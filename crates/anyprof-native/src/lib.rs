@@ -1,8 +1,14 @@
-//! Linux native CPU sampling backend.
+//! Native (C, C++, and later Rust) CPU sampling backend.
 //!
-//! The intended sampler is `perf_event_open` plus user-space unwinding (frame
-//! pointers and DWARF CFI), including kernel frames when requested. Nothing
-//! attaches to a process yet: [`NativeBackend::start`] returns a clear error.
+//! Roadmap order is macOS, then Windows, then Linux. The Linux sampler will be
+//! `perf_event_open` plus user-space unwinding (frame pointers and DWARF CFI),
+//! including kernel frames when requested. macOS and Windows samplers come
+//! first and are not built yet. [`NativeBackend::start`] returns a clear error
+//! on every platform.
+//!
+//! C++ is the next native target after Node.js and browser pages. A
+//! Rust-specific sampler comes after that; until then Rust processes fall
+//! through to this backend.
 //!
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
@@ -37,11 +43,13 @@ impl Backend for NativeBackend {
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
-        // TODO(native): sample with perf_event_open and unwind user (and optional kernel) stacks.
+        // TODO(native): C++ on-CPU sampling, macOS first, then Windows, then Linux
+        // perf_event_open. Rust-specific stacks come after the C++ sampler.
+        // Keep this backend as the pid fallback until those samplers exist.
         let _ = (target, opts);
         Err(Error::not_implemented(
             self.name(),
-            "Linux on-CPU sampling via perf events is not built yet",
+            "native on-CPU sampling is not built yet (planned order: macOS, Windows, then Linux perf events)",
         ))
     }
 }

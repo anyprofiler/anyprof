@@ -24,7 +24,7 @@ pub struct Cli {
 pub enum Command {
     /// Sample a running process and write a profile.
     Record(RecordArgs),
-    /// Convert a profile between collapsed stacks, speedscope, and pprof.
+    /// Convert a profile between collapsed stacks, speedscope, pprof, and cpuprofile.
     Convert(ConvertArgs),
 }
 
@@ -32,11 +32,24 @@ pub enum Command {
 #[command(after_help = "\
 Examples:
   anyprof record --pid 1234 --duration 30s -o cpu.collapsed
-  anyprof record --pid 1234 --duration 10s --format speedscope -o cpu.json")]
+  anyprof record --pid 1234 --inspect 9229 --duration 10s --format speedscope -o cpu.json
+  anyprof record --browser --tab example.com --duration 10s -o page.collapsed")]
 pub struct RecordArgs {
-    /// Process to profile.
-    #[arg(long, value_name = "PID", value_parser = clap::value_parser!(u32).range(1..))]
-    pub pid: u32,
+    /// Process to profile. Required unless `--browser` is set.
+    #[arg(
+        long,
+        value_name = "PID",
+        value_parser = clap::value_parser!(u32).range(1..),
+        required_unless_present = "browser"
+    )]
+    pub pid: Option<u32>,
+
+    /// Profile a browser tab instead of a pid.
+    ///
+    /// Chrome, Chromium, or Edge must already be running with
+    /// `--remote-debugging-port` (default 9222).
+    #[arg(long)]
+    pub browser: bool,
 
     /// How long to sample.
     #[arg(
@@ -63,16 +76,28 @@ pub struct RecordArgs {
     #[arg(long)]
     pub kernel: bool,
 
-    /// Force a backend (`native`, `node`, or `go`) instead of auto-detecting.
+    /// Force a backend (`node`, `browser`, `go`, or `native`) instead of auto-detecting.
     #[arg(long, value_name = "NAME")]
     pub backend: Option<String>,
+
+    /// Inspector or remote-debugging endpoint: a port, `host:port`, `http://` URL, or `ws://` URL.
+    ///
+    /// Node defaults to the process's listening inspector port, then 9229.
+    /// Browser defaults to `127.0.0.1:9222`.
+    #[arg(long, value_name = "PORT_OR_URL")]
+    pub inspect: Option<String>,
+
+    /// Browser tab: target id, or a substring of the page URL or title. Requires `--browser`.
+    #[arg(long, value_name = "URL_TITLE_OR_ID")]
+    pub tab: Option<String>,
 }
 
 #[derive(Debug, Args)]
 #[command(after_help = "\
 Examples:
   anyprof convert -i cpu.collapsed -o cpu.json --to speedscope
-  anyprof convert -i cpu.collapsed -o cpu.pb.gz --from collapsed --to pprof")]
+  anyprof convert -i cpu.collapsed -o cpu.pb.gz --from collapsed --to pprof
+  anyprof convert -i profile.cpuprofile -o cpu.collapsed")]
 pub struct ConvertArgs {
     /// Input profile.
     #[arg(short, long, value_name = "PATH")]
@@ -100,6 +125,8 @@ pub enum ProfileFormat {
     Pprof,
     /// speedscope JSON.
     Speedscope,
+    /// V8 `.cpuprofile` JSON from Node.js or Chrome.
+    Cpuprofile,
 }
 
 impl ProfileFormat {
@@ -108,6 +135,7 @@ impl ProfileFormat {
             Self::Collapsed => "collapsed",
             Self::Pprof => "pprof",
             Self::Speedscope => "speedscope",
+            Self::Cpuprofile => "cpuprofile",
         }
     }
 }
@@ -118,6 +146,7 @@ impl From<ProfileFormat> for anyprof_export::Format {
             ProfileFormat::Collapsed => Self::Collapsed,
             ProfileFormat::Pprof => Self::Pprof,
             ProfileFormat::Speedscope => Self::Speedscope,
+            ProfileFormat::Cpuprofile => Self::Cpuprofile,
         }
     }
 }
@@ -145,13 +174,16 @@ mod tests {
         let Command::Record(args) = cli.command else {
             panic!("expected record");
         };
-        assert_eq!(args.pid, 42);
+        assert_eq!(args.pid, Some(42));
+        assert!(!args.browser);
         assert_eq!(args.duration, Duration::from_secs(90));
         assert_eq!(args.output.as_os_str(), "cpu.collapsed");
         assert_eq!(args.format, ProfileFormat::Collapsed);
         assert_eq!(args.frequency, 99);
         assert!(!args.kernel);
         assert!(args.backend.is_none());
+        assert!(args.inspect.is_none());
+        assert!(args.tab.is_none());
     }
 
     #[test]
@@ -232,5 +264,28 @@ mod tests {
             "out"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn browser_record_does_not_require_a_pid() {
+        let cli = Cli::try_parse_from([
+            "anyprof",
+            "record",
+            "--browser",
+            "--tab",
+            "example.com",
+            "--inspect",
+            "9222",
+            "-o",
+            "page.collapsed",
+        ])
+        .unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record");
+        };
+        assert!(args.browser);
+        assert!(args.pid.is_none());
+        assert_eq!(args.tab.as_deref(), Some("example.com"));
+        assert_eq!(args.inspect.as_deref(), Some("9222"));
     }
 }

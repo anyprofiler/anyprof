@@ -78,6 +78,14 @@ pub struct RecordOptions {
     pub frequency_hz: u32,
     /// Ask for kernel frames when [`Capabilities::kernel_frames`] is set.
     pub include_kernel: bool,
+    /// Inspector or Chrome remote-debugging endpoint.
+    ///
+    /// A port (`9229`), `host:port`, `http://` URL, or `ws://` debugger URL.
+    /// `None` means the backend's default (Node: port 9229, or a port the
+    /// process is already listening on; browser: `127.0.0.1:9222`).
+    pub inspect: Option<String>,
+    /// Browser tab selector: target id, or a substring of the page URL or title.
+    pub tab: Option<String>,
 }
 
 impl Default for RecordOptions {
@@ -86,6 +94,8 @@ impl Default for RecordOptions {
             duration: Duration::from_secs(30),
             frequency_hz: 99,
             include_kernel: false,
+            inspect: None,
+            tab: None,
         }
     }
 }
@@ -102,9 +112,10 @@ pub trait Session: Send {
 ///
 /// Backends are stateless and cheap to construct. Register more specific
 /// runtimes before the native fallback: the registry uses the first backend
-/// whose [`Backend::detect`] returns true.
+/// whose [`Backend::detect`] returns true. Node.js is the first-class pid
+/// backend. The browser backend is selected explicitly and does not match pids.
 pub trait Backend: Send + Sync {
-    /// Stable name used by `--backend` (`native`, `node`, `go`, ...).
+    /// Stable name used by `--backend` (`node`, `browser`, `native`, `go`, ...).
     fn name(&self) -> &'static str;
 
     /// Whether this backend should profile `pid`.

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 use std::path::Path;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
 use std::process::{Command, Stdio};
 
 /// A cheap look at a process that does not attach a sampler.
@@ -21,7 +21,8 @@ pub struct ProcessSnapshot {
 /// Read a process name and command line without attaching to it.
 ///
 /// On Linux this reads `/proc/<pid>`. On other Unix systems it asks `ps` for the
-/// process name only. Returns `None` when the process does not exist.
+/// process name. On Windows it asks `tasklist`. Returns `None` when the process
+/// does not exist.
 #[must_use]
 pub fn inspect(pid: u32) -> Option<ProcessSnapshot> {
     if pid == 0 {
@@ -35,8 +36,13 @@ pub fn inspect(pid: u32) -> Option<ProcessSnapshot> {
     {
         inspect_ps(pid)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        inspect_windows(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
         None
     }
 }
@@ -65,7 +71,8 @@ pub fn executable_file(pid: u32) -> Option<PathBuf> {
 
 /// Whether `pid` currently refers to a process.
 ///
-/// This does not send a signal. Linux checks `/proc`; other Unix systems use `ps`.
+/// This does not send a signal. Linux checks `/proc`; other Unix systems use `ps`;
+/// Windows uses `tasklist`.
 #[must_use]
 pub fn process_exists(pid: u32) -> bool {
     if pid == 0 {
@@ -86,8 +93,13 @@ pub fn process_exists(pid: u32) -> bool {
             .map(|status| status.success())
             .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        inspect_windows(pid).is_some()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
         false
     }
 }
@@ -136,12 +148,69 @@ fn inspect_ps(pid: u32) -> Option<ProcessSnapshot> {
     if comm.is_empty() {
         return None;
     }
+    let cmdline = ps_args(pid).unwrap_or_else(|| vec![comm.to_string()]);
     Some(ProcessSnapshot {
         pid,
         comm: Some(comm.to_string()),
-        cmdline: vec![comm.to_string()],
+        cmdline,
         exe: None,
     })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_args(pid: u32) -> Option<Vec<String>> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let args: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    if args.is_empty() {
+        None
+    } else {
+        Some(args)
+    }
+}
+
+#[cfg(windows)]
+fn inspect_windows(pid: u32) -> Option<ProcessSnapshot> {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if line.starts_with("INFO:") {
+        return None;
+    }
+    let name = csv_first_field(line)?.to_string();
+    Some(ProcessSnapshot {
+        pid,
+        comm: Some(name.clone()),
+        cmdline: vec![name],
+        exe: None,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn csv_first_field(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    } else {
+        Some(line.split(',').next()?.trim())
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +221,15 @@ mod tests {
     fn zero_pid_is_not_a_process() {
         assert!(!process_exists(0));
         assert!(inspect(0).is_none());
+    }
+
+    #[test]
+    fn csv_first_field_reads_tasklist_names() {
+        assert_eq!(
+            super::csv_first_field(r#""node.exe","1234","Console","1","12 K""#),
+            Some("node.exe")
+        );
+        assert_eq!(super::csv_first_field("node,1234"), Some("node"));
     }
 
     #[test]

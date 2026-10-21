@@ -7,7 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Profile exporters for anyprof (collapsed stacks, speedscope, pprof)."
+description = "Profile exporters for anyprof (collapsed stacks, speedscope, pprof, cpuprofile)."
 
 [dependencies]
 anyprof-core.workspace = true

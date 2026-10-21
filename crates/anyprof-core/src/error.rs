@@ -27,6 +27,15 @@ pub enum Error {
         /// Comma-separated registered names.
         available: String,
     },
+
+    /// A backend failed while attaching or sampling.
+    #[error("{backend}: {message}")]
+    Backend {
+        /// Backend name (`node`, `browser`, ...).
+        backend: &'static str,
+        /// What went wrong.
+        message: String,
+    },
 }
 
 impl Error {
@@ -34,5 +43,13 @@ impl Error {
     #[must_use]
     pub fn not_implemented(backend: &'static str, detail: &'static str) -> Self {
         Self::NotImplemented { backend, detail }
+    }
+
+    /// Build a [`Error::Backend`] value.
+    pub fn backend(backend: &'static str, message: impl Into<String>) -> Self {
+        Self::Backend {
+            backend,
+            message: message.into(),
+        }
     }
 }

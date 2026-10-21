@@ -1,9 +1,11 @@
 //! Backend traits and the unified CPU profile data model for anyprof.
 //!
-//! Every runtime (native code, Go, Node.js, and later Python, Java, and others)
-//! implements [`Backend`]. The CLI asks each backend whether it recognizes a pid,
-//! then [`Backend::start`]s a [`Session`]. Stopping the session yields one [`Profile`],
-//! regardless of which runtime produced the samples.
+//! Node.js is the first-class pid backend. Browser pages are selected explicitly
+//! and share the DevTools Protocol client. Native C++ (then Rust) and Go follow;
+//! Go and Linux native sampling stay in the tree as lower-priority stubs.
+//! Every runtime implements [`Backend`]. The CLI asks each backend whether it
+//! recognizes a pid, then [`Backend::start`]s a [`Session`]. Stopping the session
+//! yields one [`Profile`], regardless of which runtime produced the samples.
 //!
 //! # Stack order
 //!

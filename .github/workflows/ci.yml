@@ -18,7 +18,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS is the primary target, then Windows, then Linux.
+        os: [macos-latest, windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,6 +27,9 @@ jobs:
           toolchain: 1.99.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy

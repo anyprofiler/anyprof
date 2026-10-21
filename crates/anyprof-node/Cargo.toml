@@ -10,5 +10,7 @@ rust-version.workspace = true
 description = "Node.js CPU sampling backend for anyprof."
 
 [dependencies]
+anyprof-cdp.workspace = true
 anyprof-core.workspace = true
+anyprof-export.workspace = true
 tracing.workspace = true
