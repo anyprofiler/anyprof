@@ -1,0 +1,17 @@
+[package]
+name = "anyprof-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Profile exporters for anyprof (collapsed stacks, speedscope, pprof)."
+
+[dependencies]
+anyprof-core.workspace = true
+flate2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
