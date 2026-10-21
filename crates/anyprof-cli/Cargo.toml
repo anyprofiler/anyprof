@@ -1,0 +1,26 @@
+[package]
+name = "anyprof-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "anyprof command-line interface."
+
+[[bin]]
+name = "anyprof"
+path = "src/main.rs"
+
+[dependencies]
+anyprof-core.workspace = true
+anyprof-export.workspace = true
+anyprof-go.workspace = true
+anyprof-native.workspace = true
+anyprof-node.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+humantime.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
