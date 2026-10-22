@@ -40,7 +40,9 @@ fn record_help_shows_pid_duration_and_format() {
     assert!(stdout.contains("-p, --pid"));
     assert!(stdout.contains("-d, --duration"));
     assert!(stdout.contains("-f, --format"));
-    assert!(stdout.contains("-F, --frequency"));
+    assert!(stdout.contains("-F, --frequency <HZ>"));
+    assert!(stdout.contains("--interval <DURATION>"));
+    assert!(stdout.contains("100us"));
     assert!(stdout.contains("-B, --browser"));
     assert!(stdout.contains("-b, --backend"));
     assert!(stdout.contains("-i, --inspect"));
@@ -164,6 +166,10 @@ fn record_dispatches_through_detection_and_reports_the_stub() {
     assert!(
         stderr.contains("using backend"),
         "auto-detection should name the backend: {stderr}"
+    );
+    assert!(
+        stderr.contains("sampling every 10101us (99 Hz)"),
+        "native should keep the perf default: {stderr}"
     );
     assert!(
         stderr.contains("not implemented yet"),

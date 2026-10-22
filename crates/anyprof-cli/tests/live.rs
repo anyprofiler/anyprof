@@ -74,14 +74,27 @@ fn node_args(script: &std::path::Path) -> Vec<String> {
     ]
 }
 
+/// Median gap between samples, in microseconds.
+fn median_time_delta_us(bytes: &[u8]) -> i64 {
+    let value: serde_json::Value = serde_json::from_slice(bytes).expect("cpuprofile JSON");
+    let mut deltas: Vec<i64> = value["timeDeltas"]
+        .as_array()
+        .expect("timeDeltas")
+        .iter()
+        .map(|delta| delta.as_i64().expect("integer timeDelta"))
+        .collect();
+    assert!(!deltas.is_empty(), "profile has no timeDeltas");
+    deltas.sort_unstable();
+    deltas[deltas.len() / 2]
+}
+
 fn assert_devtools_profile(bytes: &[u8], script_name: &str) {
     let value: serde_json::Value = serde_json::from_slice(bytes).expect("cpuprofile JSON");
     let nodes = value["nodes"].as_array().expect("nodes");
     let samples = value["samples"].as_array().expect("samples");
     let deltas = value["timeDeltas"].as_array().expect("timeDeltas");
-    // 2s at 99 Hz is only ~200 ticks, and a loaded macOS runner has landed
-    // just under a cutoff of 40. The old exporter bug wrote one or two
-    // aggregated samples, so a much lower floor still catches that.
+    // The old exporter bug wrote one or two aggregated samples. Sampling
+    // density is checked separately with `median_time_delta_us`.
     assert!(
         samples.len() >= 15,
         "expected many samples, got {}",
@@ -180,25 +193,67 @@ fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
         pid.as_str(),
         "--duration",
         "2s",
-        "--frequency",
-        "1000",
         "--format",
         "cpuprofile",
         "-o",
         &output_path.to_string_lossy(),
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let explicit_path =
+        std::env::temp_dir().join(format!("anyprof-live-f-{}.cpuprofile", std::process::id()));
+    let _ = std::fs::remove_file(&explicit_path);
+    let explicit = output.status.success().then(|| {
+        anyprof(&[
+            "record",
+            "--pid",
+            pid.as_str(),
+            "--duration",
+            "1s",
+            "-F",
+            "200",
+            "-o",
+            &explicit_path.to_string_lossy(),
+        ])
+    });
     let _ = child.kill();
     let _ = child.wait();
     assert!(output.status.success(), "record failed: {stderr}");
+    assert!(
+        stderr.contains("sampling every 100us (10000 Hz)"),
+        "node should default to the DevTools interval: {stderr}"
+    );
     assert!(
         !stderr.contains("warning:"),
         "a busy profile should not warn: {stderr}"
     );
     let bytes = std::fs::read(&output_path).expect("read cpuprofile");
     assert_devtools_profile(&bytes, &script_name);
+    // DevTools records a median of about 125us. The old 99 Hz default was 10101us.
+    let median = median_time_delta_us(&bytes);
+    assert!(
+        median < 1_000,
+        "default sampling should be far denser than 10ms, median timeDelta {median}us: {stderr}"
+    );
     let _ = std::fs::remove_file(&output_path);
     let _ = std::fs::remove_file(&script);
+
+    let explicit = explicit.expect("explicit -F record ran");
+    let explicit_err = String::from_utf8_lossy(&explicit.stderr);
+    assert!(
+        explicit.status.success(),
+        "-F 200 record failed: {explicit_err}"
+    );
+    assert!(
+        explicit_err.contains("sampling every 5000us (200 Hz)"),
+        "{explicit_err}"
+    );
+    let explicit_bytes = std::fs::read(&explicit_path).expect("read -F cpuprofile");
+    let median = median_time_delta_us(&explicit_bytes);
+    assert!(
+        median >= 4_000,
+        "-F 200 should win over the 100us default, median timeDelta {median}us"
+    );
+    let _ = std::fs::remove_file(&explicit_path);
 
     // Extension inference, and a stale inspector on 9229 must not be profiled quietly.
     let mut stale = spawn_node(&[
@@ -265,8 +320,9 @@ fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
     assert!(idle_out.status.success(), "idle record failed: {idle_err}");
     assert!(
         idle_err.contains("warning:")
-            && idle_err.contains("(idle)")
-            && idle_err.contains("(program)"),
+            && idle_err.contains("(idle) or (program)")
+            && idle_err.contains("caught work")
+            && idle_err.contains("under load"),
         "idle profile should warn: {idle_err}"
     );
     let _ = std::fs::remove_file(&idle_path);

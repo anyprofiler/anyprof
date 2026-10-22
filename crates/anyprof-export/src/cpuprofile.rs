@@ -6,40 +6,23 @@
 //! dropped. A `[runtime] name` prefix on a function is honored; otherwise every
 //! frame is stamped with the runtime passed to [`import_cpuprofile`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyprof_core::{Frame, Profile, Runtime, Stack};
 use serde_json::{Value, json};
 
+use crate::SampleCounts;
 use crate::error::Error;
 use crate::symbol::split_runtime_prefix;
 
 /// Decode a `.cpuprofile` document, or a CDP `Profiler.stop` result that wraps one.
 pub fn import_cpuprofile(bytes: &[u8], default_runtime: Runtime) -> Result<Profile, Error> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|err| Error::invalid("cpuprofile", format!("not JSON: {err}")))?;
-    let root = if value.get("nodes").is_some() {
-        &value
-    } else if value
-        .get("profile")
-        .and_then(|profile| profile.get("nodes"))
-        .is_some()
-    {
-        &value["profile"]
-    } else {
-        return Err(Error::invalid(
-            "cpuprofile",
-            "missing nodes array (expected a V8 CPU profile)",
-        ));
-    };
-    let nodes = root
-        .get("nodes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::invalid("cpuprofile", "nodes is not an array"))?;
-    let parsed = parse_nodes(nodes)?;
+    let value = parse_json(bytes)?;
+    let root = document_root(&value)?;
+    let parsed = parse_nodes(node_array(root)?)?;
     let samples = number_array(root.get("samples"));
-    let deltas = number_array(root.get("timeDeltas"));
+    let deltas = time_deltas(root.get("timeDeltas"));
     let stacks = if samples.is_empty() {
         stacks_from_hit_counts(&parsed, default_runtime)?
     } else {
@@ -57,6 +40,46 @@ pub fn import_cpuprofile(bytes: &[u8], default_runtime: Runtime) -> Result<Profi
         stacks,
         ..Profile::default()
     })
+}
+
+/// Count V8 samples, and those whose leaf is `(idle)` or `(program)`.
+///
+/// Falls back to `hitCount` when the document has no `samples` array.
+pub(crate) fn sample_counts(bytes: &[u8]) -> Result<SampleCounts, Error> {
+    let value = parse_json(bytes)?;
+    let root = document_root(&value)?;
+    let mut idle_nodes = HashSet::new();
+    let mut hits = SampleCounts::default();
+    for node in node_array(root)? {
+        let name = node
+            .pointer("/callFrame/functionName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let idle = is_idle_name(name);
+        if idle {
+            if let Some(id) = node.get("id").and_then(Value::as_u64) {
+                idle_nodes.insert(id);
+            }
+        }
+        let hit = node.get("hitCount").and_then(Value::as_u64).unwrap_or(0);
+        hits.total = hits.total.saturating_add(hit);
+        if idle {
+            hits.idle = hits.idle.saturating_add(hit);
+        }
+    }
+    let samples = number_array(root.get("samples"));
+    if samples.is_empty() {
+        return Ok(hits);
+    }
+    Ok(SampleCounts {
+        total: samples.len() as u64,
+        idle: samples.iter().filter(|id| idle_nodes.contains(id)).count() as u64,
+    })
+}
+
+/// V8's pseudo-frames for a thread with no JavaScript or native work on the stack.
+pub(crate) fn is_idle_name(name: &str) -> bool {
+    matches!(name, "(idle)" | "(program)")
 }
 
 pub(crate) fn export(profile: &Profile) -> Result<Vec<u8>, Error> {
@@ -292,6 +315,53 @@ fn finish(order: Vec<Vec<Frame>>, totals: HashMap<Vec<Frame>, u64>) -> Vec<Stack
             frames,
         })
         .collect()
+}
+
+fn parse_json(bytes: &[u8]) -> Result<Value, Error> {
+    serde_json::from_slice(bytes)
+        .map_err(|err| Error::invalid("cpuprofile", format!("not JSON: {err}")))
+}
+
+fn document_root(value: &Value) -> Result<&Value, Error> {
+    if value.get("nodes").is_some() {
+        Ok(value)
+    } else if value
+        .get("profile")
+        .and_then(|profile| profile.get("nodes"))
+        .is_some()
+    {
+        Ok(&value["profile"])
+    } else {
+        Err(Error::invalid(
+            "cpuprofile",
+            "missing nodes array (expected a V8 CPU profile)",
+        ))
+    }
+}
+
+fn node_array(root: &Value) -> Result<&[Value], Error> {
+    root.get("nodes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| Error::invalid("cpuprofile", "nodes is not an array"))
+}
+
+/// V8 occasionally records a negative delta when samples arrive out of order.
+/// Keep one entry per sample so later deltas stay aligned with `samples`.
+fn time_deltas(value: Option<&Value>) -> Vec<u64> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(|delta| {
+                    delta
+                        .as_i64()
+                        .map_or(0, |delta| delta.max(0).unsigned_abs())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn number_array(value: Option<&Value>) -> Vec<u64> {
@@ -539,6 +609,59 @@ mod tests {
         assert_eq!(profile.stacks[0].frames[0].name, "only");
         assert_eq!(profile.stacks[0].frames[0].line, Some(3));
         assert_eq!(profile.stacks[0].frames[0].column, None);
+    }
+
+    #[test]
+    fn negative_time_deltas_keep_later_samples_aligned() {
+        let raw = r#"{
+          "nodes": [
+            {"id": 1, "callFrame": {"functionName": "(root)", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": [2, 3]},
+            {"id": 2, "callFrame": {"functionName": "a", "url": "", "lineNumber": -1, "columnNumber": -1}},
+            {"id": 3, "callFrame": {"functionName": "b", "url": "", "lineNumber": -1, "columnNumber": -1}}
+          ],
+          "samples": [2, 2, 3],
+          "timeDeltas": [100, -5, 300]
+        }"#;
+        let profile = import_cpuprofile(raw.as_bytes(), Runtime::Node).unwrap();
+        let weight = |name: &str| {
+            profile
+                .stacks
+                .iter()
+                .find(|stack| stack.frames[0].name == name)
+                .unwrap()
+                .weight
+        };
+        assert_eq!(weight("a"), 101);
+        assert_eq!(weight("b"), 300);
+    }
+
+    #[test]
+    fn sample_counts_count_v8_samples_not_microseconds() {
+        let raw = r#"{
+          "nodes": [
+            {"id": 1, "callFrame": {"functionName": "(root)", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": [2, 3, 4]},
+            {"id": 2, "callFrame": {"functionName": "(idle)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+            {"id": 3, "callFrame": {"functionName": "(program)", "url": "", "lineNumber": -1, "columnNumber": -1}},
+            {"id": 4, "callFrame": {"functionName": "handle", "url": "a.js", "lineNumber": 1, "columnNumber": 1}}
+          ],
+          "samples": [2, 2, 3, 4, 2],
+          "timeDeltas": [125, 125, 125, 125, 125]
+        }"#;
+        let counts = super::sample_counts(raw.as_bytes()).unwrap();
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.idle, 4);
+
+        let wrapped = format!(r#"{{"profile": {raw}}}"#);
+        assert_eq!(super::sample_counts(wrapped.as_bytes()).unwrap(), counts);
+
+        let hits = r#"{
+          "nodes": [
+            {"id": 1, "callFrame": {"functionName": "(idle)", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 7},
+            {"id": 2, "callFrame": {"functionName": "work", "url": "", "lineNumber": -1, "columnNumber": -1}, "hitCount": 3}
+          ]
+        }"#;
+        let counts = super::sample_counts(hits.as_bytes()).unwrap();
+        assert_eq!((counts.total, counts.idle), (10, 7));
     }
 
     #[test]

@@ -34,6 +34,57 @@ pub fn export(profile: &Profile, format: Format) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// How many samples a profile holds and how many caught the thread idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SampleCounts {
+    /// Samples in the profile.
+    pub total: u64,
+    /// Samples whose leaf frame is V8's `(idle)` or `(program)`.
+    pub idle: u64,
+}
+
+impl SampleCounts {
+    /// Samples that caught JavaScript, native code, or the garbage collector.
+    #[must_use]
+    pub fn non_idle(self) -> u64 {
+        self.total.saturating_sub(self.idle)
+    }
+
+    /// Whether more than `percent` percent of the samples are idle.
+    #[must_use]
+    pub fn idle_above(self, percent: u64) -> bool {
+        self.total > 0 && u128::from(self.idle) * 100 > u128::from(self.total) * u128::from(percent)
+    }
+}
+
+/// Count the samples in `profile`.
+///
+/// A captured `.cpuprofile` is counted from the V8 document, one per sample:
+/// its imported stack weights are microseconds, not samples. Other profiles
+/// count stack weights.
+#[must_use]
+pub fn sample_counts(profile: &Profile) -> SampleCounts {
+    if let Some(counts) = profile
+        .raw_cpuprofile
+        .as_deref()
+        .and_then(|raw| cpuprofile::sample_counts(raw).ok())
+    {
+        return counts;
+    }
+    let mut counts = SampleCounts::default();
+    for stack in &profile.stacks {
+        counts.total = counts.total.saturating_add(stack.weight);
+        if stack
+            .frames
+            .first()
+            .is_some_and(|leaf| cpuprofile::is_idle_name(&leaf.name))
+        {
+            counts.idle = counts.idle.saturating_add(stack.weight);
+        }
+    }
+    counts
+}
+
 /// Decode a profile produced by [`export`] (or a compatible file of that format).
 pub fn import(bytes: &[u8], format: Format) -> Result<Profile, Error> {
     match format {
@@ -85,5 +136,61 @@ fn fixture() -> Profile {
             },
         ],
         raw_cpuprofile: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SampleCounts, sample_counts};
+    use anyprof_core::{Frame, Profile, Runtime, Stack};
+
+    #[test]
+    fn stack_weights_count_when_there_is_no_raw_cpuprofile() {
+        let profile = Profile {
+            stacks: vec![
+                Stack {
+                    frames: vec![Frame::new(Runtime::Node, "(idle)")],
+                    weight: 96,
+                },
+                Stack {
+                    frames: vec![
+                        Frame::new(Runtime::Node, "(idle)"),
+                        Frame::new(Runtime::Node, "caller"),
+                    ],
+                    weight: 1,
+                },
+                Stack {
+                    frames: vec![Frame::new(Runtime::Node, "work")],
+                    weight: 3,
+                },
+            ],
+            ..Profile::default()
+        };
+        assert_eq!(
+            sample_counts(&profile),
+            SampleCounts {
+                total: 100,
+                idle: 97
+            }
+        );
+    }
+
+    #[test]
+    fn idle_share_threshold_is_strict() {
+        let at = |idle, total| SampleCounts { total, idle }.idle_above(95);
+        assert!(at(96, 100));
+        assert!(!at(95, 100));
+        assert!(at(848, 850));
+        assert!(!at(0, 0));
+        assert!(at(u64::MAX, u64::MAX));
+        assert_eq!(
+            SampleCounts {
+                total: 850,
+                idle: 849
+            }
+            .non_idle(),
+            1
+        );
+        assert_eq!(SampleCounts { total: 0, idle: 0 }.non_idle(), 0);
     }
 }

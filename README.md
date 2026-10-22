@@ -78,18 +78,18 @@ A frame from a non-native runtime is written as `[runtime] name`, for example `[
 
 ## Install
 
-Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.1` is tag `v0.1.1`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
+Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.2` is tag `v0.1.2`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
 
 macOS and Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.1/anyprof-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.2/anyprof-cli-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.1/anyprof-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.2/anyprof-cli-installer.ps1 | iex"
 ```
 
 The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
@@ -149,10 +149,22 @@ anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 | `-d, --duration <DURATION>` | How long to sample. Omit it to record until Ctrl+C (SIGINT). SIGTERM, and on Windows Ctrl+Break, end the recording the same way and still write the file. A second Ctrl+C while the profile is being saved exits immediately. Accepts `humantime` values such as `90s` or `1m30s`. There is no default duration. |
 | `-o, --output <PATH>` | Output file or directory. Optional. Omit it, pass an existing directory, `.`, `..`, or a trailing `/` or `\`, and anyprof writes `anyprof-<backend>-<pid-or-tab>-YYYYMMDD-HHMMSS.<ext>` there (local time, no colons). If that name exists, `-2`, `-3`, ... is inserted before the full extension. A leading `~` expands to the home directory. Relative paths use the current directory. The path printed at the end is absolute. An explicit file is overwritten. |
 | `-f, --format <collapsed\|pprof\|speedscope\|cpuprofile>` | Output format. An explicit value wins. Otherwise an output *file* extension is used. A directory or omitted `-o` uses the backend default below. |
-| `-F, --frequency <HZ>` | Requested sampling rate. Default `99`, which Node and Chrome receive as a 10101 microsecond V8 sampling interval. |
+| `-F, --frequency <HZ>` | Samples per second. The default depends on the backend (see below). An explicit value wins. Cannot be combined with `--interval`. |
+| `--interval <DURATION>` | Time between samples, for example `100us`, `1ms`, or `10ms`. The same setting as `-F`, written as a period. Node and browser round it to whole microseconds. |
 | `-k, --kernel` | Ask for kernel frames when the backend supports them. Node and browser profiles do not include kernel frames. |
 | `-b, --backend <node\|browser\|go\|native>` | Skip auto-detection. |
 | `-v`, `-vv`, `-vvv` | Log more (`info`, `debug`, `trace`). `RUST_LOG` is used when `-v` is not passed. `-h` and `-V` are help and version. |
+
+Default sampling rate when neither `-F` nor `--interval` is passed:
+
+| Backend | Default interval | Rate |
+| --- | --- | --- |
+| `node`, `browser` | 100us | 10000 Hz, the same as a Chrome DevTools Performance recording |
+| `go`, `native` | 10101us | 99 Hz, the `perf record -F 99` convention |
+
+At 100us a mostly idle server still records the sub-millisecond work of each request. A 10s recording holds tens of thousands of samples, and a busy process writes about 2.5 MB of `.cpuprofile` per minute. For long recordings, `--interval 1ms` keeps the file 10 times smaller. The start line names the rate in use, for example `using backend 'node' for pid 1234 (on-cpu, mixed-stacks), sampling every 100us (10000 Hz)`.
+
+After recording, anyprof warns on stderr when the profile has 0 samples. It also warns when more than 95% of samples are V8's `(idle)` or `(program)` nodes and fewer than 100 samples caught JavaScript, native code, or the garbage collector. That means the process was waiting and the profile shows almost none of its work. Record again while the process is under load, for example by sending it requests during the recording. A mostly idle server that still handled some requests, such as 300 JavaScript samples out of 90,000, does not warn. The profile is always written.
 
 While stderr is a terminal, `record` redraws one status line (`Recording node pid 1234... 00:12 elapsed (Ctrl+C to stop)`, or with time left when `-d` is set). A pipe or file gets a single start line.
 
@@ -211,8 +223,8 @@ CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. Every crate inherits it.
 2. Commit that change on `main` (the release workflow has to be on the default branch).
-3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.1` is tag `v0.1.1`.
-4. Push the tag: `git push origin v0.1.1`.
+3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.2` is tag `v0.1.2`.
+4. Push the tag: `git push origin v0.1.2`.
 
 Pushing the tag runs `.github/workflows/release.yml`. [cargo-dist](https://axodotdev.github.io/cargo-dist/) builds `anyprof` for Apple Silicon macOS, Intel macOS, 64-bit Windows, and 64-bit Linux (glibc and musl, x86_64 and ARM), then uploads the archives, checksums, shell installer, and PowerShell installer to a GitHub Release.
 

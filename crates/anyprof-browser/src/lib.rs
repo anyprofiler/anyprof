@@ -18,7 +18,8 @@ use anyprof_cdp::{
     sampling_interval_us,
 };
 use anyprof_core::{
-    Backend, Capabilities, Error, Format, Profile, RecordOptions, Runtime, Session, Target,
+    Backend, Capabilities, DEVTOOLS_SAMPLING_INTERVAL, Error, Format, Profile, RecordOptions,
+    Runtime, Session, Target,
 };
 use anyprof_export::import_cpuprofile;
 
@@ -49,6 +50,10 @@ impl Backend for BrowserBackend {
     fn default_format(&self) -> Format {
         // Same DevTools document as Node. Open it in the Performance panel.
         Format::Cpuprofile
+    }
+
+    fn default_sampling_interval(&self) -> Duration {
+        DEVTOOLS_SAMPLING_INTERVAL
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
@@ -83,7 +88,10 @@ impl Backend for BrowserBackend {
                 .websocket_url
                 .clone()
         };
-        let interval_us = sampling_interval_us(opts.frequency_hz);
+        let interval_us = sampling_interval_us(
+            opts.sampling_interval
+                .unwrap_or_else(|| self.default_sampling_interval()),
+        );
         tracing::info!(%websocket, ?opts.duration, interval_us, "profiling browser tab");
         let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us, None, &opts.stop)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
