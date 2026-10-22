@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn anyprof(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_anyprof"))
@@ -52,10 +53,11 @@ fn record_help_shows_pid_duration_and_format() {
 /// Runs `anyprof` with every receipt location pointed at an empty directory,
 /// so an install on the test machine can never turn this into a real update.
 fn anyprof_without_receipt(args: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
+    static NEXT_HOME: AtomicUsize = AtomicUsize::new(0);
     let home = std::env::temp_dir().join(format!(
         "anyprof-no-receipt-{}-{}",
         std::process::id(),
-        args.join("-")
+        NEXT_HOME.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&home).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_anyprof"));
@@ -68,7 +70,8 @@ fn anyprof_without_receipt(args: &[&str], extra_env: &[(&str, &str)]) -> std::pr
         .env_remove("AXOUPDATER_CONFIG_WORKING_DIR")
         .env_remove("AXOUPDATER_CONFIG_PATH")
         .env_remove("ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL")
-        .env_remove("ANYPROF_CLI_INSTALLER_GHE_BASE_URL");
+        .env_remove("ANYPROF_CLI_INSTALLER_GHE_BASE_URL")
+        .env_remove("ANYPROF_CLI_INSTALL_DIR");
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -104,13 +107,16 @@ fn hidden_typo_alias_still_runs_update() {
 }
 
 #[test]
-fn update_ignores_release_host_overrides() {
+fn update_ignores_installer_overrides() {
     let output = anyprof_without_receipt(
         &["update"],
-        &[(
-            "ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL",
-            "https://example.invalid",
-        )],
+        &[
+            (
+                "ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL",
+                "https://example.invalid",
+            ),
+            ("ANYPROF_CLI_INSTALL_DIR", "/somewhere/else"),
+        ],
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!output.status.success(), "{stderr}");
@@ -120,6 +126,10 @@ fn update_ignores_release_host_overrides() {
     );
     assert!(
         stderr.contains("github.com/anyprofiler/anyprof"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("ignoring ANYPROF_CLI_INSTALL_DIR"),
         "{stderr}"
     );
 }

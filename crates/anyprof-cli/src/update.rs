@@ -32,11 +32,16 @@ const HOST_OVERRIDES: [&str; 4] = [
     "INSTALLER_DOWNLOAD_URL",
 ];
 
+/// The installer reads this before the `CARGO_DIST_FORCE_INSTALL_DIR` that
+/// axoupdater sets from the receipt, so a stale value would install the new
+/// binary somewhere else (and on Windows still delete the renamed original).
+const INSTALL_DIR_OVERRIDE: &str = "ANYPROF_CLI_INSTALL_DIR";
+
 const SHELL_INSTALLER: &str = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.sh | sh";
 const POWERSHELL_INSTALLER: &str = "powershell -ExecutionPolicy Bypass -c \"irm https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.ps1 | iex\"";
 
 pub fn run() -> anyhow::Result<()> {
-    clear_host_overrides();
+    clear_installer_overrides();
 
     let mut updater = AxoUpdater::new_for(APP_NAME);
     updater.load_receipt().map_err(receipt_failure)?;
@@ -92,6 +97,9 @@ pub fn run() -> anyhow::Result<()> {
         Ordering::Greater => {}
     }
 
+    // On Windows run() renames the running image, and current_exe() can follow
+    // that rename, so take the path first.
+    let previous_exe = previous_exe_path();
     hold_interrupts_until_exit();
     match runtime.block_on(updater.run()) {
         Ok(Some(update)) => {
@@ -108,7 +116,7 @@ pub fn run() -> anyhow::Result<()> {
         // Only Windows reports this, after the new anyprof.exe is in place.
         Err(AxoupdateError::CleanupFailed {}) => {
             println!("{}", format_updated(current, &latest.to_string()));
-            eprintln!("{}", format_cleanup_warning(&previous_exe_path()));
+            eprintln!("{}", format_cleanup_warning(&previous_exe));
             Ok(())
         }
         Err(err) => Err(install_failure(err)),
@@ -122,10 +130,16 @@ fn is_pinned_source(source: &ReleaseSource) -> bool {
         && source.app_name == APP_NAME
 }
 
-fn clear_host_overrides() {
-    for name in HOST_OVERRIDES {
+fn clear_installer_overrides() {
+    let host_note = format!("updates come from github.com/{OWNER}/{REPO}");
+    let install_dir_note = "updates install where the release installer put this copy".to_string();
+    let overrides = HOST_OVERRIDES
+        .iter()
+        .map(|name| (*name, &host_note))
+        .chain([(INSTALL_DIR_OVERRIDE, &install_dir_note)]);
+    for (name, note) in overrides {
         if std::env::var_os(name).is_some() {
-            eprintln!("anyprof: ignoring {name}; updates come from github.com/{OWNER}/{REPO}");
+            eprintln!("anyprof: ignoring {name}; {note}");
             // SAFETY: this runs before the updater builds its runtime or spawns
             // the installer, so no other thread can be reading the environment.
             unsafe { std::env::remove_var(name) };

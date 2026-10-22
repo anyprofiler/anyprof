@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- `anyprof update` only installs releases from `github.com/anyprofiler/anyprof`. It refuses a receipt that names another repository and ignores the installer's host override variables.
+- `anyprof update` only installs releases from `github.com/anyprofiler/anyprof`. It refuses a receipt that names another repository and ignores the installer's host override variables and `ANYPROF_CLI_INSTALL_DIR`.
 - `anyprof update` says when this binary is newer than the latest release, instead of calling it the latest.
-- On Windows, leaving the old `anyprof.exe.previous.exe` behind is a warning, not a failure, since the new binary is already in place. Once the installer starts, Ctrl+C waits for it to exit so a failed install can restore the old `anyprof.exe`.
+- On Windows, leaving the old `anyprof.exe.previous.exe` behind is a warning, not a failure, since the new binary is already in place. The warning names the path from before the rename. Once the installer starts, Ctrl+C waits for it to exit so a failed install can restore the old `anyprof.exe`.
 - Clearer `anyprof update` errors: install-location lookups are no longer reported as failed replacements, and the reinstall hint labels the macOS/Linux and Windows commands.
 - `uptate` still works but no longer appears in `--help`.
 
