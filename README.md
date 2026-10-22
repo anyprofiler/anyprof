@@ -81,18 +81,18 @@ A frame from a non-native runtime is written as `[runtime] name`, for example `[
 
 ## Install
 
-Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.2` is tag `v0.1.2`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
+Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.3` is tag `v0.1.3`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
 
 macOS and Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.2/anyprof-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.3/anyprof-cli-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.2/anyprof-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.3/anyprof-cli-installer.ps1 | iex"
 ```
 
 The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
@@ -283,8 +283,8 @@ CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. Every crate inherits it.
 2. Commit that change on `main` (the release workflow has to be on the default branch).
-3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.2` is tag `v0.1.2`.
-4. Push the tag: `git push origin v0.1.2`.
+3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.3` is tag `v0.1.3`.
+4. Push the tag: `git push origin v0.1.3`.
 
 Pushing the tag runs `.github/workflows/release.yml`. [cargo-dist](https://axodotdev.github.io/cargo-dist/) builds `anyprof` for Apple Silicon macOS, Intel macOS, 64-bit Windows, and 64-bit Linux (glibc and musl, x86_64 and ARM), then uploads the archives, checksums, shell installer, and PowerShell installer to a GitHub Release.
 
