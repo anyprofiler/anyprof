@@ -321,6 +321,7 @@ fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
     assert!(
         idle_err.contains("warning:")
             && idle_err.contains("(idle) or (program)")
+            && idle_err.contains("caught work")
             && idle_err.contains("under load"),
         "idle profile should warn: {idle_err}"
     );

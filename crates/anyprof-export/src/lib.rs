@@ -44,6 +44,12 @@ pub struct SampleCounts {
 }
 
 impl SampleCounts {
+    /// Samples that caught JavaScript, native code, or the garbage collector.
+    #[must_use]
+    pub fn non_idle(self) -> u64 {
+        self.total.saturating_sub(self.idle)
+    }
+
     /// Whether more than `percent` percent of the samples are idle.
     #[must_use]
     pub fn idle_above(self, percent: u64) -> bool {
@@ -177,5 +183,14 @@ mod tests {
         assert!(at(848, 850));
         assert!(!at(0, 0));
         assert!(at(u64::MAX, u64::MAX));
+        assert_eq!(
+            SampleCounts {
+                total: 850,
+                idle: 849
+            }
+            .non_idle(),
+            1
+        );
+        assert_eq!(SampleCounts { total: 0, idle: 0 }.non_idle(), 0);
     }
 }

@@ -194,6 +194,10 @@ fn paint(line: &str) {
 /// reported as mostly idle.
 const IDLE_WARNING_PERCENT: u64 = 95;
 
+/// A mostly idle recording with at least this many JavaScript, native, or GC
+/// samples still shows the work that happened, so it does not warn.
+const IDLE_WARNING_MAX_WORK_SAMPLES: u64 = 100;
+
 fn uninformative_reason(profile: &Profile, counts: SampleCounts) -> Option<String> {
     let has_sample = profile
         .stacks
@@ -202,13 +206,15 @@ fn uninformative_reason(profile: &Profile, counts: SampleCounts) -> Option<Strin
     if !has_sample || counts.total == 0 {
         return Some("profile has 0 samples".to_string());
     }
-    if counts.idle_above(IDLE_WARNING_PERCENT) {
+    if counts.idle_above(IDLE_WARNING_PERCENT) && counts.non_idle() < IDLE_WARNING_MAX_WORK_SAMPLES
+    {
         return Some(format!(
-            "{} of {} samples ({}%) are (idle) or (program), so the process was mostly waiting. \
+            "{} of {} samples ({}%) are (idle) or (program) and only {} caught work, so the process was mostly waiting. \
              To profile request handling, record while it is under load, for example by sending it requests during the recording",
             counts.idle,
             counts.total,
-            u128::from(counts.idle) * 100 / u128::from(counts.total)
+            u128::from(counts.idle) * 100 / u128::from(counts.total),
+            counts.non_idle()
         ));
     }
     let useful = profile
@@ -410,6 +416,7 @@ mod tests {
         let message = reason(&idle).unwrap();
         assert!(message.contains("849 of 850 samples (99%)"), "{message}");
         assert!(message.contains("(idle) or (program)"), "{message}");
+        assert!(message.contains("only 1 caught work"), "{message}");
         assert!(message.contains("under load"), "{message}");
 
         let busy = profile(&[(&["(idle)"], 90), (&["handle", "main"], 10)]);
@@ -417,6 +424,25 @@ mod tests {
 
         let boundary = profile(&[(&["(idle)"], 95), (&["handle"], 5)]);
         assert_eq!(reason(&boundary), None);
+
+        // Beace's DevTools recording: 99.6% idle, but 335 JS samples of request handling.
+        let light_load = profile(&[(&["(idle)"], 93_773), (&["parserOnHeadersComplete"], 335)]);
+        assert_eq!(reason(&light_load), None);
+
+        let just_under = profile(&[
+            (&["(idle)"], 50_000),
+            (&["handle"], 60),
+            (&["(garbage collector)"], 39),
+        ]);
+        let message = reason(&just_under).unwrap();
+        assert!(message.contains("only 99 caught work"), "{message}");
+
+        let enough_work = profile(&[
+            (&["(idle)"], 50_000),
+            (&["handle"], 60),
+            (&["(garbage collector)"], 40),
+        ]);
+        assert_eq!(reason(&enough_work), None);
     }
 
     #[test]
