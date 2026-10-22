@@ -1,5 +1,6 @@
 mod cli;
 mod convert;
+mod output;
 mod record;
 mod registry;
 

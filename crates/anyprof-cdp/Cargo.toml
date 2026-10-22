@@ -10,6 +10,7 @@ rust-version.workspace = true
 description = "Chrome DevTools Protocol client used by the Node.js and browser backends."
 
 [dependencies]
+anyprof-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

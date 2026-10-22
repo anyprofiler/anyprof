@@ -26,6 +26,7 @@
 //!         frames: vec![Frame::new(Runtime::Native, "main")],
 //!         weight: 3,
 //!     }],
+//!     raw_cpuprofile: None,
 //! };
 //! assert_eq!(profile.total_weight(), 3);
 //! ```
@@ -34,10 +35,14 @@
 
 mod backend;
 mod error;
+mod format;
 mod process;
 mod profile;
+mod stop;
 
 pub use backend::{Backend, Capabilities, RecordOptions, Registry, Session, Target};
 pub use error::Error;
+pub use format::Format;
 pub use process::{ProcessSnapshot, executable_file, inspect, process_exists};
 pub use profile::{Frame, Profile, Runtime, Stack};
+pub use stop::{SignalAction, StopGate};

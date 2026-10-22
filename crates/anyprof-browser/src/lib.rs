@@ -18,7 +18,7 @@ use anyprof_cdp::{
     sampling_interval_us,
 };
 use anyprof_core::{
-    Backend, Capabilities, Error, Profile, RecordOptions, Runtime, Session, Target,
+    Backend, Capabilities, Error, Format, Profile, RecordOptions, Runtime, Session, Target,
 };
 use anyprof_export::import_cpuprofile;
 
@@ -46,8 +46,13 @@ impl Backend for BrowserBackend {
         }
     }
 
+    fn default_format(&self) -> Format {
+        // Same DevTools document as Node. Open it in the Performance panel.
+        Format::Cpuprofile
+    }
+
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
-        if opts.duration.is_zero() {
+        if opts.duration.is_some_and(|duration| duration.is_zero()) {
             return Err(Error::backend(
                 self.name(),
                 "profile duration must be greater than zero",
@@ -80,13 +85,11 @@ impl Backend for BrowserBackend {
         };
         let interval_us = sampling_interval_us(opts.frequency_hz);
         tracing::info!(%websocket, ?opts.duration, interval_us, "profiling browser tab");
-        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us)
+        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us, None, &opts.stop)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        let imported = import_cpuprofile(&bytes, Runtime::Browser)
+        let mut imported = import_cpuprofile(&bytes, Runtime::Browser)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        if imported.stacks.is_empty() {
-            return Err(Error::backend(self.name(), "profiler returned no samples"));
-        }
+        imported.raw_cpuprofile = Some(bytes);
         Ok(Box::new(ReadySession {
             profile: finish_profile(imported, target.pid, opts, interval_us),
         }))
@@ -101,7 +104,9 @@ fn finish_profile(
 ) -> Profile {
     profile.pid = pid;
     if profile.duration.is_zero() {
-        profile.duration = opts.duration;
+        if let Some(duration) = opts.duration {
+            profile.duration = duration;
+        }
     }
     if profile.period.is_none() {
         profile.period = Some(Duration::from_micros(u64::from(interval_us)));
@@ -136,7 +141,7 @@ mod tests {
         let Err(err) = BrowserBackend.start(
             &Target { pid: 0 },
             &RecordOptions {
-                duration: Duration::from_millis(50),
+                duration: Some(Duration::from_millis(50)),
                 inspect: Some("127.0.0.1:1".to_string()),
                 ..RecordOptions::default()
             },

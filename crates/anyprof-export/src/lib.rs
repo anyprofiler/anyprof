@@ -20,34 +20,9 @@ mod symbol;
 
 use anyprof_core::{Profile, Runtime};
 
+pub use anyprof_core::Format;
 pub use cpuprofile::import_cpuprofile;
 pub use error::Error;
-
-/// Profile encodings the CLI can read and write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    /// `root;caller;leaf count` lines, suitable for FlameGraph.
-    Collapsed,
-    /// gzip-compressed pprof protobuf (`profile.proto`).
-    Pprof,
-    /// speedscope sampled-profile JSON.
-    Speedscope,
-    /// V8 `.cpuprofile` JSON from Node.js or Chrome.
-    Cpuprofile,
-}
-
-impl Format {
-    /// Stable name used in errors and CLI output.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Collapsed => "collapsed",
-            Self::Pprof => "pprof",
-            Self::Speedscope => "speedscope",
-            Self::Cpuprofile => "cpuprofile",
-        }
-    }
-}
 
 /// Encode `profile` as `format`.
 pub fn export(profile: &Profile, format: Format) -> Result<Vec<u8>, Error> {
@@ -109,5 +84,6 @@ fn fixture() -> Profile {
                 weight: 4,
             },
         ],
+        raw_cpuprofile: None,
     }
 }

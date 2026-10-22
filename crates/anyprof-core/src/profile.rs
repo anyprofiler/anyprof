@@ -145,6 +145,13 @@ pub struct Profile {
     pub period: Option<Duration>,
     /// Observed stacks. Exporters may merge entries that look identical.
     pub stacks: Vec<Stack>,
+    /// Original V8 `.cpuprofile` JSON from `Profiler.stop`, when this profile
+    /// was captured from Node or a browser tab.
+    ///
+    /// Recording with `--format cpuprofile` writes these bytes unchanged.
+    /// `convert` leaves the field empty and rebuilds a DevTools profile from
+    /// [`Self::stacks`].
+    pub raw_cpuprofile: Option<Vec<u8>>,
 }
 
 impl Profile {

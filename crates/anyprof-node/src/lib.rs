@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use anyprof_cdp::{capture_cpu_profile, sampling_interval_us};
 use anyprof_core::{
-    Backend, Capabilities, Error, ProcessSnapshot, Profile, RecordOptions, Runtime, Session,
-    Target, inspect,
+    Backend, Capabilities, Error, Format, ProcessSnapshot, Profile, RecordOptions, Runtime,
+    Session, Target, inspect,
 };
 use anyprof_export::import_cpuprofile;
 
@@ -60,8 +60,13 @@ impl Backend for NodeBackend {
         }
     }
 
+    fn default_format(&self) -> Format {
+        // Chrome DevTools Performance panel and VS Code's CPU profile viewer.
+        Format::Cpuprofile
+    }
+
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
-        if opts.duration.is_zero() {
+        if opts.duration.is_some_and(|duration| duration.is_zero()) {
             return Err(Error::backend(
                 self.name(),
                 "profile duration must be greater than zero",
@@ -89,13 +94,18 @@ impl Backend for NodeBackend {
         let websocket =
             attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
         let interval_us = sampling_interval_us(opts.frequency_hz);
-        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us)
+        let bytes = capture_cpu_profile(
+            &websocket,
+            opts.duration,
+            interval_us,
+            Some(target.pid),
+            &opts.stop,
+        )
+        .map_err(|err| Error::backend(self.name(), err.to_string()))?;
+        let mut imported = import_cpuprofile(&bytes, Runtime::Node)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        let imported = import_cpuprofile(&bytes, Runtime::Node)
-            .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        if imported.stacks.is_empty() {
-            return Err(Error::backend(self.name(), "profiler returned no samples"));
-        }
+        // Keep Profiler.stop's document so `--format cpuprofile` does not rebuild it.
+        imported.raw_cpuprofile = Some(bytes);
         let profile = finish_profile(imported, target.pid, snapshot.comm, opts, interval_us);
         tracing::info!(
             pid = target.pid,
@@ -128,7 +138,9 @@ fn finish_profile(
         profile.comm = comm;
     }
     if profile.duration.is_zero() {
-        profile.duration = opts.duration;
+        if let Some(duration) = opts.duration {
+            profile.duration = duration;
+        }
     }
     if profile.period.is_none() {
         profile.period = Some(Duration::from_micros(u64::from(interval_us)));
@@ -241,7 +253,7 @@ mod tests {
         let Err(err) = NodeBackend.start(
             &Target { pid: u32::MAX },
             &RecordOptions {
-                duration: Duration::from_secs(1),
+                duration: Some(Duration::from_secs(1)),
                 ..RecordOptions::default()
             },
         ) else {
@@ -259,7 +271,7 @@ mod tests {
                 pid: std::process::id(),
             },
             &RecordOptions {
-                duration: Duration::from_millis(200),
+                duration: Some(Duration::from_millis(200)),
                 ..RecordOptions::default()
             },
         ) else {

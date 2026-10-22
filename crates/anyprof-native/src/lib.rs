@@ -13,7 +13,9 @@
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
-use anyprof_core::{Backend, Capabilities, Error, RecordOptions, Session, Target, process_exists};
+use anyprof_core::{
+    Backend, Capabilities, Error, Format, RecordOptions, Session, Target, process_exists,
+};
 
 /// Native (C, C++, Rust, and other non-language-runtime) sampler.
 #[derive(Debug, Default)]
@@ -40,6 +42,11 @@ impl Backend for NativeBackend {
             kernel_frames: cfg!(target_os = "linux"),
             needs_root: true,
         }
+    }
+
+    fn default_format(&self) -> Format {
+        // `go tool pprof` and the pprof web UI. `.pb.gz` is the auto-named extension.
+        Format::Pprof
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
