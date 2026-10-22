@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
+- Node and browser recordings sample every 100us (10 kHz) by default, the same rate as a Chrome DevTools Performance recording. The old 99 Hz default (a 10101us V8 interval) took about 80 times fewer samples and missed short request handling on a mostly idle server. Go and native keep 99 Hz. An explicit `-F` still wins, and `record` prints the rate it uses.
+- `record --interval <DURATION>` sets the time between samples (`100us`, `1ms`, ...) as an alternative to `-F`. The two cannot be combined.
+- `record` warns on stderr when more than 95% of samples are `(idle)` or `(program)`, and suggests recording while the process is under load. The zero-sample warning is unchanged. The final `wrote N samples` line counts V8 samples; for `.cpuprofile` recordings it used to print microseconds.
+- Negative V8 `timeDeltas` no longer shift later samples onto the wrong weights when importing a `.cpuprofile`.
 - `anyprof update` only installs releases from `github.com/anyprofiler/anyprof`. It refuses a receipt that names another repository and ignores the installer's host override variables and `ANYPROF_CLI_INSTALL_DIR`.
 - `anyprof update` says when this binary is newer than the latest release, instead of calling it the latest.
 - On Windows, leaving the old `anyprof.exe.previous.exe` behind is a warning, not a failure, since the new binary is already in place. The warning names the path from before the rename. Once the installer starts, Ctrl+C waits for it to exit so a failed install can restore the old `anyprof.exe`.
