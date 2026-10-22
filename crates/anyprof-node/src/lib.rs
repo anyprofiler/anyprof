@@ -1,13 +1,30 @@
 //! Node.js CPU sampling backend.
 //!
-//! Detection looks at the process name and executable (`node` or `nodejs`) and
-//! does not open the inspector. The intended sampler attaches to the V8
-//! inspector and collects a CPU profile over the Chrome DevTools Protocol.
-//! [`NodeBackend::start`] is still a stub.
+//! Attaches to a running `node` or `nodejs` process by pid. The process does
+//! not need `--inspect` and does not need a restart: on macOS and Linux anyprof
+//! sends `SIGUSR1`, and on Windows it runs `node -e "process._debugProcess(pid)"`.
+//! The V8 inspector then samples via the Chrome DevTools Protocol
+//! (`Profiler.enable`, `Profiler.setSamplingInterval`, `Profiler.start`,
+//! `Profiler.stop`). The `.cpuprofile` document is converted into the unified
+//! [`anyprof_core::Profile`].
+//!
+//! `SIGUSR1`'s default action is to terminate the process. This backend sends
+//! it only after the pid looks like Node. Pass `--inspect ws://...` when the
+//! inspector is already open; that path does not signal.
+//!
+//! macOS is the primary target. The same code path runs on Windows and Linux.
 
+mod attach;
+mod ports;
+
+use std::time::Duration;
+
+use anyprof_cdp::{capture_cpu_profile, sampling_interval_us};
 use anyprof_core::{
-    inspect, Backend, Capabilities, Error, ProcessSnapshot, RecordOptions, Session, Target,
+    Backend, Capabilities, Error, ProcessSnapshot, Profile, RecordOptions, Runtime, Session,
+    Target, inspect,
 };
+use anyprof_export::import_cpuprofile;
 
 /// Node.js sampler.
 #[derive(Debug, Default)]
@@ -44,13 +61,79 @@ impl Backend for NodeBackend {
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
-        // TODO(node): drive the V8 inspector CPU profiler over CDP.
-        let _ = (target, opts);
-        Err(Error::not_implemented(
-            self.name(),
-            "V8 inspector CPU profiles via the Chrome DevTools Protocol are not built yet",
-        ))
+        if opts.duration.is_zero() {
+            return Err(Error::backend(
+                self.name(),
+                "profile duration must be greater than zero",
+            ));
+        }
+        let snapshot = inspect(target.pid).ok_or_else(|| {
+            Error::backend(
+                self.name(),
+                format!(
+                    "refusing to activate the inspector: pid {} does not look like node",
+                    target.pid
+                ),
+            )
+        })?;
+        if !looks_like_node(&snapshot) {
+            return Err(Error::backend(
+                self.name(),
+                format!(
+                    "refusing to activate the inspector: pid {} does not look like node",
+                    target.pid
+                ),
+            ));
+        }
+
+        let websocket =
+            attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
+        let interval_us = sampling_interval_us(opts.frequency_hz);
+        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us)
+            .map_err(|err| Error::backend(self.name(), err.to_string()))?;
+        let imported = import_cpuprofile(&bytes, Runtime::Node)
+            .map_err(|err| Error::backend(self.name(), err.to_string()))?;
+        if imported.stacks.is_empty() {
+            return Err(Error::backend(self.name(), "profiler returned no samples"));
+        }
+        let profile = finish_profile(imported, target.pid, snapshot.comm, opts, interval_us);
+        tracing::info!(
+            pid = target.pid,
+            samples = profile.total_weight(),
+            stacks = profile.stacks.len(),
+            "node profile complete"
+        );
+        Ok(Box::new(ReadySession { profile }))
     }
+}
+
+pub(crate) fn script_hints(cmdline: &[String]) -> Vec<String> {
+    cmdline
+        .iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-') && !is_node_name(arg))
+        .cloned()
+        .collect()
+}
+
+fn finish_profile(
+    mut profile: Profile,
+    pid: u32,
+    comm: Option<String>,
+    opts: &RecordOptions,
+    interval_us: u32,
+) -> Profile {
+    profile.pid = pid;
+    if profile.comm.is_none() {
+        profile.comm = comm;
+    }
+    if profile.duration.is_zero() {
+        profile.duration = opts.duration;
+    }
+    if profile.period.is_none() {
+        profile.period = Some(Duration::from_micros(u64::from(interval_us)));
+    }
+    profile
 }
 
 fn looks_like_node(snapshot: &ProcessSnapshot) -> bool {
@@ -74,16 +157,30 @@ fn looks_like_node(snapshot: &ProcessSnapshot) -> bool {
 
 fn is_node_name(value: &str) -> bool {
     let base = value.rsplit(['/', '\\']).next().unwrap_or(value);
-    base == "node" || base == "nodejs"
+    let stem = match base.len().checked_sub(4) {
+        Some(split) if base[split..].eq_ignore_ascii_case(".exe") => &base[..split],
+        _ => base,
+    };
+    stem.eq_ignore_ascii_case("node") || stem.eq_ignore_ascii_case("nodejs")
+}
+
+struct ReadySession {
+    profile: Profile,
+}
+
+impl Session for ReadySession {
+    fn stop(self: Box<Self>) -> Result<Profile, Error> {
+        Ok(self.profile)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_node;
-    use anyprof_core::{Backend, Error, ProcessSnapshot, RecordOptions, Target};
-    use std::path::PathBuf;
-
+    use super::{is_node_name, looks_like_node, script_hints};
     use crate::NodeBackend;
+    use anyprof_core::{Backend, ProcessSnapshot, RecordOptions, Target};
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     fn snap(comm: Option<&str>, cmdline: &[&str], exe: Option<&str>) -> ProcessSnapshot {
         ProcessSnapshot {
@@ -108,6 +205,8 @@ mod tests {
             &["/usr/bin/node", "server.js"],
             None
         )));
+        assert!(is_node_name(r"C:\Program Files\nodejs\node.EXE"));
+        assert!(is_node_name("nodejs.exe"));
     }
 
     #[test]
@@ -119,6 +218,17 @@ mod tests {
             None
         )));
         assert!(!looks_like_node(&snap(None, &[], None)));
+        assert!(!is_node_name("node.exe.bak"));
+    }
+
+    #[test]
+    fn script_hints_skip_the_binary_and_flags() {
+        let hints = script_hints(&[
+            "node".to_string(),
+            "--inspect-port=9229".to_string(),
+            "server.js".to_string(),
+        ]);
+        assert_eq!(hints, vec!["server.js".to_string()]);
     }
 
     #[test]
@@ -127,16 +237,36 @@ mod tests {
     }
 
     #[test]
-    fn start_reports_not_implemented() {
-        let Err(err) = NodeBackend.start(&Target { pid: 1 }, &RecordOptions::default()) else {
-            panic!("node start should fail until the inspector sampler exists");
+    fn refuses_to_signal_a_process_that_is_not_node() {
+        let Err(err) = NodeBackend.start(
+            &Target { pid: u32::MAX },
+            &RecordOptions {
+                duration: Duration::from_secs(1),
+                ..RecordOptions::default()
+            },
+        ) else {
+            panic!("a missing pid must not be signaled");
         };
-        assert!(matches!(
-            err,
-            Error::NotImplemented {
-                backend: "node",
-                ..
-            }
-        ));
+        let message = err.to_string();
+        assert!(message.contains("does not look like node"), "{message}");
+        assert!(message.contains("refusing"), "{message}");
+    }
+
+    #[test]
+    fn refuses_to_signal_this_test_process() {
+        let Err(err) = NodeBackend.start(
+            &Target {
+                pid: std::process::id(),
+            },
+            &RecordOptions {
+                duration: Duration::from_millis(200),
+                ..RecordOptions::default()
+            },
+        ) else {
+            panic!("the test binary is not node and must not be signaled");
+        };
+        let message = err.to_string();
+        assert!(message.contains("refusing"), "{message}");
+        assert!(message.contains("does not look like node"), "{message}");
     }
 }

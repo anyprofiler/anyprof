@@ -1,12 +1,14 @@
 //! Go CPU sampling backend.
 //!
-//! Detection scans the process executable for the Go build-info magic
-//! (`\xffGo buildinf:`). It does not ptrace the process. Collecting a CPU
-//! profile from an arbitrary live Go runtime is not implemented yet.
+//! Lower priority than Node.js, browser pages, and native C++. Detection still
+//! scans the process executable for the Go build-info magic (`\xffGo buildinf:`)
+//! on Linux so a Go process is not labeled native. It does not ptrace the
+//! process. Collecting a CPU profile from an arbitrary live Go runtime is not
+//! implemented yet.
 
 mod binary;
 
-use anyprof_core::{executable_file, Backend, Capabilities, Error, RecordOptions, Session, Target};
+use anyprof_core::{Backend, Capabilities, Error, RecordOptions, Session, Target, executable_file};
 
 /// Go sampler.
 #[derive(Debug, Default)]
@@ -45,7 +47,9 @@ impl Backend for GoBackend {
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
-        // TODO(go): walk a live Go runtime and collect CPU samples.
+        // TODO(go): lower priority than Node, browser pages, and native C++.
+        // Walk a live Go runtime and collect CPU samples. Linux build-info
+        // detection stays in place so Go is not classified as native.
         let _ = (target, opts);
         Err(Error::not_implemented(
             self.name(),

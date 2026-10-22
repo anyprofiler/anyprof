@@ -161,7 +161,7 @@ pub(crate) fn decode_varints(bytes: &[u8]) -> Result<Vec<u64>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_varints, Reader, Writer};
+    use super::{Reader, Writer, decode_varints};
 
     #[test]
     fn varints_roundtrip() {

@@ -16,6 +16,8 @@ pub enum Runtime {
     Go,
     /// Node.js / V8.
     Node,
+    /// JavaScript in a browser page (Chrome, Chromium, or Edge).
+    Browser,
     /// Python.
     Python,
     /// Java (HotSpot or another JVM).
@@ -32,11 +34,12 @@ pub enum Runtime {
 
 impl Runtime {
     /// Every variant, in a stable order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Native,
         Self::Kernel,
         Self::Go,
         Self::Node,
+        Self::Browser,
         Self::Python,
         Self::Java,
         Self::Ruby,
@@ -53,6 +56,7 @@ impl Runtime {
             Self::Kernel => "kernel",
             Self::Go => "go",
             Self::Node => "node",
+            Self::Browser => "browser",
             Self::Python => "python",
             Self::Java => "java",
             Self::Ruby => "ruby",

@@ -25,6 +25,8 @@ fn record_help_shows_pid_duration_and_format() {
     assert!(stdout.contains("--pid"));
     assert!(stdout.contains("--duration"));
     assert!(stdout.contains("--format"));
+    assert!(stdout.contains("--browser"));
+    assert!(stdout.contains("--inspect"));
     assert!(stdout.contains("30s"));
 }
 
@@ -38,6 +40,7 @@ fn convert_help_shows_from_and_to() {
     assert!(stdout.contains("collapsed"));
     assert!(stdout.contains("speedscope"));
     assert!(stdout.contains("pprof"));
+    assert!(stdout.contains("cpuprofile"));
 }
 
 #[test]

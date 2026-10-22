@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
 use crate::cli::{ConvertArgs, ProfileFormat};
 
@@ -38,8 +38,12 @@ fn infer_format(path: &Path) -> Option<ProfileFormat> {
     if name.ends_with(".pb.gz") || name.ends_with(".pprof") || name.ends_with(".pprof.gz") {
         return Some(ProfileFormat::Pprof);
     }
+    if name.ends_with(".cpuprofile") {
+        return Some(ProfileFormat::Cpuprofile);
+    }
     match Path::new(&name).extension().and_then(|ext| ext.to_str())? {
         "collapsed" | "folded" => Some(ProfileFormat::Collapsed),
+        "cpuprofile" => Some(ProfileFormat::Cpuprofile),
         "json" => Some(ProfileFormat::Speedscope),
         _ => None,
     }
@@ -72,6 +76,10 @@ mod tests {
         assert_eq!(
             infer_format(Path::new("cpu.pb.gz")),
             Some(ProfileFormat::Pprof)
+        );
+        assert_eq!(
+            infer_format(Path::new("profile.cpuprofile")),
+            Some(ProfileFormat::Cpuprofile)
         );
         assert_eq!(infer_format(Path::new("cpu.gz")), None);
     }

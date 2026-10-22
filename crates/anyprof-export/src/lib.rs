@@ -1,8 +1,8 @@
 //! Export and import [`anyprof_core::Profile`] values.
 //!
-//! Collapsed stacks (Brendan Gregg's folded format), speedscope JSON, and
-//! gzip-compressed pprof protobuf can all be written. All three can also be
-//! read back. Collapsed stacks are lossy: file, line, column, module, and
+//! Collapsed stacks (Brendan Gregg's folded format), speedscope JSON,
+//! gzip-compressed pprof protobuf, and V8 `.cpuprofile` JSON can all be written
+//! and read back. Collapsed stacks are lossy: file, line, column, module, and
 //! address are dropped, and identical folded stacks are merged.
 //!
 //! Non-native frames are labeled `[runtime] name` (for example `[node] work`)
@@ -11,14 +11,16 @@
 #![warn(missing_docs)]
 
 mod collapsed;
+mod cpuprofile;
 mod error;
 mod pprof;
 mod proto;
 mod speedscope;
 mod symbol;
 
-use anyprof_core::Profile;
+use anyprof_core::{Profile, Runtime};
 
+pub use cpuprofile::import_cpuprofile;
 pub use error::Error;
 
 /// Profile encodings the CLI can read and write.
@@ -30,6 +32,8 @@ pub enum Format {
     Pprof,
     /// speedscope sampled-profile JSON.
     Speedscope,
+    /// V8 `.cpuprofile` JSON from Node.js or Chrome.
+    Cpuprofile,
 }
 
 impl Format {
@@ -40,6 +44,7 @@ impl Format {
             Self::Collapsed => "collapsed",
             Self::Pprof => "pprof",
             Self::Speedscope => "speedscope",
+            Self::Cpuprofile => "cpuprofile",
         }
     }
 }
@@ -50,6 +55,7 @@ pub fn export(profile: &Profile, format: Format) -> Result<Vec<u8>, Error> {
         Format::Collapsed => Ok(collapsed::export_string(profile).into_bytes()),
         Format::Pprof => pprof::export(profile),
         Format::Speedscope => speedscope::export(profile),
+        Format::Cpuprofile => cpuprofile::export(profile),
     }
 }
 
@@ -59,6 +65,9 @@ pub fn import(bytes: &[u8], format: Format) -> Result<Profile, Error> {
         Format::Collapsed => collapsed::import(bytes),
         Format::Pprof => pprof::import(bytes),
         Format::Speedscope => speedscope::import(bytes),
+        // Files saved by Node or Chrome have no runtime prefix, so frames are Node.
+        // Browser capture calls [`import_cpuprofile`] with [`Runtime::Browser`].
+        Format::Cpuprofile => import_cpuprofile(bytes, Runtime::Node),
     }
 }
 

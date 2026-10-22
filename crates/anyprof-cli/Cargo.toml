@@ -14,6 +14,7 @@ name = "anyprof"
 path = "src/main.rs"
 
 [dependencies]
+anyprof-browser.workspace = true
 anyprof-core.workspace = true
 anyprof-export.workspace = true
 anyprof-go.workspace = true
