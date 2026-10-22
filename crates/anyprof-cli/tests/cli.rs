@@ -41,6 +41,7 @@ fn record_help_shows_pid_duration_and_format() {
     assert!(stdout.contains("-d, --duration"));
     assert!(stdout.contains("-f, --format"));
     assert!(stdout.contains("-F, --frequency <HZ>"));
+    assert!(stdout.contains("1..=1000000 Hz"));
     assert!(stdout.contains("--interval <DURATION>"));
     assert!(stdout.contains("100us"));
     assert!(stdout.contains("-B, --browser"));
