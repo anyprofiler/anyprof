@@ -6,8 +6,8 @@
 //! `install-updater` stays off in `dist-workspace.toml`; this subcommand is the
 //! in-process updater cargo-dist documents for axoupdater-as-a-library.
 
-use anyhow::anyhow;
-use axoupdater::{AxoUpdater, AxoupdateError};
+use anyhow::{Context, anyhow};
+use axoupdater::{AxoUpdater, AxoupdateError, Version};
 
 /// cargo-dist app name. The published installers are `anyprof-cli-installer.sh`
 /// and `anyprof-cli-installer.ps1`.
@@ -32,24 +32,28 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // The receipt records the version the installer wrote, which can lag the
+    // running binary. Compare and report against the binary itself.
+    let current = env!("CARGO_PKG_VERSION");
+    let version = current
+        .parse::<Version>()
+        .with_context(|| format!("anyprof's own version {current} is not semver"))?;
+    updater
+        .set_current_version(version)
+        .map_err(install_failure)?;
+
     match updater.run_sync().map_err(install_failure)? {
-        Some(update) => {
-            let old = update.old_version.as_ref().map(ToString::to_string);
-            println!(
-                "{}",
-                format_updated(old.as_deref(), &update.new_version.to_string())
-            );
-        }
-        None => println!("{}", format_already_latest(env!("CARGO_PKG_VERSION"))),
+        Some(update) => println!(
+            "{}",
+            format_updated(current, &update.new_version.to_string())
+        ),
+        None => println!("{}", format_already_latest(current)),
     }
     Ok(())
 }
 
-fn format_updated(old: Option<&str>, new: &str) -> String {
-    match old {
-        Some(old) => format!("anyprof {old} → {new}"),
-        None => format!("anyprof → {new}"),
-    }
+fn format_updated(old: &str, new: &str) -> String {
+    format!("anyprof {old} → {new}")
 }
 
 fn format_already_latest(version: &str) -> String {
@@ -62,6 +66,16 @@ fn reinstall_hint() -> String {
     )
 }
 
+fn writable_hint() -> String {
+    match std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.display().to_string()))
+    {
+        Some(dir) => format!("Check that you can write to {dir}."),
+        None => "Check that you can write to the install directory.".to_string(),
+    }
+}
+
 fn install_failure(err: AxoupdateError) -> anyhow::Error {
     match &err {
         AxoupdateError::NoReceipt { .. }
@@ -70,8 +84,20 @@ fn install_failure(err: AxoupdateError) -> anyhow::Error {
             "anyprof was not installed with the GitHub release installer, so it cannot update itself ({err}).\n{}",
             reinstall_hint()
         ),
-        AxoupdateError::InstallFailed { .. } | AxoupdateError::Io(_) => anyhow!(
-            "anyprof could not replace the installed binary ({err}).\n{}",
+        // The installer's output is already on the terminal, so only the exit
+        // status is worth repeating.
+        AxoupdateError::InstallFailed { status, .. } => anyhow!(
+            "anyprof could not replace the installed binary ({}). {}\n{}",
+            match status {
+                Some(code) => format!("the release installer exited with status {code}"),
+                None => "the release installer did not run to completion".to_string(),
+            },
+            writable_hint(),
+            reinstall_hint()
+        ),
+        AxoupdateError::Io(_) => anyhow!(
+            "anyprof could not replace the installed binary ({err}). {}\n{}",
+            writable_hint(),
             reinstall_hint()
         ),
         other => anyhow!("anyprof update failed: {other}"),
@@ -85,11 +111,7 @@ mod tests {
 
     #[test]
     fn update_lines_name_both_versions() {
-        assert_eq!(
-            format_updated(Some("0.1.0"), "0.1.1"),
-            "anyprof 0.1.0 → 0.1.1"
-        );
-        assert_eq!(format_updated(None, "0.1.1"), "anyprof → 0.1.1");
+        assert_eq!(format_updated("0.1.0", "0.1.1"), "anyprof 0.1.0 → 0.1.1");
         assert_eq!(
             format_already_latest("0.1.1"),
             "anyprof 0.1.1 is already the latest release"
@@ -106,5 +128,20 @@ mod tests {
         assert!(message.contains("anyprof-cli-installer.sh"), "{message}");
         assert!(message.contains("anyprof-cli-installer.ps1"), "{message}");
         assert!(reinstall_hint().contains("releases/latest/download"));
+    }
+
+    #[test]
+    fn failed_install_names_the_exit_status_and_the_directory() {
+        let message = install_failure(AxoupdateError::InstallFailed {
+            status: Some(1),
+            stdout: None,
+            stderr: None,
+        })
+        .to_string();
+        assert!(message.contains("could not replace"), "{message}");
+        assert!(message.contains("exited with status 1"), "{message}");
+        assert!(message.contains("Check that you can write to"), "{message}");
+        assert!(message.contains("anyprof-cli-installer.sh"), "{message}");
+        assert!(!message.contains("Output from the installer"), "{message}");
     }
 }
