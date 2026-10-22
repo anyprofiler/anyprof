@@ -32,14 +32,17 @@ pub enum Command {
     ///
     /// Works for copies installed by the shell or PowerShell release installer.
     /// A `cargo install` build has no install receipt, so this command tells you
-    /// to reinstall with that installer.
+    /// to reinstall with that installer. Releases always come from
+    /// github.com/anyprofiler/anyprof. Once the installer starts, Ctrl+C waits
+    /// for it to exit, so on Windows the old anyprof.exe is restored if the
+    /// install fails.
     #[command(
-        visible_aliases = ["upgrade", "uptate"],
+        visible_alias = "upgrade",
+        alias = "uptate",
         after_help = "\
 Examples:
   anyprof update
-  anyprof upgrade
-  anyprof uptate"
+  anyprof upgrade"
     )]
     Update,
 }
