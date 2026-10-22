@@ -76,18 +76,14 @@ fn speedscope_renders_profiles_in_headless_chrome() {
     }
     let mut cdp = browser.connect();
     for (path, importer) in &cases {
-        let screenshot = check_one(&mut cdp, path, importer);
-        if let Some(dir) = &artifacts {
-            let name = path.file_name().unwrap().to_string_lossy();
-            std::fs::write(dir.join(format!("{name}.png")), &screenshot).unwrap();
-        }
+        check_one(&mut cdp, path, importer, artifacts.as_deref());
     }
     drop(cdp);
     drop(browser);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn check_one(cdp: &mut Cdp, path: &Path, importer: &str) -> Vec<u8> {
+fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, artifacts: Option<&Path>) {
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
     let viewer = ViewerProcess::start(path);
     eprintln!("{name}: {}", viewer.url);
@@ -114,7 +110,8 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str) -> Vec<u8> {
 
     let started = Instant::now();
     let state = loop {
-        let state = cdp.call(
+        // Fails while the landing page's meta refresh navigates; poll again.
+        let state = cdp.try_call(
             session,
             "Runtime.evaluate",
             json!({
@@ -123,7 +120,9 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str) -> Vec<u8> {
             }),
         );
         let state: Value = state
-            .pointer("/result/value")
+            .ok()
+            .as_ref()
+            .and_then(|state| state.pointer("/result/value"))
             .and_then(Value::as_str)
             .and_then(|text| serde_json::from_str(text).ok())
             .unwrap_or(Value::Null);
@@ -143,6 +142,22 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str) -> Vec<u8> {
     };
     // Let the flame graph draw a frame after the import.
     std::thread::sleep(Duration::from_millis(750));
+
+    let shot = cdp.call(
+        session,
+        "Page.captureScreenshot",
+        json!({ "format": "png" }),
+    );
+    let png = base64_decode(shot["data"].as_str().unwrap());
+    if let Some(dir) = artifacts {
+        std::fs::write(dir.join(format!("{name}.png")), &png).unwrap();
+    }
+    let renderer = cdp
+        .console()
+        .into_iter()
+        .find(|line| line.starts_with("WebGL initialized"))
+        .unwrap_or_else(|| "no WebGL renderer logged".to_string());
+    eprintln!("{name}: {renderer}");
 
     let text = state["text"].as_str().unwrap_or_default();
     assert!(
@@ -170,12 +185,6 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str) -> Vec<u8> {
         "{name}: exceptions or CSP violations: {problems:#?}"
     );
 
-    let shot = cdp.call(
-        session,
-        "Page.captureScreenshot",
-        json!({ "format": "png" }),
-    );
-    let png = base64_decode(shot["data"].as_str().unwrap());
     let colored = flame_graph_coverage(&png);
     assert!(
         colored >= 0.02,
@@ -193,7 +202,6 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str) -> Vec<u8> {
         "{name}: rendered ({:.1}% of the flame graph area colored)",
         colored * 100.0
     );
-    png
 }
 
 /// Share of saturated pixels between 20% and 60% of the page height.
@@ -347,6 +355,11 @@ impl Browser {
             // GitHub's Ubuntu images restrict unprivileged user namespaces.
             command.arg("--no-sandbox");
         }
+        if cfg!(windows) {
+            // The default software GL on GPU-less Windows runners (D3D11 WARP)
+            // leaves speedscope's render-to-texture framebuffer incomplete.
+            command.arg("--use-angle=swiftshader");
+        }
         let child = command.spawn().unwrap();
         Self {
             child,
@@ -399,6 +412,17 @@ struct Cdp {
 
 impl Cdp {
     fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Value {
+        self.try_call(session, method, params)
+            .unwrap_or_else(|error| panic!("{method}: {error}"))
+    }
+
+    /// The command's result, or the protocol error it returned.
+    fn try_call(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Value> {
         let id = self.next_id;
         self.next_id += 1;
         let mut message = json!({ "id": id, "method": method, "params": params });
@@ -418,8 +442,10 @@ impl Cdp {
             };
             let value: Value = serde_json::from_str(text.as_str()).unwrap();
             if value.get("id").and_then(Value::as_u64) == Some(id) {
-                assert!(value.get("error").is_none(), "{method}: {}", value["error"]);
-                return value["result"].clone();
+                return match value.get("error") {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(value["result"].clone()),
+                };
             }
             if value.get("method").is_some() {
                 self.events.push(value);
@@ -461,12 +487,15 @@ impl Cdp {
                     let source = entry["source"].as_str().unwrap_or_default();
                     let level = entry["level"].as_str().unwrap_or_default();
                     let text = entry["text"].as_str().unwrap_or_default();
-                    // A missing favicon or source map is not a rendering failure.
-                    let benign = text.contains("favicon") || text.contains(".map");
+                    let url = entry["url"].as_str().unwrap_or_default();
+                    // Chrome asks for /favicon.ico at the origin root, outside
+                    // the token, and DevTools asks for source maps that are
+                    // not shipped. Neither affects rendering.
+                    let benign = url.ends_with("/favicon.ico") || url.ends_with(".map");
                     (level == "error"
                         && !benign
                         && matches!(source, "security" | "network" | "javascript"))
-                    .then(|| format!("{source}: {text}"))
+                    .then(|| format!("{source}: {text} {url}"))
                 }
                 _ => None,
             })
