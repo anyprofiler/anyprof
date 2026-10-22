@@ -1,11 +1,17 @@
 //! Records a real Node process and checks the `.cpuprofile` Chrome can load.
 
-use std::io::Read;
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// The CLI live tests both need 127.0.0.1:9229.
 static PORT_9229: Mutex<()> = Mutex::new(());
