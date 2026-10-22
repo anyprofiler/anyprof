@@ -21,6 +21,7 @@ anyprof-go.workspace = true
 anyprof-native.workspace = true
 anyprof-node.workspace = true
 anyhow.workspace = true
+axoupdater.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 humantime.workspace = true

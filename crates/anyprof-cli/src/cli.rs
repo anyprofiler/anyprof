@@ -28,6 +28,20 @@ pub enum Command {
     /// Convert a profile between collapsed stacks, speedscope, pprof, and cpuprofile.
     #[command(visible_alias = "conv")]
     Convert(ConvertArgs),
+    /// Upgrade this install to the latest GitHub release.
+    ///
+    /// Works for copies installed by the shell or PowerShell release installer.
+    /// A `cargo install` build has no install receipt, so this command tells you
+    /// to reinstall with that installer.
+    #[command(
+        visible_aliases = ["upgrade", "uptate"],
+        after_help = "\
+Examples:
+  anyprof update
+  anyprof upgrade
+  anyprof uptate"
+    )]
+    Update,
 }
 
 #[derive(Debug, Args)]
@@ -475,5 +489,16 @@ mod tests {
         assert!(args.pid.is_none());
         assert_eq!(args.tab.as_deref(), Some("example.com"));
         assert_eq!(args.inspect.as_deref(), Some("9222"));
+    }
+
+    #[test]
+    fn update_aliases_parse() {
+        for name in ["update", "upgrade", "uptate"] {
+            let cli = Cli::try_parse_from(["anyprof", name]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Update),
+                "{name} should select update"
+            );
+        }
     }
 }

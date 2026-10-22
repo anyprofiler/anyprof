@@ -3,6 +3,7 @@ mod convert;
 mod output;
 mod record;
 mod registry;
+mod update;
 
 use anyhow::Result;
 use clap::Parser;
@@ -22,6 +23,7 @@ fn try_main() -> Result<()> {
     match cli.command {
         Command::Record(args) => record::run(args),
         Command::Convert(args) => convert::run(args),
+        Command::Update => update::run(),
     }
 }
 
