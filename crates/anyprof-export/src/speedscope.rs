@@ -240,7 +240,7 @@ struct SampledIn {
 #[cfg(test)]
 mod tests {
     use super::export;
-    use crate::{import, Format};
+    use crate::{Format, import};
     use anyprof_core::Runtime;
 
     #[test]

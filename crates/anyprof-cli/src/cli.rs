@@ -242,28 +242,32 @@ mod tests {
     fn rejects_missing_pid_zero_pid_and_unknown_format() {
         assert!(Cli::try_parse_from(["anyprof", "record", "-o", "out"]).is_err());
         assert!(Cli::try_parse_from(["anyprof", "record", "--pid", "0", "-o", "out"]).is_err());
-        assert!(Cli::try_parse_from([
-            "anyprof",
-            "record",
-            "--pid",
-            "1",
-            "--frequency",
-            "0",
-            "-o",
-            "out"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "anyprof",
-            "record",
-            "--pid",
-            "1",
-            "--format",
-            "flamegraph",
-            "-o",
-            "out"
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "anyprof",
+                "record",
+                "--pid",
+                "1",
+                "--frequency",
+                "0",
+                "-o",
+                "out"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "anyprof",
+                "record",
+                "--pid",
+                "1",
+                "--format",
+                "flamegraph",
+                "-o",
+                "out"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

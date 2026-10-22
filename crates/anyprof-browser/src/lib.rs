@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use anyprof_cdp::{
-    capture_cpu_profile, choose_page, list_targets, parse_inspect, sampling_interval_us,
-    InspectEndpoint,
+    InspectEndpoint, capture_cpu_profile, choose_page, list_targets, parse_inspect,
+    sampling_interval_us,
 };
 use anyprof_core::{
     Backend, Capabilities, Error, Profile, RecordOptions, Runtime, Session, Target,

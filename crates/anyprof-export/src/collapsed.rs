@@ -93,7 +93,7 @@ fn parse_line(line: &str) -> Result<Stack, String> {
 #[cfg(test)]
 mod tests {
     use super::export_string;
-    use crate::{export, import, Format};
+    use crate::{Format, export, import};
     use anyprof_core::{Frame, Profile, Runtime, Stack};
 
     #[test]

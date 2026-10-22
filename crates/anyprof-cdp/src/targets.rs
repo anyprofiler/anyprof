@@ -194,7 +194,7 @@ struct RawTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_node, choose_page, DebugTarget};
+    use super::{DebugTarget, choose_node, choose_page};
 
     fn target(kind: &str, id: &str, url: &str, title: &str) -> DebugTarget {
         DebugTarget {

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyprof_core::{Frame, Profile, Runtime, Stack};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::Error;
 use crate::symbol::{split_runtime_prefix, symbol_base};
@@ -362,7 +362,7 @@ impl Trie {
 #[cfg(test)]
 mod tests {
     use super::import_cpuprofile;
-    use crate::{export, import, Format};
+    use crate::{Format, export, import};
     use anyprof_core::Runtime;
     use std::time::Duration;
 

@@ -75,9 +75,35 @@ Stacks are leaf-first: `frames[0]` is the leaf (the frame that was on-CPU) and t
 
 A frame from a non-native runtime is written as `[runtime] name`, for example `[node] work`, so mixed stacks keep their origin in every format. `.cpuprofile` export keeps that prefix so a browser profile stays `[browser]` when it is imported again.
 
+## Install
+
+Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
+
+macOS and Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.ps1 | iex"
+```
+
+The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
+
+Without a release, build from this repo. That needs Rust 1.85 or newer (the workspace is edition 2024):
+
+```bash
+cargo install --git https://github.com/anyprofiler/anyprof anyprof-cli
+```
+
+Homebrew and npm packages are not published. Those installers stay off until a tap and an npm scope exist.
+
 ## Quick start
 
-Requires Rust 1.85 or newer. CI uses Rust 1.99. Profiling Node also needs `node` on `PATH` when the target is a Windows process (anyprof shells out to `node -e`).
+CI and release builds use Rust 1.99.1 (`rust-toolchain.toml`). Profiling Node also needs `node` on `PATH` when the target is a Windows process (anyprof shells out to `node -e`).
 
 ```bash
 cargo build --release
@@ -152,7 +178,16 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The crate MSRV is 1.85.
+CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The crate MSRV is 1.85, and the workspace uses Rust edition 2024.
+
+### Cutting a release
+
+1. Bump `version` under `[workspace.package]` in `Cargo.toml`. Every crate inherits it.
+2. Commit that change on `main` (the release workflow has to be on the default branch).
+3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.0` is tag `v0.1.0`.
+4. Push the tag: `git push origin v0.1.0`.
+
+Pushing the tag runs `.github/workflows/release.yml`. [cargo-dist](https://axodotdev.github.io/cargo-dist/) builds `anyprof` for Apple Silicon macOS, Intel macOS, 64-bit Windows, and 64-bit Linux (glibc and musl, x86_64 and ARM), then uploads the archives, checksums, shell installer, and PowerShell installer to a GitHub Release.
 
 The live test spawns `node --inspect-port=127.0.0.1:<port>` without telling the backend that port, so port discovery and inspector activation both run. It skips when `node` is not on `PATH`.
 
@@ -166,6 +201,7 @@ The live test spawns `node --inspect-port=127.0.0.1:<port>` without telling the 
 | `crates/anyprof-go` | Go backend (stub; Linux build-info detection works) |
 | `crates/anyprof-export` | collapsed, speedscope, pprof, and `.cpuprofile` |
 | `crates/anyprof-cli` | the `anyprof` binary |
+| `dist-workspace.toml` | cargo-dist release config |
 
 Linux process inspection reads `/proc`. On other Unix systems, detection uses `ps` for the process name and command line. On Windows it uses `tasklist`. Listening-port discovery uses `/proc/<pid>/net/tcp` (filtered by socket inode), `lsof` on macOS, and `netstat` on Windows.
 

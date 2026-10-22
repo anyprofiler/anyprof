@@ -3,7 +3,7 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tungstenite::client::connect_with_config;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
@@ -72,7 +72,9 @@ fn wait_for_samples(
     }
     let started = Instant::now();
     while started.elapsed() < duration {
-        match socket.read() {
+        // Bind the read so the message's drop order does not depend on the edition.
+        let message = socket.read();
+        match message {
             Ok(Message::Ping(payload)) => {
                 socket
                     .send(Message::Pong(payload))

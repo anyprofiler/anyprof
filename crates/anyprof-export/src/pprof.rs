@@ -11,12 +11,12 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use anyprof_core::{Frame, Profile, Runtime, Stack};
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 
 use crate::error::Error;
-use crate::proto::{decode_varints, Reader, Value, Writer};
+use crate::proto::{Reader, Value, Writer, decode_varints};
 use crate::symbol::{format_symbol, parse_symbol};
 
 pub(crate) fn export(profile: &Profile) -> Result<Vec<u8>, Error> {
@@ -515,7 +515,7 @@ fn gunzip_if_needed(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::export;
-    use crate::{import, Format};
+    use crate::{Format, import};
     use anyprof_core::Runtime;
     use std::time::Duration;
 

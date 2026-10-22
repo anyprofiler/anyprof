@@ -14,9 +14,9 @@ mod http;
 mod targets;
 
 pub use client::capture_cpu_profile;
-pub use endpoint::{parse_inspect, InspectEndpoint};
+pub use endpoint::{InspectEndpoint, parse_inspect};
 pub use error::Error;
-pub use targets::{choose_node, choose_page, list_targets, DebugTarget};
+pub use targets::{DebugTarget, choose_node, choose_page, list_targets};
 
 /// Convert a sampling frequency in hertz to V8's microsecond interval.
 ///
