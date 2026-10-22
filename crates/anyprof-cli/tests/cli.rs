@@ -23,6 +23,9 @@ fn help_lists_record_and_convert() {
         stdout.contains("aliases: conv") || stdout.contains("[alias: conv]"),
         "convert alias missing from help:\n{stdout}"
     );
+    assert!(stdout.contains("update"));
+    assert!(stdout.contains("upgrade"));
+    assert!(stdout.contains("uptate"));
 }
 
 #[test]
@@ -41,6 +44,19 @@ fn record_help_shows_pid_duration_and_format() {
     assert!(stdout.contains("-k, --kernel"));
     assert!(stdout.contains("Ctrl+C"));
     assert!(!stdout.contains("default: 30s"));
+}
+
+#[test]
+fn update_without_a_release_receipt_explains_how_to_install() {
+    let output = anyprof(&["update"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("release installer"),
+        "missing receipt should say so: {stderr}"
+    );
+    assert!(stderr.contains("anyprof-cli-installer.sh"), "{stderr}");
+    assert!(stderr.contains("anyprof-cli-installer.ps1"), "{stderr}");
 }
 
 #[test]
