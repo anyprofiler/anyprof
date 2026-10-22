@@ -94,13 +94,15 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anypro
 
 The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
 
-Upgrade an installed binary in place. `upgrade` and `uptate` are the same command:
+Upgrade an installed binary in place. `upgrade` is the same command, and the typo `uptate` works too:
 
 ```bash
 anyprof update
 ```
 
-That downloads the latest GitHub Release and replaces the current binary. If this copy is already current, it says so and exits 0. `anyprof update` only works for a binary the release installer put in place. A `cargo install` build has no install receipt; the command tells you to re-run the installer above.
+That downloads the latest GitHub Release and replaces the current binary. If this copy is already current, or newer than the latest release, it says so and exits 0. `anyprof update` only works for a binary the release installer put in place. A `cargo install` build has no install receipt; the command tells you to re-run the installer above.
+
+Updates only come from `github.com/anyprofiler/anyprof`. The command refuses a receipt that names another repository and ignores the installer's host overrides (`ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL`, `ANYPROF_CLI_INSTALLER_GHE_BASE_URL`, `ANYPROF_CLI_DOWNLOAD_URL`, `INSTALLER_DOWNLOAD_URL`). The installer checks the archive's SHA-256 before it unpacks. Once the installer starts, Ctrl+C waits for it to exit. On Windows the running `anyprof.exe` is moved to `anyprof.exe.previous.exe` during the install and moved back if the install fails. If a leftover `anyprof.exe.previous.exe` can't be deleted afterwards, the update still exits 0 and prints its path so you can delete it.
 
 Without a release, build from this repo. That needs Rust 1.85 or newer (the workspace is edition 2024):
 

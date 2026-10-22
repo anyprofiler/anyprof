@@ -26,6 +26,7 @@ clap.workspace = true
 ctrlc.workspace = true
 humantime.workspace = true
 jiff.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

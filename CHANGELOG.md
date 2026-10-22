@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `anyprof update` only installs releases from `github.com/anyprofiler/anyprof`. It refuses a receipt that names another repository and ignores the installer's host override variables.
+- `anyprof update` says when this binary is newer than the latest release, instead of calling it the latest.
+- On Windows, leaving the old `anyprof.exe.previous.exe` behind is a warning, not a failure, since the new binary is already in place. Once the installer starts, Ctrl+C waits for it to exit so a failed install can restore the old `anyprof.exe`.
+- Clearer `anyprof update` errors: install-location lookups are no longer reported as failed replacements, and the reinstall hint labels the macOS/Linux and Windows commands.
+- `uptate` still works but no longer appears in `--help`.
+
 ## 0.1.1
 
 - Node and browser recordings write the original V8 `.cpuprofile` from `Profiler.stop`, so Chrome DevTools shows a real profile. `convert` rebuilds a DevTools-valid tree (a `(root)` node, `scriptId`, linked children, and `timeDeltas` the same length as `samples`, with `hitCount` omitted). Before sampling, anyprof reads `process.pid` and refuses an inspector that belongs to a different process.

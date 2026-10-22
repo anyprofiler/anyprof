@@ -25,7 +25,10 @@ fn help_lists_record_and_convert() {
     );
     assert!(stdout.contains("update"));
     assert!(stdout.contains("upgrade"));
-    assert!(stdout.contains("uptate"));
+    assert!(
+        !stdout.contains("uptate"),
+        "the typo alias should stay out of help:\n{stdout}"
+    );
 }
 
 #[test]
@@ -46,17 +49,79 @@ fn record_help_shows_pid_duration_and_format() {
     assert!(!stdout.contains("default: 30s"));
 }
 
+/// Runs `anyprof` with every receipt location pointed at an empty directory,
+/// so an install on the test machine can never turn this into a real update.
+fn anyprof_without_receipt(args: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
+    let home = std::env::temp_dir().join(format!(
+        "anyprof-no-receipt-{}-{}",
+        std::process::id(),
+        args.join("-")
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_anyprof"));
+    command
+        .args(args)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LOCALAPPDATA", home.join("AppData").join("Local"))
+        .env_remove("AXOUPDATER_CONFIG_WORKING_DIR")
+        .env_remove("AXOUPDATER_CONFIG_PATH")
+        .env_remove("ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL")
+        .env_remove("ANYPROF_CLI_INSTALLER_GHE_BASE_URL");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run anyprof");
+    let _ = std::fs::remove_dir_all(&home);
+    output
+}
+
 #[test]
 fn update_without_a_release_receipt_explains_how_to_install() {
-    let output = anyprof(&["update"]);
+    let output = anyprof_without_receipt(&["update"], &[]);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!output.status.success(), "{stderr}");
     assert!(
-        stderr.contains("release installer"),
+        stderr.contains("was not installed with the GitHub release installer"),
         "missing receipt should say so: {stderr}"
     );
+    assert!(stderr.contains("macOS and Linux:"), "{stderr}");
     assert!(stderr.contains("anyprof-cli-installer.sh"), "{stderr}");
+    assert!(stderr.contains("Windows (PowerShell):"), "{stderr}");
     assert!(stderr.contains("anyprof-cli-installer.ps1"), "{stderr}");
+}
+
+#[test]
+fn hidden_typo_alias_still_runs_update() {
+    let output = anyprof_without_receipt(&["uptate"], &[]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("was not installed with the GitHub release installer"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn update_ignores_release_host_overrides() {
+    let output = anyprof_without_receipt(
+        &["update"],
+        &[(
+            "ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL",
+            "https://example.invalid",
+        )],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("ignoring ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("github.com/anyprofiler/anyprof"),
+        "{stderr}"
+    );
 }
 
 #[test]
