@@ -245,7 +245,7 @@ The URL looks like `http://127.0.0.1:53211/t/<token>/`. It has no `#fragment`, b
 
 ### Binary size
 
-The viewer adds about 0.8 MiB to the binary. On x86_64 Linux (glibc), the `dist` profile used for releases went from 10,960,848 to 11,773,680 bytes (+794 KiB, +7.4%); stripped, from 8,753,240 to 9,408,752 bytes (+640 KiB); xz-compressed, as in the release `.tar.xz`, from 2,772,496 to 3,117,112 bytes (+337 KiB). About 210 KiB of that is the gzip-compressed speedscope build. Most of the rest is `tiny_http` (about 120 KiB of code), `webbrowser` (about 50 KiB), and `anyprof-web` itself.
+The viewer adds about 0.8 MiB to the binary. On x86_64 Linux (glibc), the `dist` profile used for releases went from 10,964,520 to 11,781,840 bytes (+798 KiB, +7.5%); stripped, from 8,758,528 to 9,417,128 bytes (+643 KiB); xz-compressed, as in the release `.tar.xz`, from 2,773,660 to 3,119,540 bytes (+338 KiB). About 210 KiB of that is the gzip-compressed speedscope build. Most of the rest is `tiny_http` (about 120 KiB of code), `webbrowser` (about 50 KiB), and `anyprof-web` itself.
 
 ### Vendored speedscope
 
