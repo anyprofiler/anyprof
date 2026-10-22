@@ -1,0 +1,3 @@
+using backend 'native' for pid 24861 (on-cpu, kernel-frames, needs-root)
+Recording native pid 24861... (Ctrl+C to stop)
+Error: native backend is not implemented yet: native on-CPU sampling is not built yet (planned order: macOS, Windows, then Linux perf events)

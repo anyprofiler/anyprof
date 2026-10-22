@@ -4,7 +4,7 @@ Capture CPU profiles from any running process, no code changes or restarts neede
 
 anyprof attaches to a live process by pid and writes a CPU profile. The process does not need a profiler baked in, and it does not need to be restarted. Runtimes sit behind one `Backend` trait, and every backend emits the same profile.
 
-**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling and Go sampling are still stubs.
+**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. `anyprof view` opens any of those in a built-in, offline speedscope viewer. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling and Go sampling are still stubs.
 
 ## Goals
 
@@ -54,6 +54,9 @@ anyprof-core        Backend::detect / start -> Session::stop -> Profile
         |
         v
 anyprof-export       collapsed | speedscope | pprof | cpuprofile
+        |
+        v
+anyprof-web          anyprof view / record --web: embedded speedscope on 127.0.0.1
 ```
 
 `Backend` is the extension point:
@@ -136,6 +139,10 @@ anyprof rec -B -t example.com -d 10s -o page.cpuprofile
 anyprof conv -i profile.cpuprofile -o cpu.collapsed -t collapsed
 anyprof conv -i cpu.collapsed -o cpu.speedscope.json -t speedscope
 anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
+
+# Look at a profile in the built-in speedscope viewer (offline).
+anyprof view cpu.cpuprofile
+anyprof rec -p 1234 -d 10s -w
 ```
 
 `record` (`rec`) options:
@@ -153,6 +160,7 @@ anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 | `--interval <DURATION>` | Time between samples, for example `100us`, `1ms`, or `10ms`. The same setting as `-F`, written as a period. Node and browser round it to whole microseconds. |
 | `-k, --kernel` | Ask for kernel frames when the backend supports them. Node and browser profiles do not include kernel frames. |
 | `-b, --backend <node\|browser\|go\|native>` | Skip auto-detection. |
+| `-w, --web` | After writing the file, open it in the built-in viewer, the same as `anyprof view <file>`. `--no-open`, `--port`, and `--web-timeout` (see [Viewing profiles](#viewing-profiles)) require `--web`. |
 | `-v`, `-vv`, `-vvv` | Log more (`info`, `debug`, `trace`). `RUST_LOG` is used when `-v` is not passed. `-h` and `-V` are help and version. |
 
 Default sampling rate when neither `-F` nor `--interval` is passed:
@@ -191,6 +199,58 @@ main;[node] work 3
 [kernel] schedule;[go] runtime.main 4
 ```
 
+## Viewing profiles
+
+`anyprof view <file>` (alias `v`) opens a profile in [speedscope](https://github.com/jlfwong/speedscope) 1.25.0, which is built into the binary. Nothing is downloaded and the profile never leaves the machine. `anyprof rec ... -w` does the same with the file it just wrote: it prints the path as usual, then starts the viewer.
+
+```bash
+anyprof view cpu.cpuprofile
+anyprof v cpu.pb.gz --no-open --port 8123
+anyprof rec -p 1234 -d 10s -w --web-timeout 10m
+```
+
+`view` reads `.cpuprofile`, pprof (`.pb.gz`, gzip-compressed or raw), speedscope JSON, and collapsed stacks. The file is served as-is and speedscope detects the format from its contents, not the extension. pprof is decoded by speedscope's own protobuf importer, so there is no server-side conversion. Formats speedscope reads that anyprof does not write (Linux `perf script`, Instruments, and so on) work too. Java Flight Recorder files do not, because the JFR importer's wasm is not shipped.
+
+| Flag | Meaning |
+| --- | --- |
+| `--no-open` | Print the URL instead of opening a browser. |
+| `--port <PORT>` | Listen on `127.0.0.1:<PORT>`. Default: a free port chosen by the OS. |
+| `--web-timeout <DURATION>` | Stop after this long (`humantime`, for example `10m`). Default: serve until Ctrl+C. |
+
+The viewer serves until Ctrl+C (or SIGTERM, or Ctrl+Break on Windows), then exits 0. The browser tab keeps the profile it already loaded.
+
+anyprof opens the default browser with the [`webbrowser`](https://crates.io/crates/webbrowser) crate (macOS `open`, Windows `ShellExecute`, `xdg-open` and friends elsewhere). It prints the URL instead, together with an `ssh -L <port>:127.0.0.1:<port>` command for viewing from another machine, when:
+
+- `--no-open` is passed,
+- `SSH_CONNECTION` is set,
+- on Linux and the BSDs, neither `DISPLAY` nor `WAYLAND_DISPLAY` is set (WSL is exempt), or
+- opening the browser fails.
+
+The URL looks like `http://127.0.0.1:53211/t/<token>/`. It has no `#fragment`, because macOS `open` and Windows `start` drop fragments. That page is a meta-refresh redirect to `index.html#profileURL=profile&title=<file name>&view=left-heavy`, the hash speedscope reads on startup.
+
+### Security
+
+- The server binds `127.0.0.1` only, never `0.0.0.0` or `::`.
+- Every URL is under `/t/<token>/`, where the token is 128 bits from the OS random number generator (`getrandom`), compared in constant time. A wrong token, or any path outside it, is a 404 that does not reveal whether the token was close.
+- Only the embedded speedscope files and the one profile (`/t/<token>/profile`) are served. Asset names are looked up in a table compiled into the binary, so there is no filesystem access and no path traversal; `..`, `/`, `\`, and percent-encoded names all miss the table and get a 404.
+- Only `GET` and `HEAD` are accepted (others are 405). There are no CORS headers, so other origins cannot read responses.
+- Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, and this Content Security Policy:
+
+  ```
+  default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'
+  ```
+
+  Everything is same-origin. `'wasm-unsafe-eval'` is there because speedscope's C++/Rust symbol demangler is a WebAssembly module inside its JS bundle; it allows compiling wasm, not JS `eval`. `style-src 'unsafe-inline'` is there because speedscope styles its UI with aphrodite (CSS-in-JS), which writes rules into a `<style>` element; without it the UI is unstyled and the flame graph fails to lay out. No `blob:`, `data:`, or remote sources are allowed.
+- Anyone who can read the URL (for example from your shell scrollback, or another user on a shared machine who can see the process's output) can load the profile until the viewer stops. Use `--web-timeout` on shared machines.
+
+### Binary size
+
+The viewer adds about 0.8 MiB to the binary. On x86_64 Linux (glibc), the `dist` profile used for releases went from 10,960,848 to 11,773,680 bytes (+794 KiB, +7.4%); stripped, from 8,753,240 to 9,408,752 bytes (+640 KiB); xz-compressed, as in the release `.tar.xz`, from 2,772,496 to 3,117,112 bytes (+337 KiB). About 210 KiB of that is the gzip-compressed speedscope build. Most of the rest is `tiny_http` (about 120 KiB of code), `webbrowser` (about 50 KiB), and `anyprof-web` itself.
+
+### Vendored speedscope
+
+`crates/anyprof-web/vendor/speedscope/` holds speedscope 1.25.0's static build, one `<name>.gz` per file. `crates/anyprof-web/scripts/vendor-speedscope.sh` recreates it: it downloads the npm tarball, checks its sha256, drops the example profile (`perf-vertx-*.txt`) and the Java Flight Recorder wasm (`jfrview_bg*.wasm`), and gzips the rest with `gzip -n -9`. The files are embedded with [`include_dir`](https://crates.io/crates/include_dir) and sent with `Content-Encoding: gzip` (decompressed on the fly for a client that does not accept gzip). To upgrade, change `VERSION` and `SHA256` in the script and rerun it.
+
 ## Permissions
 
 Node attach does not need root. On macOS and Linux, anyprof sends `SIGUSR1` only when the process looks like `node` or `nodejs` (including `node.exe`). That signal's default action is to terminate a process, so a pid that does not look like Node is refused before anything is signaled. Profile a process that is already running: during the first moments of startup, before Node installs its handler, `SIGUSR1` still terminates the process. If you pass `--inspect` with a `ws://` URL, anyprof does not signal. After a profile, Node may keep the inspector listening on `127.0.0.1` until the process exits.
@@ -217,7 +277,7 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The crate MSRV is 1.85, and the workspace uses Rust edition 2024.
+CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope JSON in `anyprof view`, and checks that the viewer served the profile, that speedscope used the matching importer, that the page logged no exceptions or CSP violations, and that the screenshot contains a flame graph. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The crate MSRV is 1.85, and the workspace uses Rust edition 2024.
 
 ### Cutting a release
 
@@ -239,6 +299,7 @@ The live test spawns `node --inspect-port=127.0.0.1:<port>` without telling the 
 | `crates/anyprof-native` | Native backend (stub; pid fallback) |
 | `crates/anyprof-go` | Go backend (stub; Linux build-info detection works) |
 | `crates/anyprof-export` | collapsed, speedscope, pprof, and `.cpuprofile` |
+| `crates/anyprof-web` | `anyprof view`: localhost server, embedded speedscope, browser opener |
 | `crates/anyprof-cli` | the `anyprof` binary |
 | `dist-workspace.toml` | cargo-dist release config |
 
@@ -247,3 +308,12 @@ Linux process inspection reads `/proc`. On other Unix systems, detection uses `p
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+### Third-party licenses
+
+The `anyprof` binary embeds third-party files for `anyprof view`:
+
+- [speedscope](https://github.com/jlfwong/speedscope) 1.25.0, MIT License, copyright (c) 2018 Jamie Wong: [`LICENSE-speedscope.txt`](crates/anyprof-web/vendor/licenses/LICENSE-speedscope.txt).
+- Source Code Pro (the font speedscope uses), SIL Open Font License 1.1, copyright 2010-2019 Adobe: [`LICENSE-source-code-pro.md`](crates/anyprof-web/vendor/licenses/LICENSE-source-code-pro.md).
+
+Both license files are included in every release archive next to `LICENSE`.
