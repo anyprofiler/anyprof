@@ -79,8 +79,11 @@ fn assert_devtools_profile(bytes: &[u8], script_name: &str) {
     let nodes = value["nodes"].as_array().expect("nodes");
     let samples = value["samples"].as_array().expect("samples");
     let deltas = value["timeDeltas"].as_array().expect("timeDeltas");
+    // 2s at 99 Hz is only ~200 ticks, and a loaded macOS runner has landed
+    // just under a cutoff of 40. The old exporter bug wrote one or two
+    // aggregated samples, so a much lower floor still catches that.
     assert!(
-        samples.len() >= 40,
+        samples.len() >= 15,
         "expected many samples, got {}",
         samples.len()
     );
@@ -177,6 +180,8 @@ fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
         pid.as_str(),
         "--duration",
         "2s",
+        "--frequency",
+        "1000",
         "--format",
         "cpuprofile",
         "-o",
