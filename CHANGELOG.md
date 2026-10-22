@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `-F` above 1000000 Hz is rejected with a clear message. It used to print a `0us` sampling banner while V8 sampled every 1us.
+- The idle warning shows its percentage with one decimal and never rounds a share above 95% down to `95%`.
+- Node's `-v` log reports the V8 sample count in `samples`, not the total of microsecond weights.
+
 ## 0.1.2
 
 - Node and browser recordings sample every 100us (10 kHz) by default, the same rate as a Chrome DevTools Performance recording. The old 99 Hz default (a 10101us V8 interval) took about 80 times fewer samples and missed short request handling on a mostly idle server. Go and native keep 99 Hz. An explicit `-F` still wins, and `record` prints the rate it uses.

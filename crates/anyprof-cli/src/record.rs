@@ -209,11 +209,11 @@ fn uninformative_reason(profile: &Profile, counts: SampleCounts) -> Option<Strin
     if counts.idle_above(IDLE_WARNING_PERCENT) && counts.non_idle() < IDLE_WARNING_MAX_WORK_SAMPLES
     {
         return Some(format!(
-            "{} of {} samples ({}%) are (idle) or (program) and only {} caught work, so the process was mostly waiting. \
+            "{} of {} samples ({}) are (idle) or (program) and only {} caught work, so the process was mostly waiting. \
              To profile request handling, record while it is under load, for example by sending it requests during the recording",
             counts.idle,
             counts.total,
-            u128::from(counts.idle) * 100 / u128::from(counts.total),
+            idle_percent(counts),
             counts.non_idle()
         ));
     }
@@ -226,6 +226,24 @@ fn uninformative_reason(profile: &Profile, counts: SampleCounts) -> Option<Strin
     } else {
         Some("profile only contains (idle), (program), or (garbage collector)".to_string())
     }
+}
+
+/// Idle share with one decimal for a profile that is above
+/// [`IDLE_WARNING_PERCENT`].
+///
+/// Rounds down, so `100.0%` means every sample was idle, except that a share
+/// just above the threshold is shown as `95.1%` rather than the `95.0%` it
+/// exceeded.
+fn idle_percent(counts: SampleCounts) -> String {
+    let total = u128::from(counts.total.max(1));
+    let floor = u128::from(counts.idle) * 1000 / total;
+    let threshold = u128::from(IDLE_WARNING_PERCENT) * 10;
+    let tenths = if floor <= threshold && counts.idle_above(IDLE_WARNING_PERCENT) {
+        threshold + 1
+    } else {
+        floor
+    };
+    format!("{}.{}%", tenths / 10, tenths % 10)
 }
 
 /// `--interval`, or `--frequency` converted to an interval. `None` leaves the
@@ -300,8 +318,8 @@ fn select<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_interval, format_clock, requested_interval, status_line, uninformative_reason,
-        validate,
+        describe_interval, format_clock, idle_percent, requested_interval, status_line,
+        uninformative_reason, validate,
     };
     use crate::cli::RecordArgs;
     use anyprof_core::{Frame, Profile, Runtime, Stack};
@@ -414,7 +432,7 @@ mod tests {
     fn mostly_idle_recordings_suggest_recording_under_load() {
         let idle = profile(&[(&["(idle)"], 848), (&["(program)"], 1), (&["handle"], 1)]);
         let message = reason(&idle).unwrap();
-        assert!(message.contains("849 of 850 samples (99%)"), "{message}");
+        assert!(message.contains("849 of 850 samples (99.8%)"), "{message}");
         assert!(message.contains("(idle) or (program)"), "{message}");
         assert!(message.contains("only 1 caught work"), "{message}");
         assert!(message.contains("under load"), "{message}");
@@ -460,5 +478,20 @@ mod tests {
             uninformative_reason(&gc, SampleCounts { total: 0, idle: 0 }).as_deref(),
             Some("profile has 0 samples")
         );
+    }
+
+    #[test]
+    fn idle_percent_never_rounds_down_to_the_threshold() {
+        let percent = |idle, total| idle_percent(SampleCounts { total, idle });
+        assert_eq!(percent(96, 101), "95.1%");
+        assert_eq!(percent(95_001, 100_000), "95.1%");
+        assert_eq!(percent(951, 1000), "95.1%");
+        assert_eq!(percent(959, 1000), "95.9%");
+        assert_eq!(percent(32_530, 32_531), "99.9%");
+        assert_eq!(percent(19_585, 19_585), "100.0%");
+
+        let just_over = profile(&[(&["(idle)"], 96), (&["handle"], 5)]);
+        let message = reason(&just_over).unwrap();
+        assert!(message.contains("96 of 101 samples (95.1%)"), "{message}");
     }
 }

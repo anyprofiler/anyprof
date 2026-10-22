@@ -116,7 +116,7 @@ impl Backend for NodeBackend {
         let profile = finish_profile(imported, target.pid, snapshot.comm, opts, interval_us);
         tracing::info!(
             pid = target.pid,
-            samples = profile.total_weight(),
+            samples = anyprof_export::sample_counts(&profile).total,
             stacks = profile.stacks.len(),
             "node profile complete"
         );
