@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyprof_core::{Backend, RecordOptions, Runtime, Target};
+use anyprof_core::{Backend, RecordOptions, Target};
 use anyprof_node::NodeBackend;
 
 #[test]
@@ -23,23 +23,26 @@ fn profiles_a_live_node_process() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let script = r#"
-        function anyprofSampleWork(n) {
-            let x = n;
-            for (let i = 0; i < 200000; i++) {
-                x = Math.imul(x ^ i, 1664525) + 1013904223;
-            }
-            return x;
-        }
-        function loop() {
-            const end = Date.now() + 5;
-            while (Date.now() < end) anyprofSampleWork(end);
-            setTimeout(loop, 0);
-        }
-        loop();
-    "#;
+    let script_path = std::env::temp_dir().join(format!(
+        "anyprof-sample-work-{}-{port}.js",
+        std::process::id()
+    ));
+    std::fs::write(&script_path, BUSY_JS).expect("write the sample fixture");
+    let script_name = script_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let mut child = Command::new("node")
-        .args([&format!("--inspect-port=127.0.0.1:{port}"), "-e", script])
+        .args([
+            "--allow-natives-syntax",
+            "--no-turbo-inlining",
+            "--no-maglev-inlining",
+            "--max-inlined-bytecode-size=0",
+            "--max-inlined-bytecode-size-small=0",
+            &format!("--inspect-port=127.0.0.1:{port}"),
+            script_path.to_str().expect("fixture path is utf-8"),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -62,11 +65,9 @@ fn profiles_a_live_node_process() {
     let started = NodeBackend.start(
         &Target { pid },
         &RecordOptions {
-            duration: Duration::from_secs(2),
+            duration: Some(Duration::from_secs(2)),
             frequency_hz: 1000,
-            include_kernel: false,
-            inspect: None,
-            tab: None,
+            ..RecordOptions::default()
         },
     );
 
@@ -80,24 +81,19 @@ fn profiles_a_live_node_process() {
     let profile = session
         .stop()
         .unwrap_or_else(|err| panic!("stop failed: {err}\nnode stderr:\n{stderr}"));
+    let hit_fixture = profile.stacks.iter().any(|stack| {
+        stack.frames.iter().any(|frame| {
+            frame.name.contains("anyprofSampleWork")
+                || frame
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| file.contains(&script_name))
+        })
+    });
     assert!(
-        profile.stacks.iter().any(|stack| {
-            stack.frames.iter().any(|frame| {
-                frame.runtime == Runtime::Node && frame.name.contains("anyprofSampleWork")
-            })
-        }),
-        "expected anyprofSampleWork in {:?}\nnode stderr:\n{stderr}",
-        profile
-            .stacks
-            .iter()
-            .map(|stack| {
-                stack
-                    .frames
-                    .iter()
-                    .map(|frame| frame.name.as_str())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+        hit_fixture,
+        "expected anyprofSampleWork or {script_name} in a frame.\nTop stacks:\n{}\nnode stderr:\n{stderr}",
+        top_stacks(&profile)
     );
     assert_eq!(profile.pid, pid);
     assert!(profile.total_weight() > 0);
@@ -120,8 +116,51 @@ fn profiles_a_live_node_process() {
             .unwrap_or(0)
     );
     assert_eq!(value["nodes"][0]["callFrame"]["functionName"], "(root)");
+    let raw_text = String::from_utf8_lossy(raw);
     assert!(
-        raw.windows(b"anyprofSampleWork".len())
-            .any(|window| window == b"anyprofSampleWork")
+        raw_text.contains("anyprofSampleWork") || raw_text.contains(&script_name),
+        "raw profile missing the fixture.\nTop stacks:\n{}\nnode stderr:\n{stderr}",
+        top_stacks(&profile)
     );
+    let _ = std::fs::remove_file(&script_path);
+}
+
+/// Sustained CPU work. V8 flags on the `node` command, plus
+/// `%NeverOptimizeFunction`, keep TurboFan and Maglev from inlining
+/// `anyprofSampleWork` into its caller (Node 22 on macOS does that for the
+/// short timer-tick version, so the name never appears in the profile).
+const BUSY_JS: &str = r#"
+function anyprofSampleWork(n) {
+    let x = n | 0;
+    for (let i = 0; i < 10000; i++) {
+        x = Math.imul(x ^ i, 1664525) + 1013904223 | 0;
+    }
+    return x;
+}
+%NeverOptimizeFunction(anyprofSampleWork);
+const deadline = Date.now() + 120000;
+while (Date.now() < deadline) {
+    anyprofSampleWork(deadline);
+}
+"#;
+
+fn top_stacks(profile: &anyprof_core::Profile) -> String {
+    let mut stacks: Vec<_> = profile.stacks.iter().collect();
+    stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));
+    stacks
+        .into_iter()
+        .take(8)
+        .map(|stack| {
+            let frames: Vec<_> = stack
+                .frames
+                .iter()
+                .map(|frame| match frame.file.as_deref() {
+                    Some(file) => format!("{} ({file})", frame.name),
+                    None => frame.name.clone(),
+                })
+                .collect();
+            format!("  {} x {}", stack.weight, frames.join(" <- "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

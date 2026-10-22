@@ -63,6 +63,7 @@ trait Backend {
     fn name(&self) -> &'static str;
     fn detect(&self, pid: u32) -> bool;
     fn capabilities(&self) -> Capabilities;
+    fn default_format(&self) -> Format;
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error>;
 }
 
@@ -109,40 +110,55 @@ CI and release builds use Rust 1.99.1 (`rust-toolchain.toml`). Profiling Node al
 cargo build --release
 
 # Node.js. The process does not need to have been started with --inspect.
-# `.cpuprofile` is inferred from the file name. Open cpu.cpuprofile in Chrome DevTools.
-anyprof record --pid 1234 --duration 10s -o cpu.cpuprofile
+# Omit -d to record until Ctrl+C. Omit -o to write an auto-named .cpuprofile.
+anyprof rec -p 1234 -d 10s -o cpu.cpuprofile
+anyprof rec -p 1234
 
 # Pin the inspector port, or pass a websocket URL you already have.
-anyprof record --pid 1234 --inspect 9229 --duration 10s --format speedscope -o cpu.json
-anyprof record --pid 1234 --inspect ws://127.0.0.1:9229/<id> --duration 10s -o cpu.collapsed
+anyprof rec -p 1234 -i 9229 -d 10s -f speedscope -o cpu.json
+anyprof rec -p 1234 -i ws://127.0.0.1:9229/<id> -d 10s -o cpu.collapsed
 
 # Browser tab. Start the browser yourself:
 #   chrome --remote-debugging-port=9222
-anyprof record --browser --tab example.com --duration 10s -o page.cpuprofile
+anyprof rec -B -t example.com -d 10s -o page.cpuprofile
 
 # Import an existing V8 profile.
-anyprof convert -i profile.cpuprofile -o cpu.collapsed
-anyprof convert -i cpu.collapsed -o cpu.speedscope.json --to speedscope
-anyprof convert -i cpu.collapsed -o cpu.pb.gz --to pprof
+anyprof conv -i profile.cpuprofile -o cpu.collapsed -t collapsed
+anyprof conv -i cpu.collapsed -o cpu.speedscope.json -t speedscope
+anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 ```
 
-`record` options:
+`record` (`rec`) options:
 
 | Flag | Meaning |
 | --- | --- |
-| `--pid <PID>` | Process to profile. Required unless `--browser` is set. |
-| `--browser` | Profile a browser tab instead of a pid. |
-| `--tab <URL_TITLE_OR_ID>` | Which tab. Target id, or a substring of the URL or title. Requires `--browser`. |
-| `--inspect <PORT_OR_URL>` | Inspector or remote-debugging endpoint: a port, `host:port`, `http://` URL, or `ws://` URL. Node uses a port that process is listening on, then 9229. Before sampling, anyprof reads `process.pid` and refuses the connection when it is a different process. Browser defaults to `127.0.0.1:9222`. |
-| `--duration <DURATION>` | How long to sample. Default `30s`. Accepts `humantime` values such as `90s` or `1m30s`. |
-| `-o, --output <PATH>` | Output file. Required. The extension selects the format when `--format` is omitted. |
-| `--format <collapsed\|pprof\|speedscope\|cpuprofile>` | Output format. Inferred from `-o`: `.cpuprofile`, `.pb.gz`/`.pprof`, `.speedscope.json`, `.collapsed`/`.folded`/`.txt`. With no recognized extension, Node and browser default to cpuprofile and other backends default to collapsed. |
-| `--frequency <HZ>` | Requested sampling rate. Default `99`, which Node and Chrome receive as a 10101 microsecond V8 sampling interval. |
-| `--kernel` | Ask for kernel frames when the backend supports them. Node and browser profiles do not include kernel frames. |
-| `--backend <node\|browser\|go\|native>` | Skip auto-detection. |
-| `-v`, `-vv`, `-vvv` | Log more (`info`, `debug`, `trace`). `RUST_LOG` is used when `-v` is not passed. |
+| `-p, --pid <PID>` | Process to profile. Required unless `-B` / `--browser` is set. |
+| `-B, --browser` | Profile a browser tab instead of a pid. |
+| `-t, --tab <URL_TITLE_OR_ID>` | Which tab. Target id, or a substring of the URL or title. Requires `--browser`. |
+| `-i, --inspect <PORT_OR_URL>` | Inspector or remote-debugging endpoint: a port, `host:port`, `http://` URL, or `ws://` URL. Node uses a port that process is listening on, then 9229. Before sampling, anyprof reads `process.pid` and refuses the connection when it is a different process. Browser defaults to `127.0.0.1:9222`. |
+| `-d, --duration <DURATION>` | How long to sample. Omit it to record until Ctrl+C (SIGINT). SIGTERM, and on Windows Ctrl+Break, end the recording the same way and still write the file. A second Ctrl+C while the profile is being saved exits immediately. Accepts `humantime` values such as `90s` or `1m30s`. There is no default duration. |
+| `-o, --output <PATH>` | Output file or directory. Optional. Omit it, pass an existing directory, `.`, `..`, or a trailing `/` or `\`, and anyprof writes `anyprof-<backend>-<pid-or-tab>-YYYYMMDD-HHMMSS.<ext>` there (local time, no colons). If that name exists, `-2`, `-3`, ... is inserted before the full extension. A leading `~` expands to the home directory. Relative paths use the current directory. The path printed at the end is absolute. An explicit file is overwritten. |
+| `-f, --format <collapsed\|pprof\|speedscope\|cpuprofile>` | Output format. An explicit value wins. Otherwise an output *file* extension is used. A directory or omitted `-o` uses the backend default below. |
+| `-F, --frequency <HZ>` | Requested sampling rate. Default `99`, which Node and Chrome receive as a 10101 microsecond V8 sampling interval. |
+| `-k, --kernel` | Ask for kernel frames when the backend supports them. Node and browser profiles do not include kernel frames. |
+| `-b, --backend <node\|browser\|go\|native>` | Skip auto-detection. |
+| `-v`, `-vv`, `-vvv` | Log more (`info`, `debug`, `trace`). `RUST_LOG` is used when `-v` is not passed. `-h` and `-V` are help and version. |
 
-`convert` reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `--from` is inferred from the file name (`.collapsed`, `.folded`, `.txt`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. A `.cpuprofile` that carries no `[runtime]` prefix is imported as Node. A `.cpuprofile` written by `convert` is rebuilt from the unified stacks and is still a tree Chrome DevTools accepts.
+While stderr is a terminal, `record` redraws one status line (`Recording node pid 1234... 00:12 elapsed (Ctrl+C to stop)`, or with time left when `-d` is set). A pipe or file gets a single start line.
+
+Default format when `-f` is omitted and `-o` is not a recognized file name:
+
+| Backend | Default | Extension | Open with |
+| --- | --- | --- | --- |
+| `node` | cpuprofile | `.cpuprofile` | Chrome DevTools Performance panel, VS Code |
+| `browser` | cpuprofile | `.cpuprofile` | Chrome DevTools Performance panel |
+| `go` | pprof | `.pb.gz` | `go tool pprof`, pprof web UI |
+| `native` | pprof | `.pb.gz` | `go tool pprof`, pprof web UI |
+| Python, Ruby, PHP, and other scripting runtimes (planned) | speedscope | `.speedscope.json` | [speedscope.app](https://www.speedscope.app) |
+
+`-o cpu.collapsed` still writes collapsed stacks for Node. `--format pprof -o cpu.cpuprofile` still writes pprof. A directory named `profiles.cpuprofile` does not select the format; the backend default does.
+
+`convert` (`conv`) reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `-f` / `--from` is inferred from the file name (`.collapsed`, `.folded`, `.txt`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. `-t` / `--to` is the output format. `-i` / `--input` and `-o` / `--output` are the files. A `.cpuprofile` that carries no `[runtime]` prefix is imported as Node. A `.cpuprofile` written by `convert` is rebuilt from the unified stacks and is still a tree Chrome DevTools accepts.
 
 Collapsed stacks keep the runtime label and function name. Speedscope also keeps file, line, and column. pprof also keeps the instruction address, duration, and sampling period. A frame's module is not written yet.
 
@@ -167,7 +183,7 @@ Native sampling is not built yet. When the Linux perf sampler lands it will need
 
 1. **Node.js** via the V8 inspector, on macOS, then Windows, then Linux. This is implemented.
 2. **C++ (native)** on-CPU sampling, in the same platform order, and **browser pages** over the DevTools Protocol. Browser pages are implemented. Native sampling is the next sampler.
-3. **Rust**, then **Go** (detection already exists on Linux), then Python, Java, Ruby, PHP, and .NET.
+3. **Rust**, then **Go** (detection already exists on Linux), then Python, Java, Ruby, PHP, and .NET. Those scripting backends should default to speedscope (see the format table above). Go already defaults to pprof.
 4. Linux perf events are last among the native platform backends, after macOS and Windows.
 
 ## Development

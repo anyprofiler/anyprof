@@ -1,7 +1,10 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::Error;
+use crate::format::Format;
 use crate::profile::Profile;
+use crate::stop::StopGate;
 
 /// What a backend is able to collect.
 ///
@@ -70,10 +73,16 @@ pub struct Target {
 }
 
 /// Options for one recording session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// [`RecordOptions::default`] samples for 30 seconds. The CLI does not use that
+/// default: omitting `-d` passes [`None`] and the recording runs until
+/// [`StopGate`] is signaled.
+#[derive(Debug, Clone)]
 pub struct RecordOptions {
     /// How long to sample.
-    pub duration: Duration,
+    ///
+    /// `None` means sample until [`Self::stop`] is signaled. `Some(0)` is rejected.
+    pub duration: Option<Duration>,
     /// Requested sampling frequency in hertz.
     pub frequency_hz: u32,
     /// Ask for kernel frames when [`Capabilities::kernel_frames`] is set.
@@ -86,16 +95,19 @@ pub struct RecordOptions {
     pub inspect: Option<String>,
     /// Browser tab selector: target id, or a substring of the page URL or title.
     pub tab: Option<String>,
+    /// Set when the user asks to end sampling. The sampler still returns a profile.
+    pub stop: Arc<StopGate>,
 }
 
 impl Default for RecordOptions {
     fn default() -> Self {
         Self {
-            duration: Duration::from_secs(30),
+            duration: Some(Duration::from_secs(30)),
             frequency_hz: 99,
             include_kernel: false,
             inspect: None,
             tab: None,
+            stop: StopGate::new(),
         }
     }
 }
@@ -127,7 +139,20 @@ pub trait Backend: Send + Sync {
     /// Features this backend is built to provide.
     fn capabilities(&self) -> Capabilities;
 
+    /// Format written when the user does not pass `--format` or a recognized
+    /// output-file extension.
+    ///
+    /// Node.js and browser tabs return [`Format::Cpuprofile`]. Go and native
+    /// return [`Format::Pprof`]. A future Python, Ruby, or PHP backend should
+    /// return [`Format::Speedscope`].
+    fn default_format(&self) -> Format;
+
     /// Begin sampling. The returned session is stopped to obtain a [`Profile`].
+    ///
+    /// When [`RecordOptions::duration`] is `None`, or [`RecordOptions::stop`] is
+    /// signaled early, sampling ends and the session still yields the samples
+    /// collected so far. The target profiler must be stopped on every path,
+    /// including errors, so the process is not left with a profiler attached.
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error>;
 }
 
@@ -178,6 +203,7 @@ impl Registry {
 mod tests {
     use super::{Backend, Capabilities, RecordOptions, Registry, Session, Target};
     use crate::error::Error;
+    use crate::format::Format;
 
     struct Scripted {
         name: &'static str,
@@ -195,6 +221,10 @@ mod tests {
 
         fn capabilities(&self) -> Capabilities {
             Capabilities::none()
+        }
+
+        fn default_format(&self) -> Format {
+            Format::Collapsed
         }
 
         fn start(
@@ -269,8 +299,9 @@ mod tests {
     #[test]
     fn default_record_options_are_thirty_seconds_at_99hz() {
         let opts = RecordOptions::default();
-        assert_eq!(opts.duration, std::time::Duration::from_secs(30));
+        assert_eq!(opts.duration, Some(std::time::Duration::from_secs(30)));
         assert_eq!(opts.frequency_hz, 99);
         assert!(!opts.include_kernel);
+        assert!(!opts.stop.stop_requested());
     }
 }

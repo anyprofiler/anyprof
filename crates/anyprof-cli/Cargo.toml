@@ -22,7 +22,9 @@ anyprof-native.workspace = true
 anyprof-node.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 humantime.workspace = true
+jiff.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

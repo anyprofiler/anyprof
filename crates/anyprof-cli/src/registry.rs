@@ -20,6 +20,11 @@ pub fn default_registry() -> Registry {
 #[cfg(test)]
 mod tests {
     use super::default_registry;
+    use anyprof_browser::BrowserBackend;
+    use anyprof_core::{Backend, Format};
+    use anyprof_go::GoBackend;
+    use anyprof_native::NativeBackend;
+    use anyprof_node::NodeBackend;
 
     #[test]
     fn detection_order_is_node_browser_go_native() {
@@ -27,5 +32,13 @@ mod tests {
             default_registry().names(),
             vec!["node", "browser", "go", "native"]
         );
+    }
+
+    #[test]
+    fn each_backend_defaults_to_its_ecosystem_format() {
+        assert_eq!(NodeBackend.default_format(), Format::Cpuprofile);
+        assert_eq!(BrowserBackend.default_format(), Format::Cpuprofile);
+        assert_eq!(GoBackend.default_format(), Format::Pprof);
+        assert_eq!(NativeBackend.default_format(), Format::Pprof);
     }
 }

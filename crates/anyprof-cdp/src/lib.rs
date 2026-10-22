@@ -34,6 +34,31 @@ mod tests {
     use super::sampling_interval_us;
 
     #[test]
+    fn sampling_runs_until_a_limit_or_a_stop_request() {
+        use std::time::Duration;
+
+        use crate::client::keep_sampling;
+
+        assert!(keep_sampling(Duration::from_secs(1), None, false));
+        assert!(!keep_sampling(Duration::from_secs(1), None, true));
+        assert!(keep_sampling(
+            Duration::from_millis(500),
+            Some(Duration::from_secs(2)),
+            false
+        ));
+        assert!(!keep_sampling(
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+            false
+        ));
+        assert!(!keep_sampling(
+            Duration::from_millis(10),
+            Some(Duration::from_secs(2)),
+            true
+        ));
+    }
+
+    #[test]
     fn frequency_maps_to_microseconds() {
         assert_eq!(sampling_interval_us(1000), 1000);
         assert_eq!(sampling_interval_us(99), 10_101);

@@ -8,7 +8,9 @@
 
 mod binary;
 
-use anyprof_core::{Backend, Capabilities, Error, RecordOptions, Session, Target, executable_file};
+use anyprof_core::{
+    Backend, Capabilities, Error, Format, RecordOptions, Session, Target, executable_file,
+};
 
 /// Go sampler.
 #[derive(Debug, Default)]
@@ -44,6 +46,11 @@ impl Backend for GoBackend {
             kernel_frames: false,
             needs_root: true,
         }
+    }
+
+    fn default_format(&self) -> Format {
+        // `go tool pprof` and the pprof web UI.
+        Format::Pprof
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
