@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
 use crate::cli::{ConvertArgs, ProfileFormat};
 

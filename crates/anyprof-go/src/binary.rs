@@ -46,7 +46,7 @@ fn contains_magic(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_go_build_info, contains_magic, CHUNK, GO_BUILD_INFO_MAGIC};
+    use super::{CHUNK, GO_BUILD_INFO_MAGIC, contains_go_build_info, contains_magic};
     use std::io::Write;
 
     #[test]

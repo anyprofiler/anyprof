@@ -9,7 +9,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyprof_cdp::{choose_node, list_targets, parse_inspect, InspectEndpoint};
+use anyprof_cdp::{InspectEndpoint, choose_node, list_targets, parse_inspect};
 use anyprof_core::Error;
 
 use crate::ports::{listening_ports, prefer_inspector_port};

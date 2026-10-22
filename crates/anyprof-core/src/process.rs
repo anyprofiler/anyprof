@@ -56,11 +56,7 @@ pub fn executable_file(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         let path = PathBuf::from(format!("/proc/{pid}/exe"));
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
+        if path.exists() { Some(path) } else { None }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -170,11 +166,7 @@ fn ps_args(pid: u32) -> Option<Vec<String>> {
     }
     let text = String::from_utf8(output.stdout).ok()?;
     let args: Vec<String> = text.split_whitespace().map(str::to_string).collect();
-    if args.is_empty() {
-        None
-    } else {
-        Some(args)
-    }
+    if args.is_empty() { None } else { Some(args) }
 }
 
 #[cfg(windows)]

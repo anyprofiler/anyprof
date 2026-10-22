@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use anyprof_core::{Backend, RecordOptions, Registry, Target};
 
 use crate::cli::RecordArgs;

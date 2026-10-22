@@ -13,7 +13,7 @@
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
-use anyprof_core::{process_exists, Backend, Capabilities, Error, RecordOptions, Session, Target};
+use anyprof_core::{Backend, Capabilities, Error, RecordOptions, Session, Target, process_exists};
 
 /// Native (C, C++, Rust, and other non-language-runtime) sampler.
 #[derive(Debug, Default)]

@@ -39,5 +39,5 @@ mod profile;
 
 pub use backend::{Backend, Capabilities, RecordOptions, Registry, Session, Target};
 pub use error::Error;
-pub use process::{executable_file, inspect, process_exists, ProcessSnapshot};
+pub use process::{ProcessSnapshot, executable_file, inspect, process_exists};
 pub use profile::{Frame, Profile, Runtime, Stack};

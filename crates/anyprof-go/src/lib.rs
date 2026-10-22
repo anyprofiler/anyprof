@@ -8,7 +8,7 @@
 
 mod binary;
 
-use anyprof_core::{executable_file, Backend, Capabilities, Error, RecordOptions, Session, Target};
+use anyprof_core::{Backend, Capabilities, Error, RecordOptions, Session, Target, executable_file};
 
 /// Go sampler.
 #[derive(Debug, Default)]

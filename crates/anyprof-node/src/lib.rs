@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use anyprof_cdp::{capture_cpu_profile, sampling_interval_us};
 use anyprof_core::{
-    inspect, Backend, Capabilities, Error, ProcessSnapshot, Profile, RecordOptions, Runtime,
-    Session, Target,
+    Backend, Capabilities, Error, ProcessSnapshot, Profile, RecordOptions, Runtime, Session,
+    Target, inspect,
 };
 use anyprof_export::import_cpuprofile;
 
