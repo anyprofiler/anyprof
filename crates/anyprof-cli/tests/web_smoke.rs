@@ -8,6 +8,8 @@
 //! Skips when no Chrome is found unless `ANYPROF_REQUIRE_CHROME` is set (CI
 //! sets it). `ANYPROF_CHROME` overrides the browser path.
 //! `ANYPROF_SMOKE_ARTIFACTS` names a directory to keep the screenshots in.
+//! When a page does not finish loading, a screenshot and a text report are
+//! saved there (or in the scratch directory) before the test fails.
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
@@ -76,14 +78,21 @@ fn speedscope_renders_profiles_in_headless_chrome() {
     }
     let mut cdp = browser.connect();
     for (path, importer) in &cases {
-        check_one(&mut cdp, path, importer, artifacts.as_deref());
+        check_one(
+            &mut cdp,
+            path,
+            importer,
+            artifacts.as_deref().unwrap_or(&dir),
+        );
     }
     drop(cdp);
     drop(browser);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, artifacts: Option<&Path>) {
+/// Load `path` and check it rendered. Screenshots and failure reports go to
+/// `keep`.
+fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
     let viewer = ViewerProcess::start(path);
     eprintln!("{name}: {}", viewer.url);
@@ -131,13 +140,17 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, artifacts: Option<&Path
         if imported && text.contains(&name) && text.contains("Left Heavy") {
             break state;
         }
-        assert!(
-            started.elapsed() < DEADLINE,
-            "{name}: speedscope did not finish loading.\nstate: {state}\nconsole: {:#?}\nlog: {:#?}\nviewer: {}",
-            cdp.console(),
-            cdp.problems(),
-            viewer.stderr()
-        );
+        if started.elapsed() >= DEADLINE {
+            let report = format!(
+                "{name}: speedscope did not finish loading within {DEADLINE:?}.\nurl: {}\nstate: {state}\nconsole: {:#?}\nlog: {:#?}\nviewer: {}",
+                viewer.url,
+                cdp.console(),
+                cdp.problems(),
+                viewer.stderr()
+            );
+            let saved = save_timeout_diagnostics(cdp, session, keep, &name, &report);
+            panic!("{report}\nsaved: {saved:#?}");
+        }
         std::thread::sleep(Duration::from_millis(250));
     };
     // Let the flame graph draw a frame after the import.
@@ -149,9 +162,7 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, artifacts: Option<&Path
         json!({ "format": "png" }),
     );
     let png = base64_decode(shot["data"].as_str().unwrap());
-    if let Some(dir) = artifacts {
-        std::fs::write(dir.join(format!("{name}.png")), &png).unwrap();
-    }
+    std::fs::write(keep.join(format!("{name}.png")), &png).unwrap();
     let renderer = cdp
         .console()
         .into_iter()
@@ -202,6 +213,59 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, artifacts: Option<&Path
         "{name}: rendered ({:.1}% of the flame graph area colored)",
         colored * 100.0
     );
+}
+
+/// Write `<name>.timeout.png` (when the page can still be captured) and
+/// `<name>.timeout.txt` (`report` plus the page's DOM) to `dir`.
+fn save_timeout_diagnostics(
+    cdp: &mut Cdp,
+    session: Option<&str>,
+    dir: &Path,
+    name: &str,
+    report: &str,
+) -> Vec<PathBuf> {
+    let mut saved = Vec::new();
+    let shot = cdp.try_call(
+        session,
+        "Page.captureScreenshot",
+        json!({ "format": "png" }),
+    );
+    let shot_note = match shot.as_ref().map(|shot| shot["data"].as_str()) {
+        Ok(Some(data)) => {
+            let path = dir.join(format!("{name}.timeout.png"));
+            match std::fs::write(&path, base64_decode(data)) {
+                Ok(()) => {
+                    saved.push(path);
+                    "saved".to_string()
+                }
+                Err(err) => format!("not saved: {err}"),
+            }
+        }
+        Ok(None) => "no data in the reply".to_string(),
+        Err(err) => format!("failed: {err}"),
+    };
+    let dom = cdp
+        .try_call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.documentElement ? document.documentElement.outerHTML : ''",
+                "returnByValue": true,
+            }),
+        )
+        .map(|reply| {
+            reply["result"]["value"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_else(|err| format!("(could not read the DOM: {err})"));
+    let text = format!("{report}\n\nscreenshot: {shot_note}\n\ndom:\n{dom}\n");
+    let path = dir.join(format!("{name}.timeout.txt"));
+    if std::fs::write(&path, text).is_ok() {
+        saved.push(path);
+    }
+    saved
 }
 
 /// Share of saturated pixels between 20% and 60% of the page height.
