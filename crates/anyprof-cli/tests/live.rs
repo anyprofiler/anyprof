@@ -229,11 +229,12 @@ fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
     let bytes = std::fs::read(&output_path).expect("read cpuprofile");
     assert_devtools_profile(&bytes, &script_name);
     // DevTools records a median of about 125us. The old 99 Hz default was 10101us.
-    // A loaded Windows runner has delivered a 2ms median for a 100us request, so
-    // the bound only has to rule out the old default.
+    // V8's sampler timer is coarser on Windows: a 100us request has produced a
+    // 2ms median there, so that bound only rules out the old default.
+    let bound = if cfg!(windows) { 5_000 } else { 1_000 };
     let median = median_time_delta_us(&bytes);
     assert!(
-        median < 5_000,
+        median < bound,
         "default sampling should be far denser than 10ms, median timeDelta {median}us: {stderr}"
     );
     let _ = std::fs::remove_file(&output_path);
