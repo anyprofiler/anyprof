@@ -19,7 +19,7 @@ license = "Apache-2.0"
 repository = "https://github.com/anyprofiler/anyprof"
 homepage = "https://github.com/anyprofiler/anyprof"
 authors = ["anyprofiler contributors"]
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Capture CPU profiles from any running process, no code changes or restarts needed."
 
 [workspace.dependencies]

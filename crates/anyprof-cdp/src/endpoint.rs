@@ -59,10 +59,11 @@ fn split_host_port(hostport: &str, default_port: Option<u16>) -> Result<(String,
     if hostport.is_empty() {
         return Err("inspect endpoint is missing a host".to_string());
     }
-    if let Some((host, port)) = hostport.rsplit_once(':') {
-        if !host.is_empty() && !host.contains(':') {
-            return Ok((host.to_string(), parse_port(port)?));
-        }
+    if let Some((host, port)) = hostport.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+    {
+        return Ok((host.to_string(), parse_port(port)?));
     }
     if let Some(port) = default_port {
         return Ok((hostport.to_string(), port));

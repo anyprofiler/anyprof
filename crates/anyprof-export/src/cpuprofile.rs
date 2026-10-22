@@ -56,10 +56,8 @@ pub(crate) fn sample_counts(bytes: &[u8]) -> Result<SampleCounts, Error> {
             .and_then(Value::as_str)
             .unwrap_or("");
         let idle = is_idle_name(name);
-        if idle {
-            if let Some(id) = node.get("id").and_then(Value::as_u64) {
-                idle_nodes.insert(id);
-            }
+        if idle && let Some(id) = node.get("id").and_then(Value::as_u64) {
+            idle_nodes.insert(id);
         }
         let hit = node.get("hitCount").and_then(Value::as_u64).unwrap_or(0);
         hits.total = hits.total.saturating_add(hit);

@@ -269,10 +269,10 @@ fn validate(args: &RecordArgs) -> anyhow::Result<()> {
     {
         return Err(anyhow!("--interval must be at least 1us"));
     }
-    if !args.web {
-        if let Some(flag) = args.viewer.first_flag_set() {
-            return Err(anyhow!("{flag} configures the viewer and requires --web"));
-        }
+    if !args.web
+        && let Some(flag) = args.viewer.first_flag_set()
+    {
+        return Err(anyhow!("{flag} configures the viewer and requires --web"));
     }
     view::validate(&args.viewer)?;
     if args.tab.is_some() && !args.browser {
@@ -284,12 +284,12 @@ fn validate(args: &RecordArgs) -> anyhow::Result<()> {
         if args.pid.is_some() {
             return Err(anyhow!("--browser profiles a tab; omit --pid"));
         }
-        if let Some(name) = args.backend.as_deref() {
-            if name != "browser" {
-                return Err(anyhow!(
-                    "--browser cannot be combined with --backend {name}"
-                ));
-            }
+        if let Some(name) = args.backend.as_deref()
+            && name != "browser"
+        {
+            return Err(anyhow!(
+                "--browser cannot be combined with --backend {name}"
+            ));
         }
     }
     Ok(())

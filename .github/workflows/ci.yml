@@ -49,3 +49,32 @@ jobs:
           if-no-files-found: ignore
       - name: Build
         run: cargo build --workspace --locked
+
+  msrv:
+    name: msrv (Rust 1.88)
+    runs-on: ubuntu-latest
+    env:
+      # Keep in sync with `rust-version` in Cargo.toml. RUSTUP_TOOLCHAIN
+      # overrides the 1.99.1 pin in rust-toolchain.toml.
+      RUSTUP_TOOLCHAIN: "1.88.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the compiler and rust-version
+        shell: bash
+        run: |
+          rustc --version
+          rustc --version | grep -q '^rustc 1\.88\.0 '
+          grep -q '^rust-version = "1.88"$' Cargo.toml
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --locked
+        env:
+          ANYPROF_REQUIRE_CHROME: "1"
