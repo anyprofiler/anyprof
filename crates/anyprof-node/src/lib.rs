@@ -89,13 +89,12 @@ impl Backend for NodeBackend {
         let websocket =
             attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
         let interval_us = sampling_interval_us(opts.frequency_hz);
-        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us)
+        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us, Some(target.pid))
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        let imported = import_cpuprofile(&bytes, Runtime::Node)
+        let mut imported = import_cpuprofile(&bytes, Runtime::Node)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        if imported.stacks.is_empty() {
-            return Err(Error::backend(self.name(), "profiler returned no samples"));
-        }
+        // Keep Profiler.stop's document so `--format cpuprofile` does not rebuild it.
+        imported.raw_cpuprofile = Some(bytes);
         let profile = finish_profile(imported, target.pid, snapshot.comm, opts, interval_us);
         tracing::info!(
             pid = target.pid,

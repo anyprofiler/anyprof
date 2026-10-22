@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow};
-use anyprof_core::{Backend, RecordOptions, Registry, Target};
+use anyprof_core::{Backend, Profile, RecordOptions, Registry, Target};
 
-use crate::cli::RecordArgs;
+use crate::cli::{ProfileFormat, RecordArgs, infer_format};
 use crate::registry::default_registry;
 
 pub fn run(args: RecordArgs) -> anyhow::Result<()> {
@@ -53,8 +53,11 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
         },
     )?;
     let profile = session.stop()?;
-    let format = anyprof_export::Format::from(args.format);
-    let bytes = anyprof_export::export(&profile, format)?;
+    if let Some(warning) = uninformative_reason(&profile) {
+        eprintln!("warning: {warning}");
+    }
+    let format = output_format(&args, backend.name());
+    let bytes = anyprof_export::export(&profile, format.into())?;
     std::fs::write(&args.output, bytes)
         .with_context(|| format!("writing {}", args.output.display()))?;
     eprintln!(
@@ -64,6 +67,45 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
         format.as_str()
     );
     Ok(())
+}
+
+fn output_format(args: &RecordArgs, backend: &str) -> ProfileFormat {
+    if let Some(format) = args.format {
+        return format;
+    }
+    if let Some(format) = infer_format(&args.output) {
+        return format;
+    }
+    match backend {
+        "node" | "browser" => ProfileFormat::Cpuprofile,
+        _ => ProfileFormat::Collapsed,
+    }
+}
+
+fn uninformative_reason(profile: &Profile) -> Option<&'static str> {
+    let has_sample = profile
+        .stacks
+        .iter()
+        .any(|stack| stack.weight > 0 && !stack.frames.is_empty());
+    if !has_sample {
+        return Some("profile has 0 samples");
+    }
+    let useful = profile
+        .stacks
+        .iter()
+        .any(|stack| stack.frames.iter().any(|frame| !is_meta_frame(&frame.name)));
+    if useful {
+        None
+    } else {
+        Some("profile only contains (idle), (program), or (garbage collector)")
+    }
+}
+
+fn is_meta_frame(name: &str) -> bool {
+    matches!(
+        name,
+        "(idle)" | "(program)" | "(garbage collector)" | "(root)" | ""
+    )
 }
 
 fn validate(args: &RecordArgs) -> anyhow::Result<()> {
@@ -109,7 +151,10 @@ mod tests {
     use clap::Parser;
 
     fn record(args: &[&str]) -> RecordArgs {
-        let mut full = vec!["anyprof", "record", "-o", "out"];
+        let mut full = vec!["anyprof", "record"];
+        if !args.iter().any(|arg| *arg == "-o" || *arg == "--output") {
+            full.extend(["-o", "out"]);
+        }
         full.extend_from_slice(args);
         let cli = crate::cli::Cli::try_parse_from(full).unwrap();
         let crate::cli::Command::Record(args) = cli.command else {
@@ -157,5 +202,77 @@ mod tests {
         };
         let message = validate(&args).unwrap_err().to_string();
         assert!(message.contains("--backend node"), "{message}");
+    }
+
+    #[test]
+    fn output_format_uses_the_extension_then_the_backend() {
+        let node = record(&["--pid", "1", "-o", "cpu.cpuprofile"]);
+        assert_eq!(
+            super::output_format(&node, "node"),
+            crate::cli::ProfileFormat::Cpuprofile
+        );
+        let bare = record(&["--pid", "1", "-o", "cpu"]);
+        assert_eq!(
+            super::output_format(&bare, "node"),
+            crate::cli::ProfileFormat::Cpuprofile
+        );
+        assert_eq!(
+            super::output_format(&bare, "browser"),
+            crate::cli::ProfileFormat::Cpuprofile
+        );
+        assert_eq!(
+            super::output_format(&bare, "native"),
+            crate::cli::ProfileFormat::Collapsed
+        );
+        let collapsed = record(&["--pid", "1", "-o", "cpu.collapsed"]);
+        assert_eq!(
+            super::output_format(&collapsed, "node"),
+            crate::cli::ProfileFormat::Collapsed
+        );
+        let explicit = record(&["--pid", "1", "--format", "pprof", "-o", "cpu.cpuprofile"]);
+        assert_eq!(
+            super::output_format(&explicit, "node"),
+            crate::cli::ProfileFormat::Pprof
+        );
+    }
+
+    #[test]
+    fn warns_on_empty_and_idle_only_profiles() {
+        use anyprof_core::{Frame, Runtime, Stack};
+
+        assert_eq!(
+            super::uninformative_reason(&anyprof_core::Profile::default()),
+            Some("profile has 0 samples")
+        );
+        let idle = anyprof_core::Profile {
+            stacks: vec![
+                Stack {
+                    frames: vec![Frame::new(Runtime::Node, "(idle)")],
+                    weight: 10,
+                },
+                Stack {
+                    frames: vec![Frame::new(Runtime::Node, "(program)")],
+                    weight: 2,
+                },
+                Stack {
+                    frames: vec![Frame::new(Runtime::Node, "(garbage collector)")],
+                    weight: 1,
+                },
+            ],
+            ..anyprof_core::Profile::default()
+        };
+        assert!(
+            super::uninformative_reason(&idle)
+                .unwrap()
+                .contains("(idle)")
+        );
+        let busy = anyprof_core::Profile {
+            stacks: vec![Stack {
+                frames: vec![Frame::new(Runtime::Node, "anyprofSampleWork")],
+                weight: 4,
+            }],
+            ..anyprof_core::Profile::default()
+        };
+        assert_eq!(super::uninformative_reason(&busy), None);
     }
 }

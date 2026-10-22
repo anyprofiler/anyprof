@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -31,9 +31,10 @@ pub enum Command {
 #[derive(Debug, Args)]
 #[command(after_help = "\
 Examples:
-  anyprof record --pid 1234 --duration 30s -o cpu.collapsed
+  anyprof record --pid 1234 --duration 10s -o cpu.cpuprofile
+  anyprof record --pid 1234 --duration 30s --format collapsed -o cpu.collapsed
   anyprof record --pid 1234 --inspect 9229 --duration 10s --format speedscope -o cpu.json
-  anyprof record --browser --tab example.com --duration 10s -o page.collapsed")]
+  anyprof record --browser --tab example.com --duration 10s -o page.cpuprofile")]
 pub struct RecordArgs {
     /// Process to profile. Required unless `--browser` is set.
     #[arg(
@@ -64,9 +65,15 @@ pub struct RecordArgs {
     #[arg(short, long, value_name = "PATH")]
     pub output: PathBuf,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value = "collapsed")]
-    pub format: ProfileFormat,
+    /// Output format. Inferred from `-o` when omitted.
+    ///
+    /// `.cpuprofile` is cpuprofile, `.pb.gz` and `.pprof` are pprof,
+    /// `.speedscope.json` is speedscope, and `.collapsed`, `.folded`, and
+    /// `.txt` are collapsed. With no recognized extension, Node and browser
+    /// recordings default to cpuprofile and every other backend defaults to
+    /// collapsed.
+    #[arg(long, value_enum)]
+    pub format: Option<ProfileFormat>,
 
     /// Sampling frequency in hertz.
     #[arg(long, default_value_t = 99, value_parser = clap::value_parser!(u32).range(1..))]
@@ -140,6 +147,28 @@ impl ProfileFormat {
     }
 }
 
+/// Infer a profile format from a file name.
+///
+/// `.speedscope.json` is checked before a bare `.json`. `.txt` is collapsed
+/// stacks, the same as `.collapsed` and `.folded`.
+pub(crate) fn infer_format(path: &Path) -> Option<ProfileFormat> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    if name.ends_with(".speedscope.json") || name.ends_with(".speedscope") {
+        return Some(ProfileFormat::Speedscope);
+    }
+    if name.ends_with(".pb.gz") || name.ends_with(".pprof") || name.ends_with(".pprof.gz") {
+        return Some(ProfileFormat::Pprof);
+    }
+    if name.ends_with(".cpuprofile") {
+        return Some(ProfileFormat::Cpuprofile);
+    }
+    match Path::new(&name).extension().and_then(|ext| ext.to_str())? {
+        "collapsed" | "folded" | "txt" => Some(ProfileFormat::Collapsed),
+        "json" => Some(ProfileFormat::Speedscope),
+        _ => None,
+    }
+}
+
 impl From<ProfileFormat> for anyprof_export::Format {
     fn from(format: ProfileFormat) -> Self {
         match format {
@@ -153,7 +182,7 @@ impl From<ProfileFormat> for anyprof_export::Format {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ProfileFormat};
+    use super::{Cli, Command, ProfileFormat, infer_format};
     use clap::Parser;
     use std::time::Duration;
 
@@ -178,7 +207,36 @@ mod tests {
         assert!(!args.browser);
         assert_eq!(args.duration, Duration::from_secs(90));
         assert_eq!(args.output.as_os_str(), "cpu.collapsed");
-        assert_eq!(args.format, ProfileFormat::Collapsed);
+        assert_eq!(args.format, None);
+        assert_eq!(
+            infer_format(std::path::Path::new("cpu.cpuprofile")),
+            Some(ProfileFormat::Cpuprofile)
+        );
+        assert_eq!(
+            infer_format(std::path::Path::new("cpu.collapsed")),
+            Some(ProfileFormat::Collapsed)
+        );
+        assert_eq!(
+            infer_format(std::path::Path::new("cpu.folded")),
+            Some(ProfileFormat::Collapsed)
+        );
+        assert_eq!(
+            infer_format(std::path::Path::new("stacks.txt")),
+            Some(ProfileFormat::Collapsed)
+        );
+        assert_eq!(
+            infer_format(std::path::Path::new("cpu.pb.gz")),
+            Some(ProfileFormat::Pprof)
+        );
+        assert_eq!(
+            infer_format(std::path::Path::new("cpu.pprof")),
+            Some(ProfileFormat::Pprof)
+        );
+        assert_eq!(
+            infer_format(std::path::Path::new("cpu.speedscope.json")),
+            Some(ProfileFormat::Speedscope)
+        );
+        assert_eq!(infer_format(std::path::Path::new("cpu")), None);
         assert_eq!(args.frequency, 99);
         assert!(!args.kernel);
         assert!(args.backend.is_none());
@@ -209,7 +267,7 @@ mod tests {
         let Command::Record(args) = cli.command else {
             panic!("expected record");
         };
-        assert_eq!(args.format, ProfileFormat::Pprof);
+        assert_eq!(args.format, Some(ProfileFormat::Pprof));
         assert_eq!(args.frequency, 199);
         assert!(args.kernel);
         assert_eq!(args.backend.as_deref(), Some("native"));

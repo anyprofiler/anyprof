@@ -80,13 +80,11 @@ impl Backend for BrowserBackend {
         };
         let interval_us = sampling_interval_us(opts.frequency_hz);
         tracing::info!(%websocket, ?opts.duration, interval_us, "profiling browser tab");
-        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us)
+        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us, None)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        let imported = import_cpuprofile(&bytes, Runtime::Browser)
+        let mut imported = import_cpuprofile(&bytes, Runtime::Browser)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        if imported.stacks.is_empty() {
-            return Err(Error::backend(self.name(), "profiler returned no samples"));
-        }
+        imported.raw_cpuprofile = Some(bytes);
         Ok(Box::new(ReadySession {
             profile: finish_profile(imported, target.pid, opts, interval_us),
         }))

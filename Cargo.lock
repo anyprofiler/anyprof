@@ -107,6 +107,7 @@ dependencies = [
  "anyprof-node",
  "clap",
  "humantime",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -153,6 +154,7 @@ dependencies = [
  "anyprof-cdp",
  "anyprof-core",
  "anyprof-export",
+ "serde_json",
  "tracing",
 ]
 

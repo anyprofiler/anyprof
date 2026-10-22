@@ -73,7 +73,7 @@ trait Session {
 
 Stacks are leaf-first: `frames[0]` is the leaf (the frame that was on-CPU) and the last frame is the root. That matches pprof. Collapsed stacks and speedscope are root-first, and the exporters reverse the order.
 
-A frame from a non-native runtime is written as `[runtime] name`, for example `[node] work`, so mixed stacks keep their origin in every format. `.cpuprofile` export keeps that prefix so a browser profile stays `[browser]` when it is imported again.
+A frame from a non-native runtime is written as `[runtime] name`, for example `[node] work`, in collapsed stacks, speedscope, and pprof, so mixed stacks keep their origin. A `.cpuprofile` recorded from Node or a browser tab is the original V8 document from `Profiler.stop`, not a rebuilt tree. `convert` rebuilds a `.cpuprofile` Chrome DevTools can open: a `(root)` node, `scriptId` on every call frame, and `timeDeltas` the same length as `samples`.
 
 ## Install
 
@@ -109,7 +109,8 @@ CI and release builds use Rust 1.99.1 (`rust-toolchain.toml`). Profiling Node al
 cargo build --release
 
 # Node.js. The process does not need to have been started with --inspect.
-anyprof record --pid 1234 --duration 10s -o cpu.collapsed
+# `.cpuprofile` is inferred from the file name. Open cpu.cpuprofile in Chrome DevTools.
+anyprof record --pid 1234 --duration 10s -o cpu.cpuprofile
 
 # Pin the inspector port, or pass a websocket URL you already have.
 anyprof record --pid 1234 --inspect 9229 --duration 10s --format speedscope -o cpu.json
@@ -117,7 +118,7 @@ anyprof record --pid 1234 --inspect ws://127.0.0.1:9229/<id> --duration 10s -o c
 
 # Browser tab. Start the browser yourself:
 #   chrome --remote-debugging-port=9222
-anyprof record --browser --tab example.com --duration 10s -o page.collapsed
+anyprof record --browser --tab example.com --duration 10s -o page.cpuprofile
 
 # Import an existing V8 profile.
 anyprof convert -i profile.cpuprofile -o cpu.collapsed
@@ -132,16 +133,16 @@ anyprof convert -i cpu.collapsed -o cpu.pb.gz --to pprof
 | `--pid <PID>` | Process to profile. Required unless `--browser` is set. |
 | `--browser` | Profile a browser tab instead of a pid. |
 | `--tab <URL_TITLE_OR_ID>` | Which tab. Target id, or a substring of the URL or title. Requires `--browser`. |
-| `--inspect <PORT_OR_URL>` | Inspector or remote-debugging endpoint: a port, `host:port`, `http://` URL, or `ws://` URL. Node defaults to a port that process is listening on, then 9229. Browser defaults to `127.0.0.1:9222`. |
+| `--inspect <PORT_OR_URL>` | Inspector or remote-debugging endpoint: a port, `host:port`, `http://` URL, or `ws://` URL. Node uses a port that process is listening on, then 9229. Before sampling, anyprof reads `process.pid` and refuses the connection when it is a different process. Browser defaults to `127.0.0.1:9222`. |
 | `--duration <DURATION>` | How long to sample. Default `30s`. Accepts `humantime` values such as `90s` or `1m30s`. |
-| `-o, --output <PATH>` | Output file. Required. |
-| `--format <collapsed\|pprof\|speedscope\|cpuprofile>` | Output format. Default `collapsed`. |
-| `--frequency <HZ>` | Requested sampling rate. Default `99`. Node and Chrome receive this as a V8 sampling interval. |
+| `-o, --output <PATH>` | Output file. Required. The extension selects the format when `--format` is omitted. |
+| `--format <collapsed\|pprof\|speedscope\|cpuprofile>` | Output format. Inferred from `-o`: `.cpuprofile`, `.pb.gz`/`.pprof`, `.speedscope.json`, `.collapsed`/`.folded`/`.txt`. With no recognized extension, Node and browser default to cpuprofile and other backends default to collapsed. |
+| `--frequency <HZ>` | Requested sampling rate. Default `99`, which Node and Chrome receive as a 10101 microsecond V8 sampling interval. |
 | `--kernel` | Ask for kernel frames when the backend supports them. Node and browser profiles do not include kernel frames. |
 | `--backend <node\|browser\|go\|native>` | Skip auto-detection. |
 | `-v`, `-vv`, `-vvv` | Log more (`info`, `debug`, `trace`). `RUST_LOG` is used when `-v` is not passed. |
 
-`convert` reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `--from` is inferred from the file name (`.collapsed`, `.folded`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. A `.cpuprofile` that carries no `[runtime]` prefix is imported as Node.
+`convert` reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `--from` is inferred from the file name (`.collapsed`, `.folded`, `.txt`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. A `.cpuprofile` that carries no `[runtime]` prefix is imported as Node. A `.cpuprofile` written by `convert` is rebuilt from the unified stacks and is still a tree Chrome DevTools accepts.
 
 Collapsed stacks keep the runtime label and function name. Speedscope also keeps file, line, and column. pprof also keeps the instruction address, duration, and sampling period. A frame's module is not written yet.
 

@@ -109,5 +109,6 @@ fn fixture() -> Profile {
                 weight: 4,
             },
         ],
+        raw_cpuprofile: None,
     }
 }

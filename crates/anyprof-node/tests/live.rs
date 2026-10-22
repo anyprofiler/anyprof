@@ -101,4 +101,27 @@ fn profiles_a_live_node_process() {
     );
     assert_eq!(profile.pid, pid);
     assert!(profile.total_weight() > 0);
+    let raw = profile
+        .raw_cpuprofile
+        .as_deref()
+        .expect("node capture keeps the original V8 profile");
+    let value: serde_json::Value = serde_json::from_slice(raw).expect("raw cpuprofile is JSON");
+    let samples = value["samples"].as_array().expect("samples");
+    assert!(
+        samples.len() > 20,
+        "expected many V8 samples, got {}",
+        samples.len()
+    );
+    assert_eq!(
+        samples.len(),
+        value["timeDeltas"]
+            .as_array()
+            .map(|deltas| deltas.len())
+            .unwrap_or(0)
+    );
+    assert_eq!(value["nodes"][0]["callFrame"]["functionName"], "(root)");
+    assert!(
+        raw.windows(b"anyprofSampleWork".len())
+            .any(|window| window == b"anyprofSampleWork")
+    );
 }

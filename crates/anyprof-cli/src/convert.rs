@@ -31,22 +31,7 @@ pub fn run(args: ConvertArgs) -> anyhow::Result<()> {
 }
 
 fn infer_format(path: &Path) -> Option<ProfileFormat> {
-    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-    if name.ends_with(".speedscope.json") || name.ends_with(".speedscope") {
-        return Some(ProfileFormat::Speedscope);
-    }
-    if name.ends_with(".pb.gz") || name.ends_with(".pprof") || name.ends_with(".pprof.gz") {
-        return Some(ProfileFormat::Pprof);
-    }
-    if name.ends_with(".cpuprofile") {
-        return Some(ProfileFormat::Cpuprofile);
-    }
-    match Path::new(&name).extension().and_then(|ext| ext.to_str())? {
-        "collapsed" | "folded" => Some(ProfileFormat::Collapsed),
-        "cpuprofile" => Some(ProfileFormat::Cpuprofile),
-        "json" => Some(ProfileFormat::Speedscope),
-        _ => None,
-    }
+    crate::cli::infer_format(path)
 }
 
 #[cfg(test)]
@@ -63,6 +48,10 @@ mod tests {
         );
         assert_eq!(
             infer_format(Path::new("cpu.folded")),
+            Some(ProfileFormat::Collapsed)
+        );
+        assert_eq!(
+            infer_format(Path::new("stacks.txt")),
             Some(ProfileFormat::Collapsed)
         );
         assert_eq!(

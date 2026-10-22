@@ -14,3 +14,6 @@ anyprof-cdp.workspace = true
 anyprof-core.workspace = true
 anyprof-export.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

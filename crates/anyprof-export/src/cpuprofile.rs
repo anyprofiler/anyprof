@@ -13,7 +13,7 @@ use anyprof_core::{Frame, Profile, Runtime, Stack};
 use serde_json::{Value, json};
 
 use crate::error::Error;
-use crate::symbol::{split_runtime_prefix, symbol_base};
+use crate::symbol::split_runtime_prefix;
 
 /// Decode a `.cpuprofile` document, or a CDP `Profiler.stop` result that wraps one.
 pub fn import_cpuprofile(bytes: &[u8], default_runtime: Runtime) -> Result<Profile, Error> {
@@ -60,18 +60,38 @@ pub fn import_cpuprofile(bytes: &[u8], default_runtime: Runtime) -> Result<Profi
 }
 
 pub(crate) fn export(profile: &Profile) -> Result<Vec<u8>, Error> {
-    let mut builder = Trie::default();
+    // Node and browser capture keep Profiler.stop's JSON. Re-encoding it here
+    // would collapse samples and drop scriptId, which Chrome DevTools then
+    // shows as an empty profile. `convert` has no raw document and rebuilds one.
+    if let Some(raw) = profile
+        .raw_cpuprofile
+        .as_ref()
+        .filter(|raw| !raw.is_empty())
+    {
+        return Ok(raw.clone());
+    }
+    let mut builder = Trie::with_root();
     let mut samples = Vec::new();
     let mut deltas = Vec::new();
     for stack in &profile.stacks {
-        if stack.weight == 0 || stack.frames.is_empty() {
+        if stack.weight == 0 {
             continue;
         }
-        let mut parent = 0_u64;
+        let mut parent = 1_u64;
+        let mut leaf = 1_u64;
+        let mut saw_frame = false;
         for frame in stack.frames.iter().rev() {
+            if frame.name == "(root)" {
+                continue;
+            }
             parent = builder.intern(parent, frame);
+            leaf = parent;
+            saw_frame = true;
         }
-        samples.push(parent);
+        if !saw_frame {
+            continue;
+        }
+        samples.push(leaf);
         deltas.push(stack.weight);
     }
     let end = deltas
@@ -281,7 +301,6 @@ fn number_array(value: Option<&Value>) -> Vec<u64> {
         .unwrap_or_default()
 }
 
-#[derive(Default)]
 struct Trie {
     nodes: Vec<TrieNode>,
     index: HashMap<(u64, FrameKey), u64>,
@@ -302,12 +321,27 @@ struct FrameKey {
 }
 
 impl Trie {
+    fn with_root() -> Self {
+        Self {
+            nodes: vec![TrieNode {
+                frame: Frame::new(Runtime::Native, "(root)"),
+                children: Vec::new(),
+            }],
+            index: HashMap::new(),
+        }
+    }
+
     fn intern(&mut self, parent: u64, frame: &Frame) -> u64 {
+        let name = if frame.name.is_empty() {
+            "(anonymous)".to_string()
+        } else {
+            frame.name.clone()
+        };
         let key = (
             parent,
             FrameKey {
                 runtime: frame.runtime,
-                name: frame.name.clone(),
+                name: name.clone(),
                 file: frame.file.clone(),
                 line: frame.line,
                 column: frame.column,
@@ -317,13 +351,13 @@ impl Trie {
             return *id;
         }
         let id = self.nodes.len() as u64 + 1;
+        let mut stored = frame.clone();
+        stored.name = name;
         self.nodes.push(TrieNode {
-            frame: frame.clone(),
+            frame: stored,
             children: Vec::new(),
         });
-        if parent != 0 {
-            self.nodes[parent as usize - 1].children.push(id);
-        }
+        self.nodes[parent as usize - 1].children.push(id);
         self.index.insert(key, id);
         id
     }
@@ -333,25 +367,33 @@ impl Trie {
             .iter()
             .enumerate()
             .map(|(index, node)| {
-                let line = node
-                    .frame
-                    .line
-                    .map(|line| i64::from(line).saturating_sub(1))
-                    .unwrap_or(-1);
-                let column = node
-                    .frame
-                    .column
-                    .map(|column| i64::from(column).saturating_sub(1))
-                    .unwrap_or(-1);
+                let (line, column, url) = if index == 0 {
+                    (-1, -1, String::new())
+                } else {
+                    let line = node
+                        .frame
+                        .line
+                        .map(|line| i64::from(line).saturating_sub(1))
+                        .unwrap_or(-1);
+                    let column = node
+                        .frame
+                        .column
+                        .map(|column| i64::from(column).saturating_sub(1))
+                        .unwrap_or(-1);
+                    (line, column, node.frame.file.clone().unwrap_or_default())
+                };
+                // hitCount is omitted on purpose. Chrome treats a present hitCount
+                // of 0 as authoritative and then divides by a total of zero, so the
+                // chart is empty even when `samples` is populated.
                 json!({
                     "id": index as u64 + 1,
                     "callFrame": {
-                        "functionName": format!("[{}] {}", node.frame.runtime, symbol_base(&node.frame)),
-                        "url": node.frame.file.clone().unwrap_or_default(),
+                        "functionName": node.frame.name,
+                        "scriptId": "0",
+                        "url": url,
                         "lineNumber": line,
                         "columnNumber": column,
                     },
-                    "hitCount": 0,
                     "children": node.children,
                 })
             })
@@ -416,16 +458,71 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_preserves_stacks_and_browser_runtime() {
+    fn rebuilt_cpuprofile_is_a_devtools_tree() {
         let original = import_cpuprofile(sample().as_bytes(), Runtime::Browser).unwrap();
         assert_eq!(original.stacks[0].frames[0].runtime, Runtime::Browser);
         let bytes = export(&original, Format::Cpuprofile).unwrap();
-        let again = import(&bytes, Format::Cpuprofile).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let nodes = value["nodes"].as_array().unwrap();
+        let samples = value["samples"].as_array().unwrap();
+        let deltas = value["timeDeltas"].as_array().unwrap();
+        assert_eq!(samples.len(), deltas.len());
+        assert!(value["startTime"].as_u64().is_some());
+        assert!(value["endTime"].as_u64().unwrap() >= value["startTime"].as_u64().unwrap());
+        assert_eq!(nodes[0]["callFrame"]["functionName"], "(root)");
+        assert_eq!(nodes[0]["callFrame"]["scriptId"], "0");
+        assert!(nodes[0].get("hitCount").is_none());
+
+        let mut ids = std::collections::HashSet::new();
+        let mut children = std::collections::HashSet::new();
+        for node in nodes {
+            let id = node["id"].as_u64().unwrap();
+            assert!(ids.insert(id), "duplicate id {id}");
+            for field in [
+                "functionName",
+                "scriptId",
+                "url",
+                "lineNumber",
+                "columnNumber",
+            ] {
+                assert!(node["callFrame"].get(field).is_some(), "missing {field}");
+            }
+            for child in node["children"].as_array().unwrap() {
+                children.insert(child.as_u64().unwrap());
+            }
+        }
+        for sample in samples {
+            let id = sample.as_u64().unwrap();
+            assert!(ids.contains(&id), "sample {id} is not a node");
+        }
+        for node in nodes.iter().skip(1) {
+            let id = node["id"].as_u64().unwrap();
+            assert!(children.contains(&id), "node {id} is not a child of anyone");
+        }
+        let names: Vec<_> = nodes
+            .iter()
+            .map(|node| node["callFrame"]["functionName"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"work"));
+        assert!(names.contains(&"main"));
+        assert!(names.iter().all(|name| !name.starts_with('[')));
+
+        let again = import_cpuprofile(&bytes, Runtime::Browser).unwrap();
         assert_eq!(again.stacks.len(), original.stacks.len());
         assert_eq!(again.stacks[0].frames[0].runtime, Runtime::Browser);
         assert_eq!(again.stacks[0].frames[0].name, "work");
         assert_eq!(again.stacks[0].frames[0].line, Some(10));
         assert_eq!(again.total_weight(), original.total_weight());
+    }
+
+    #[test]
+    fn raw_cpuprofile_is_written_unchanged() {
+        let mut profile = import_cpuprofile(sample().as_bytes(), Runtime::Node).unwrap();
+        let raw =
+            br#"{"nodes":[{"id":1}],"samples":[1],"timeDeltas":[5],"startTime":9,"endTime":14}"#;
+        profile.raw_cpuprofile = Some(raw.to_vec());
+        let bytes = export(&profile, Format::Cpuprofile).unwrap();
+        assert_eq!(bytes, raw);
     }
 
     #[test]

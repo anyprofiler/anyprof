@@ -12,10 +12,18 @@ use tungstenite::{Error as WsError, Message};
 use crate::error::Error;
 
 /// Run the V8 CPU profiler for `duration` and return the `.cpuprofile` JSON object.
+///
+/// `expected_pid`, when set, is checked with `Runtime.evaluate` of `process.pid`
+/// before sampling starts. A mismatch is an error: the websocket often belongs
+/// to a different Node process that is already listening on port 9229.
+///
+/// `interval_us` is V8's sampling interval in microseconds (`Profiler.setSamplingInterval`
+/// is called before `Profiler.start`). `Profiler.stop` runs only after `duration` has elapsed.
 pub fn capture_cpu_profile(
     websocket_url: &str,
     duration: Duration,
     interval_us: u32,
+    expected_pid: Option<u32>,
 ) -> Result<Vec<u8>, Error> {
     if duration.is_zero() {
         return Err(Error::message("profile duration must be greater than zero"));
@@ -28,12 +36,22 @@ pub fn capture_cpu_profile(
     prepare_socket(socket.get_mut())?;
 
     let mut rpc = Rpc { next_id: 1 };
-    rpc.call(&mut socket, "Profiler.enable", json!({}))?;
+    if let Some(expected) = expected_pid {
+        let actual = node_process_pid(&mut rpc, &mut socket)?;
+        if actual != expected {
+            return Err(Error::message(format!(
+                "inspector {websocket_url} is node pid {actual}, not the requested pid {expected}. Refusing to profile a different process (a stale inspector on 127.0.0.1:9229 is the usual cause)"
+            )));
+        }
+        tracing::info!(pid = actual, %websocket_url, "inspector process.pid matches");
+    }
+    // V8 ignores a sampling interval set after Profiler.start. The unit is microseconds.
     rpc.call(
         &mut socket,
         "Profiler.setSamplingInterval",
         json!({ "interval": interval_us }),
     )?;
+    rpc.call(&mut socket, "Profiler.enable", json!({}))?;
     rpc.call(&mut socket, "Profiler.start", json!({}))?;
     tracing::info!(%websocket_url, ?duration, interval_us, "CPU profiler started");
     wait_for_samples(&mut socket, duration)?;
@@ -45,6 +63,48 @@ pub fn capture_cpu_profile(
         .ok_or_else(|| Error::message("Profiler.stop did not return a profile"))?;
     serde_json::to_vec(&profile)
         .map_err(|err| Error::message(format!("encoding cpuprofile JSON: {err}")))
+}
+
+fn node_process_pid(
+    rpc: &mut Rpc,
+    socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+) -> Result<u32, Error> {
+    let result = rpc.call(
+        socket,
+        "Runtime.evaluate",
+        json!({
+            "expression": "process.pid",
+            "returnByValue": true,
+        }),
+    )?;
+    if result.get("exceptionDetails").is_some() {
+        let text = result
+            .pointer("/result/description")
+            .and_then(Value::as_str)
+            .unwrap_or("evaluation failed");
+        return Err(Error::message(format!(
+            "could not read process.pid from the inspector: {text}"
+        )));
+    }
+    let value = result.pointer("/result/value").ok_or_else(|| {
+        Error::message("inspector did not return process.pid (the target may not be Node.js)")
+    })?;
+    let pid = value.as_u64().or_else(|| {
+        value.as_f64().and_then(|number| {
+            if number >= 0.0 && number <= f64::from(u32::MAX) && number.fract() == 0.0 {
+                Some(number as u64)
+            } else {
+                None
+            }
+        })
+    });
+    let Some(pid) = pid else {
+        return Err(Error::message(format!(
+            "process.pid was not an integer ({value})"
+        )));
+    };
+    u32::try_from(pid)
+        .map_err(|_| Error::message(format!("process.pid {pid} does not fit in a pid")))
 }
 
 fn prepare_socket(stream: &mut MaybeTlsStream<TcpStream>) -> Result<(), Error> {

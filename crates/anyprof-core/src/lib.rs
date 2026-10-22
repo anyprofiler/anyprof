@@ -26,6 +26,7 @@
 //!         frames: vec![Frame::new(Runtime::Native, "main")],
 //!         weight: 3,
 //!     }],
+//!     raw_cpuprofile: None,
 //! };
 //! assert_eq!(profile.total_weight(), 3);
 //! ```
