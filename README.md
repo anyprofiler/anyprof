@@ -217,7 +217,7 @@ anyprof rec -p 1234 -d 10s -w --web-timeout 10m
 | `--port <PORT>` | Listen on `127.0.0.1:<PORT>`. Default: a free port chosen by the OS. |
 | `--web-timeout <DURATION>` | Stop after this long (`humantime`, for example `10m`). Default: serve until Ctrl+C. |
 
-The viewer serves until Ctrl+C (or SIGTERM, or Ctrl+Break on Windows), then exits 0. The browser tab keeps the profile it already loaded.
+The viewer serves until Ctrl+C (or SIGTERM, or Ctrl+Break on Windows), then exits 0. A second Ctrl+C exits immediately with status 130, even if a response is stuck on a client that stopped reading. The browser tab keeps the profile it already loaded.
 
 anyprof opens the default browser with the [`webbrowser`](https://crates.io/crates/webbrowser) crate (macOS `open`, Windows `ShellExecute`, `xdg-open` and friends elsewhere). It prints the URL instead, together with an `ssh -L <port>:127.0.0.1:<port>` command for viewing from another machine, when:
 

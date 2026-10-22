@@ -37,6 +37,10 @@ pub fn show(path: &Path, bytes: Vec<u8>, viewer: &ViewerArgs) -> anyhow::Result<
     let server = Viewer::bind(&name, bytes, viewer.port.unwrap_or(0))?;
     let url = server.url();
     let stop = StopGate::new();
+    // Serving has nothing left to save, so the first Ctrl+C stops the server
+    // and a second exits at once, even while a response write is blocked on a
+    // client that stopped reading.
+    stop.begin_stopping();
     interrupt::route_to(&stop)?;
 
     eprintln!("Viewing {} in speedscope at {url}", path.display());
