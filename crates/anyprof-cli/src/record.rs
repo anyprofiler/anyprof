@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use anyprof_core::{
-    Backend, Profile, RecordOptions, Registry, SignalAction, StopGate, Target,
-    interval_for_frequency,
+    Backend, Profile, RecordOptions, Registry, StopGate, Target, interval_for_frequency,
 };
 use anyprof_export::SampleCounts;
 
 use crate::cli::{ProfileFormat, RecordArgs};
 use crate::output::{self, OutputRequest};
 use crate::registry::default_registry;
+use crate::{interrupt, view};
 
 pub fn run(args: RecordArgs) -> anyhow::Result<()> {
     validate(&args)?;
@@ -47,7 +47,7 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
     }
 
     let stop = StopGate::new();
-    install_stop_handler(&stop)?;
+    interrupt::route_to(&stop)?;
     let label = recording_label(backend.name(), &args, pid);
     tracing::info!(
         backend = backend.name(),
@@ -100,7 +100,7 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let bytes = anyprof_export::export(&profile, format.into())?;
-    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
     let absolute = std::path::absolute(&path).unwrap_or(path);
     eprintln!(
         "wrote {} samples to {} ({})",
@@ -108,20 +108,9 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
         absolute.display(),
         format.as_str()
     );
-    Ok(())
-}
-
-fn install_stop_handler(gate: &Arc<StopGate>) -> anyhow::Result<()> {
-    let gate = Arc::clone(gate);
-    ctrlc::set_handler(move || match gate.note_signal() {
-        SignalAction::StopSampling => {}
-        SignalAction::ForceExit => {
-            eprintln!("\nanyprof: second interrupt, exiting immediately");
-            let _ = std::io::stderr().flush();
-            std::process::exit(130);
-        }
-    })
-    .context("installing the Ctrl+C handler")?;
+    if args.web {
+        view::show(&absolute, bytes, &args.viewer)?;
+    }
     Ok(())
 }
 
@@ -280,6 +269,12 @@ fn validate(args: &RecordArgs) -> anyhow::Result<()> {
     {
         return Err(anyhow!("--interval must be at least 1us"));
     }
+    if !args.web {
+        if let Some(flag) = args.viewer.first_flag_set() {
+            return Err(anyhow!("{flag} configures the viewer and requires --web"));
+        }
+    }
+    view::validate(&args.viewer)?;
     if args.tab.is_some() && !args.browser {
         return Err(anyhow!(
             "--tab selects a browser page and requires --browser"
@@ -374,6 +369,27 @@ mod tests {
         let zero = record(&["--pid", "1", "-d", "0s"]);
         let message = validate(&zero).unwrap_err().to_string();
         assert!(message.contains("greater than zero"), "{message}");
+    }
+
+    #[test]
+    fn viewer_flags_require_web() {
+        for flag in [
+            &["--no-open"][..],
+            &["--port", "8123"][..],
+            &["--web-timeout", "1m"][..],
+        ] {
+            let mut args = vec!["--pid", "1"];
+            args.extend_from_slice(flag);
+            let message = validate(&record(&args)).unwrap_err().to_string();
+            assert!(message.contains("requires --web"), "{message}");
+            assert!(message.contains(flag[0]), "{message}");
+
+            args.push("--web");
+            assert!(validate(&record(&args)).is_ok(), "{args:?}");
+        }
+        let zero = record(&["--pid", "1", "-w", "--web-timeout", "0s"]);
+        let message = validate(&zero).unwrap_err().to_string();
+        assert!(message.contains("--web-timeout"), "{message}");
     }
 
     #[test]
