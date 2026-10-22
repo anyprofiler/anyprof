@@ -115,7 +115,7 @@ pub struct RecordArgs {
         short = 'F',
         long,
         value_name = "HZ",
-        value_parser = clap::value_parser!(u32).range(1..)
+        value_parser = parse_frequency
     )]
     pub frequency: Option<u32>,
 
@@ -173,6 +173,22 @@ pub struct ConvertArgs {
     /// Output format.
     #[arg(short = 't', long, value_enum)]
     pub to: ProfileFormat,
+}
+
+/// One sample per microsecond. V8 takes whole-microsecond intervals, so a
+/// faster `-F` could not be honored.
+pub const MAX_FREQUENCY_HZ: u32 = 1_000_000;
+
+fn parse_frequency(raw: &str) -> Result<u32, String> {
+    let hertz: u32 = raw
+        .parse()
+        .map_err(|_| format!("expected a whole number of hertz, got '{raw}'"))?;
+    if !(1..=MAX_FREQUENCY_HZ).contains(&hertz) {
+        return Err(format!(
+            "must be between 1 and {MAX_FREQUENCY_HZ} Hz (one sample per microsecond is the finest rate)"
+        ));
+    }
+    Ok(hertz)
 }
 
 /// Encodings `record` and `convert` accept.
@@ -385,6 +401,24 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert!(Cli::try_parse_from(["anyprof", "rec", "-p", "3", "--interval", "fast"]).is_err());
+    }
+
+    #[test]
+    fn frequency_is_capped_at_one_sample_per_microsecond() {
+        let cli = Cli::try_parse_from(["anyprof", "rec", "-p", "3", "-F", "1000000"]).unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record");
+        };
+        assert_eq!(args.frequency, Some(1_000_000));
+
+        for raw in ["1000001", "4000000000"] {
+            let err = Cli::try_parse_from(["anyprof", "rec", "-p", "3", "-F", raw]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{raw}");
+            let message = err.to_string();
+            assert!(message.contains("between 1 and 1000000 Hz"), "{message}");
+        }
+        let err = Cli::try_parse_from(["anyprof", "rec", "-p", "3", "-F", "fast"]).unwrap_err();
+        assert!(err.to_string().contains("whole number of hertz"), "{err}");
     }
 
     #[test]
