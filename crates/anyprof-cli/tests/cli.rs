@@ -179,6 +179,117 @@ fn record_dispatches_through_detection_and_reports_the_stub() {
 }
 
 #[test]
+fn view_help_and_record_web_flags() {
+    let output = anyprof(&["view", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for flag in ["--no-open", "--port", "--web-timeout", "<FILE>"] {
+        assert!(stdout.contains(flag), "{flag} missing:\n{stdout}");
+    }
+
+    let output = anyprof(&["record", "--help"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("-w, --web"), "{stdout}");
+    assert!(stdout.contains("--no-open"), "{stdout}");
+
+    let output = anyprof(&["--help"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("view"), "{stdout}");
+    assert!(
+        stdout.contains("aliases: v") || stdout.contains("[alias: v]"),
+        "view alias missing from help:\n{stdout}"
+    );
+}
+
+#[test]
+fn view_rejects_missing_empty_and_directory_inputs() {
+    let dir = std::env::temp_dir().join(format!("anyprof-view-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let empty = dir.join("empty.cpuprofile");
+    std::fs::write(&empty, b"").unwrap();
+    for (path, expected) in [
+        (dir.join("missing.cpuprofile"), "reading"),
+        (empty, "is empty"),
+        (dir.clone(), "is a directory"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+            .arg("view")
+            .arg(&path)
+            .arg("--no-open")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+    }
+    let output = anyprof(&["rec", "-p", "1", "--no-open"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("requires --web"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn view_serves_the_profile_on_loopback_until_the_timeout() {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let dir = std::env::temp_dir().join(format!("anyprof-view-ok-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("cpu.collapsed");
+    std::fs::write(&file, "main;work 3\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+        .arg("v")
+        .arg(&file)
+        .args(["--no-open", "--web-timeout", "3s"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut printed = String::new();
+    let url = loop {
+        let mut line = String::new();
+        assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "{printed}");
+        printed.push_str(&line);
+        if let Some(url) = line
+            .split_whitespace()
+            .find(|word| word.starts_with("http://127.0.0.1:"))
+        {
+            break url.to_string();
+        }
+    };
+    let rest = url.strip_prefix("http://").unwrap();
+    let (host, path) = rest.split_once('/').unwrap();
+    let get = |path: &str| {
+        let mut stream = std::net::TcpStream::connect(host).unwrap();
+        write!(stream, "GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+    let profile = get(&format!("/{path}profile"));
+    assert!(profile.starts_with("HTTP/1.0 200 OK"), "{profile}");
+    assert!(profile.ends_with("main;work 3\n"), "{profile}");
+    let landing = get(&format!("/{path}"));
+    assert!(
+        landing.contains("index.html#profileURL=profile&amp;title=cpu.collapsed"),
+        "{landing}"
+    );
+    assert!(get("/t/00000000000000000000000000000000/profile").contains(" 404 "));
+
+    let status = child.wait().unwrap();
+    let mut tail = String::new();
+    stderr.read_to_string(&mut tail).unwrap();
+    printed.push_str(&tail);
+    assert!(status.success(), "{printed}");
+    assert!(
+        printed.contains("Not opening a browser: --no-open"),
+        "{printed}"
+    );
+    assert!(printed.contains("ssh -L"), "{printed}");
+    assert!(printed.contains("--web-timeout reached"), "{printed}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn convert_collapsed_to_speedscope() {
     let dir = std::env::temp_dir();
     let input = dir.join(format!("anyprof-in-{}.collapsed", std::process::id()));

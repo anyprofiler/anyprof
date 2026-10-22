@@ -36,5 +36,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+        env:
+          # The runner images ship Chrome; the viewer smoke test must not skip.
+          ANYPROF_REQUIRE_CHROME: "1"
+          ANYPROF_SMOKE_ARTIFACTS: ${{ runner.temp }}/web-smoke
+      - name: Upload viewer screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-smoke-${{ matrix.os }}
+          path: ${{ runner.temp }}/web-smoke
+          if-no-files-found: ignore
       - name: Build
         run: cargo build --workspace --locked

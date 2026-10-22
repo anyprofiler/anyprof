@@ -1,9 +1,11 @@
 mod cli;
 mod convert;
+mod interrupt;
 mod output;
 mod record;
 mod registry;
 mod update;
+mod view;
 
 use anyhow::Result;
 use clap::Parser;
@@ -23,6 +25,7 @@ fn try_main() -> Result<()> {
     match cli.command {
         Command::Record(args) => record::run(args),
         Command::Convert(args) => convert::run(args),
+        Command::View(args) => view::run(args),
         Command::Update => update::run(),
     }
 }

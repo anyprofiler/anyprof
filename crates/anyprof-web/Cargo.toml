@@ -1,0 +1,19 @@
+[package]
+name = "anyprof-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Offline speedscope viewer for anyprof profiles, served on 127.0.0.1."
+
+[dependencies]
+flate2.workspace = true
+getrandom.workspace = true
+include_dir.workspace = true
+thiserror.workspace = true
+tiny_http.workspace = true
+tracing.workspace = true
+webbrowser.workspace = true

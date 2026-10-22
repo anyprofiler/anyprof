@@ -28,6 +28,13 @@ pub enum Command {
     /// Convert a profile between collapsed stacks, speedscope, pprof, and cpuprofile.
     #[command(visible_alias = "conv")]
     Convert(ConvertArgs),
+    /// Open a profile in the built-in speedscope viewer (offline, 127.0.0.1 only).
+    ///
+    /// Reads `.cpuprofile`, pprof (`.pb.gz`), speedscope JSON, and collapsed
+    /// stacks; speedscope detects the format from the contents. The viewer is
+    /// served from inside this binary and needs no network access.
+    #[command(visible_alias = "v")]
+    View(ViewArgs),
     /// Upgrade this install to the latest GitHub release.
     ///
     /// Works for copies installed by the shell or PowerShell release installer.
@@ -55,7 +62,8 @@ Examples:
   anyprof rec -p 1234 -d 30s -f collapsed -o cpu.collapsed
   anyprof rec -p 1234 -i 9229 -d 10s -f speedscope -o cpu.json
   anyprof rec -p 1234 -d 5m --interval 1ms
-  anyprof rec -B -t example.com -d 10s -o page.cpuprofile")]
+  anyprof rec -B -t example.com -d 10s -o page.cpuprofile
+  anyprof rec -p 1234 -d 10s -w")]
 pub struct RecordArgs {
     /// Process to profile. Required unless `--browser` is set.
     #[arg(
@@ -149,6 +157,62 @@ pub struct RecordArgs {
     /// Browser tab: target id, or a substring of the page URL or title. Requires `--browser`.
     #[arg(short = 't', long, value_name = "URL_TITLE_OR_ID")]
     pub tab: Option<String>,
+
+    /// After writing the profile, open it in the built-in speedscope viewer.
+    ///
+    /// Same as running `anyprof view` on the written file.
+    #[arg(short = 'w', long)]
+    pub web: bool,
+
+    #[command(flatten)]
+    pub viewer: ViewerArgs,
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "\
+Examples:
+  anyprof view cpu.cpuprofile
+  anyprof v cpu.pb.gz --no-open --port 8123
+  anyprof view cpu.collapsed --web-timeout 10m")]
+pub struct ViewArgs {
+    /// Profile to open: `.cpuprofile`, pprof, speedscope JSON, or collapsed stacks.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    #[command(flatten)]
+    pub viewer: ViewerArgs,
+}
+
+/// Options for the local viewer, shared by `view` and `record --web`.
+#[derive(Debug, Clone, Default, Args)]
+#[command(next_help_heading = "Viewer")]
+pub struct ViewerArgs {
+    /// Print the viewer URL instead of opening a browser.
+    #[arg(long)]
+    pub no_open: bool,
+
+    /// Port on 127.0.0.1 for the viewer. Default: a free port chosen by the OS.
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+
+    /// Stop the viewer after this long, for example `10m`. Default: run until Ctrl+C.
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub web_timeout: Option<Duration>,
+}
+
+impl ViewerArgs {
+    /// A viewer flag that was set, for "requires --web" errors.
+    pub fn first_flag_set(&self) -> Option<&'static str> {
+        if self.no_open {
+            Some("--no-open")
+        } else if self.port.is_some() {
+            Some("--port")
+        } else if self.web_timeout.is_some() {
+            Some("--web-timeout")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -576,6 +640,69 @@ mod tests {
         assert!(args.pid.is_none());
         assert_eq!(args.tab.as_deref(), Some("example.com"));
         assert_eq!(args.inspect.as_deref(), Some("9222"));
+    }
+
+    #[test]
+    fn view_and_its_alias_parse_viewer_flags() {
+        let cli = Cli::try_parse_from([
+            "anyprof",
+            "v",
+            "cpu.pb.gz",
+            "--no-open",
+            "--port",
+            "8123",
+            "--web-timeout",
+            "5m",
+        ])
+        .unwrap();
+        let Command::View(args) = cli.command else {
+            panic!("expected view");
+        };
+        assert_eq!(args.file.as_os_str(), "cpu.pb.gz");
+        assert!(args.viewer.no_open);
+        assert_eq!(args.viewer.port, Some(8123));
+        assert_eq!(args.viewer.web_timeout, Some(Duration::from_secs(300)));
+
+        let cli = Cli::try_parse_from(["anyprof", "view", "cpu.cpuprofile"]).unwrap();
+        let Command::View(args) = cli.command else {
+            panic!("expected view");
+        };
+        assert!(!args.viewer.no_open);
+        assert_eq!(args.viewer.port, None);
+        assert_eq!(args.viewer.web_timeout, None);
+        assert_eq!(args.viewer.first_flag_set(), None);
+
+        assert!(Cli::try_parse_from(["anyprof", "view"]).is_err());
+        assert!(Cli::try_parse_from(["anyprof", "view", "a", "--port", "70000"]).is_err());
+    }
+
+    #[test]
+    fn record_web_short_flag_and_viewer_flags() {
+        let cli = Cli::try_parse_from([
+            "anyprof",
+            "rec",
+            "-p",
+            "42",
+            "-w",
+            "--no-open",
+            "--port",
+            "0",
+        ])
+        .unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record");
+        };
+        assert!(args.web);
+        assert!(args.viewer.no_open);
+        assert_eq!(args.viewer.port, Some(0));
+
+        let cli =
+            Cli::try_parse_from(["anyprof", "rec", "-p", "42", "--web-timeout", "1m"]).unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record");
+        };
+        assert!(!args.web);
+        assert_eq!(args.viewer.first_flag_set(), Some("--web-timeout"));
     }
 
     #[test]
