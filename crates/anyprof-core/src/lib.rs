@@ -40,7 +40,10 @@ mod process;
 mod profile;
 mod stop;
 
-pub use backend::{Backend, Capabilities, RecordOptions, Registry, Session, Target};
+pub use backend::{
+    Backend, Capabilities, DEVTOOLS_SAMPLING_INTERVAL, PERF_SAMPLING_INTERVAL, RecordOptions,
+    Registry, Session, Target, interval_for_frequency,
+};
 pub use error::Error;
 pub use format::Format;
 pub use process::{ProcessSnapshot, executable_file, inspect, process_exists};

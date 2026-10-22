@@ -18,15 +18,16 @@ pub use endpoint::{InspectEndpoint, parse_inspect};
 pub use error::Error;
 pub use targets::{DebugTarget, choose_node, choose_page, list_targets};
 
-/// Convert a sampling frequency in hertz to V8's microsecond interval.
+/// Convert a sampling interval to the whole microseconds
+/// `Profiler.setSamplingInterval` takes.
 ///
-/// Zero is treated as 1 kHz. The interval is at least one microsecond.
+/// Sub-microsecond intervals round up to one microsecond; very long ones
+/// saturate at `u32::MAX`.
 #[must_use]
-pub fn sampling_interval_us(frequency_hz: u32) -> u32 {
-    if frequency_hz == 0 {
-        return 1_000;
-    }
-    (1_000_000 / frequency_hz).max(1)
+pub fn sampling_interval_us(interval: std::time::Duration) -> u32 {
+    u32::try_from(interval.as_micros())
+        .unwrap_or(u32::MAX)
+        .max(1)
 }
 
 #[cfg(test)]
@@ -59,10 +60,17 @@ mod tests {
     }
 
     #[test]
-    fn frequency_maps_to_microseconds() {
-        assert_eq!(sampling_interval_us(1000), 1000);
-        assert_eq!(sampling_interval_us(99), 10_101);
-        assert_eq!(sampling_interval_us(0), 1000);
-        assert_eq!(sampling_interval_us(5_000_000), 1);
+    fn intervals_map_to_whole_microseconds() {
+        use std::time::Duration;
+
+        assert_eq!(sampling_interval_us(Duration::from_micros(100)), 100);
+        assert_eq!(sampling_interval_us(Duration::from_millis(1)), 1000);
+        assert_eq!(
+            sampling_interval_us(Duration::from_nanos(10_101_010)),
+            10_101
+        );
+        assert_eq!(sampling_interval_us(Duration::from_nanos(200)), 1);
+        assert_eq!(sampling_interval_us(Duration::ZERO), 1);
+        assert_eq!(sampling_interval_us(Duration::from_secs(1 << 40)), u32::MAX);
     }
 }

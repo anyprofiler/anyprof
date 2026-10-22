@@ -66,7 +66,7 @@ fn profiles_a_live_node_process() {
         &Target { pid },
         &RecordOptions {
             duration: Some(Duration::from_secs(2)),
-            frequency_hz: 1000,
+            sampling_interval: Some(Duration::from_millis(1)),
             ..RecordOptions::default()
         },
     );

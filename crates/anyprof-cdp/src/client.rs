@@ -12,6 +12,10 @@ use tungstenite::{Error as WsError, Message};
 
 use crate::error::Error;
 
+/// Largest `Profiler.stop` reply accepted. At the 100us default a busy target
+/// produces about 2.5 MiB of JSON per minute, so this covers well over an hour.
+const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Run the V8 CPU profiler and return the `.cpuprofile` JSON object.
 ///
 /// `expected_pid`, when set, is checked with `Runtime.evaluate` of `process.pid`
@@ -34,8 +38,8 @@ pub fn capture_cpu_profile(
         return Err(Error::message("profile duration must be greater than zero"));
     }
     let config = WebSocketConfig::default()
-        .max_message_size(Some(256 * 1024 * 1024))
-        .max_frame_size(Some(256 * 1024 * 1024));
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES));
     let (mut socket, _response) = connect_with_config(websocket_url, Some(config), 0)
         .map_err(|err| Error::message(format!("websocket {websocket_url}: {err}")))?;
     prepare_socket(socket.get_mut())?;
@@ -213,9 +217,13 @@ impl Rpc {
             .send(Message::text(payload.to_string()))
             .map_err(|err| Error::message(format!("{method}: send failed: {err}")))?;
         for _ in 0..10_000 {
-            let message = socket
-                .read()
-                .map_err(|err| Error::message(format!("{method}: read failed: {err}")))?;
+            let message = socket.read().map_err(|err| match err {
+                WsError::Capacity(_) => Error::message(format!(
+                    "{method}: {err}. The profile is larger than {} MiB; record a shorter window or sample less often, for example --interval 1ms",
+                    MAX_MESSAGE_BYTES / (1024 * 1024)
+                )),
+                err => Error::message(format!("{method}: read failed: {err}")),
+            })?;
             match message {
                 Message::Text(text) => {
                     let value: Value = serde_json::from_str(text.as_str()).map_err(|err| {

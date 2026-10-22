@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use anyprof_cdp::{capture_cpu_profile, sampling_interval_us};
 use anyprof_core::{
-    Backend, Capabilities, Error, Format, ProcessSnapshot, Profile, RecordOptions, Runtime,
-    Session, Target, inspect,
+    Backend, Capabilities, DEVTOOLS_SAMPLING_INTERVAL, Error, Format, ProcessSnapshot, Profile,
+    RecordOptions, Runtime, Session, Target, inspect,
 };
 use anyprof_export::import_cpuprofile;
 
@@ -65,6 +65,10 @@ impl Backend for NodeBackend {
         Format::Cpuprofile
     }
 
+    fn default_sampling_interval(&self) -> Duration {
+        DEVTOOLS_SAMPLING_INTERVAL
+    }
+
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
         if opts.duration.is_some_and(|duration| duration.is_zero()) {
             return Err(Error::backend(
@@ -93,7 +97,10 @@ impl Backend for NodeBackend {
 
         let websocket =
             attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
-        let interval_us = sampling_interval_us(opts.frequency_hz);
+        let interval_us = sampling_interval_us(
+            opts.sampling_interval
+                .unwrap_or_else(|| self.default_sampling_interval()),
+        );
         let bytes = capture_cpu_profile(
             &websocket,
             opts.duration,

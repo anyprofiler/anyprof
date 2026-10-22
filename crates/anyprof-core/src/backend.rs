@@ -72,19 +72,40 @@ pub struct Target {
     pub pid: u32,
 }
 
+/// Sampling interval Chrome DevTools' Performance panel records with (10 kHz).
+///
+/// Node.js and browser tabs default to this so a mostly idle server still
+/// catches sub-millisecond request handling.
+pub const DEVTOOLS_SAMPLING_INTERVAL: Duration = Duration::from_micros(100);
+
+/// 99 Hz, the `perf record -F 99` convention native and Go samplers default to.
+/// The odd rate keeps samples from lining up with periodic work.
+pub const PERF_SAMPLING_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 99);
+
+/// Interval between samples at `hertz` samples per second.
+///
+/// Zero is treated as one sample per second.
+#[must_use]
+pub fn interval_for_frequency(hertz: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000 / u64::from(hertz.max(1)))
+}
+
 /// Options for one recording session.
 ///
-/// [`RecordOptions::default`] samples for 30 seconds. The CLI does not use that
-/// default: omitting `-d` passes [`None`] and the recording runs until
-/// [`StopGate`] is signaled.
+/// [`RecordOptions::default`] samples for 30 seconds at the backend's default
+/// interval. The CLI does not use that duration: omitting `-d` passes [`None`]
+/// and the recording runs until [`StopGate`] is signaled.
 #[derive(Debug, Clone)]
 pub struct RecordOptions {
     /// How long to sample.
     ///
     /// `None` means sample until [`Self::stop`] is signaled. `Some(0)` is rejected.
     pub duration: Option<Duration>,
-    /// Requested sampling frequency in hertz.
-    pub frequency_hz: u32,
+    /// Time between samples.
+    ///
+    /// `None` uses [`Backend::default_sampling_interval`]. Backends round to
+    /// what their sampler supports (V8 takes whole microseconds).
+    pub sampling_interval: Option<Duration>,
     /// Ask for kernel frames when [`Capabilities::kernel_frames`] is set.
     pub include_kernel: bool,
     /// Inspector or Chrome remote-debugging endpoint.
@@ -103,7 +124,7 @@ impl Default for RecordOptions {
     fn default() -> Self {
         Self {
             duration: Some(Duration::from_secs(30)),
-            frequency_hz: 99,
+            sampling_interval: None,
             include_kernel: false,
             inspect: None,
             tab: None,
@@ -146,6 +167,13 @@ pub trait Backend: Send + Sync {
     /// return [`Format::Pprof`]. A future Python, Ruby, or PHP backend should
     /// return [`Format::Speedscope`].
     fn default_format(&self) -> Format;
+
+    /// Interval used when [`RecordOptions::sampling_interval`] is `None`.
+    ///
+    /// Node.js and browser tabs return [`DEVTOOLS_SAMPLING_INTERVAL`] (100 µs)
+    /// to match a DevTools recording. Go and native return
+    /// [`PERF_SAMPLING_INTERVAL`] (99 Hz).
+    fn default_sampling_interval(&self) -> Duration;
 
     /// Begin sampling. The returned session is stopped to obtain a [`Profile`].
     ///
@@ -227,6 +255,10 @@ mod tests {
             Format::Collapsed
         }
 
+        fn default_sampling_interval(&self) -> std::time::Duration {
+            super::PERF_SAMPLING_INTERVAL
+        }
+
         fn start(
             &self,
             _target: &Target,
@@ -297,11 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn default_record_options_are_thirty_seconds_at_99hz() {
+    fn default_record_options_are_thirty_seconds_at_the_backend_interval() {
         let opts = RecordOptions::default();
         assert_eq!(opts.duration, Some(std::time::Duration::from_secs(30)));
-        assert_eq!(opts.frequency_hz, 99);
+        assert_eq!(opts.sampling_interval, None);
         assert!(!opts.include_kernel);
         assert!(!opts.stop.stop_requested());
+    }
+
+    #[test]
+    fn frequencies_become_intervals() {
+        use super::{DEVTOOLS_SAMPLING_INTERVAL, PERF_SAMPLING_INTERVAL, interval_for_frequency};
+        use std::time::Duration;
+
+        assert_eq!(interval_for_frequency(10_000), DEVTOOLS_SAMPLING_INTERVAL);
+        assert_eq!(interval_for_frequency(99), PERF_SAMPLING_INTERVAL);
+        assert_eq!(PERF_SAMPLING_INTERVAL.as_micros(), 10_101);
+        assert_eq!(interval_for_frequency(1000), Duration::from_millis(1));
+        assert_eq!(interval_for_frequency(0), Duration::from_secs(1));
     }
 }

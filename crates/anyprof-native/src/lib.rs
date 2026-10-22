@@ -49,6 +49,10 @@ impl Backend for NativeBackend {
         Format::Pprof
     }
 
+    fn default_sampling_interval(&self) -> std::time::Duration {
+        anyprof_core::PERF_SAMPLING_INTERVAL
+    }
+
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
         // TODO(native): C++ on-CPU sampling, macOS first, then Windows, then Linux
         // perf_event_open. Rust-specific stacks come after the C++ sampler.

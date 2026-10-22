@@ -41,4 +41,18 @@ mod tests {
         assert_eq!(GoBackend.default_format(), Format::Pprof);
         assert_eq!(NativeBackend.default_format(), Format::Pprof);
     }
+
+    #[test]
+    fn v8_backends_sample_like_devtools_and_perf_backends_at_99_hz() {
+        use std::time::Duration;
+
+        let devtools = Duration::from_micros(100);
+        assert_eq!(NodeBackend.default_sampling_interval(), devtools);
+        assert_eq!(BrowserBackend.default_sampling_interval(), devtools);
+        assert_eq!(GoBackend.default_sampling_interval().as_micros(), 10_101);
+        assert_eq!(
+            NativeBackend.default_sampling_interval().as_micros(),
+            10_101
+        );
+    }
 }

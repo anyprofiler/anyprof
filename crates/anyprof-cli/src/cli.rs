@@ -54,6 +54,7 @@ Examples:
   anyprof rec -p 1234
   anyprof rec -p 1234 -d 30s -f collapsed -o cpu.collapsed
   anyprof rec -p 1234 -i 9229 -d 10s -f speedscope -o cpu.json
+  anyprof rec -p 1234 -d 5m --interval 1ms
   anyprof rec -B -t example.com -d 10s -o page.cpuprofile")]
 pub struct RecordArgs {
     /// Process to profile. Required unless `--browser` is set.
@@ -105,14 +106,30 @@ pub struct RecordArgs {
     #[arg(short = 'f', long, value_enum)]
     pub format: Option<ProfileFormat>,
 
-    /// Sampling frequency in hertz.
+    /// Samples per second, for example `1000`.
+    ///
+    /// Defaults depend on the backend: Node and browser sample every 100us
+    /// (10000 Hz), the same rate as a Chrome DevTools recording, and Go and
+    /// native sample at 99 Hz. Conflicts with `--interval`.
     #[arg(
         short = 'F',
         long,
-        default_value_t = 99,
+        value_name = "HZ",
         value_parser = clap::value_parser!(u32).range(1..)
     )]
-    pub frequency: u32,
+    pub frequency: Option<u32>,
+
+    /// Time between samples, for example `100us`, `1ms`, or `10ms`.
+    ///
+    /// An alternative to `--frequency`. Node and browser round to whole
+    /// microseconds.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = humantime::parse_duration,
+        conflicts_with = "frequency"
+    )]
+    pub interval: Option<Duration>,
 
     /// Include kernel frames when the backend supports them.
     #[arg(short = 'k', long)]
@@ -287,7 +304,8 @@ mod tests {
             Some(ProfileFormat::Speedscope)
         );
         assert_eq!(infer_format(std::path::Path::new("cpu")), None);
-        assert_eq!(args.frequency, 99);
+        assert_eq!(args.frequency, None);
+        assert_eq!(args.interval, None);
         assert!(!args.kernel);
         assert!(args.backend.is_none());
         assert!(args.inspect.is_none());
@@ -318,7 +336,7 @@ mod tests {
             panic!("expected record");
         };
         assert_eq!(args.format, Some(ProfileFormat::Pprof));
-        assert_eq!(args.frequency, 199);
+        assert_eq!(args.frequency, Some(199));
         assert!(args.kernel);
         assert_eq!(args.backend.as_deref(), Some("native"));
         assert_eq!(args.duration, None);
@@ -334,7 +352,39 @@ mod tests {
         assert_eq!(args.pid, Some(3));
         assert!(args.output.is_none());
         assert!(args.duration.is_none());
-        assert_eq!(args.frequency, 99);
+        assert_eq!(args.frequency, None);
+        assert_eq!(args.interval, None);
+    }
+
+    #[test]
+    fn interval_takes_a_duration_and_conflicts_with_frequency() {
+        for (raw, expected) in [
+            ("100us", Duration::from_micros(100)),
+            ("1ms", Duration::from_millis(1)),
+            ("10ms", Duration::from_millis(10)),
+        ] {
+            let cli =
+                Cli::try_parse_from(["anyprof", "rec", "-p", "3", "--interval", raw]).unwrap();
+            let Command::Record(args) = cli.command else {
+                panic!("expected record");
+            };
+            assert_eq!(args.interval, Some(expected), "{raw}");
+            assert_eq!(args.frequency, None);
+        }
+
+        let err = Cli::try_parse_from([
+            "anyprof",
+            "rec",
+            "-p",
+            "3",
+            "-F",
+            "1000",
+            "--interval",
+            "1ms",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(Cli::try_parse_from(["anyprof", "rec", "-p", "3", "--interval", "fast"]).is_err());
     }
 
     #[test]
@@ -367,7 +417,7 @@ mod tests {
         assert_eq!(args.pid, Some(42));
         assert_eq!(args.duration, Some(Duration::from_secs(10)));
         assert_eq!(args.format, Some(ProfileFormat::Cpuprofile));
-        assert_eq!(args.frequency, 50);
+        assert_eq!(args.frequency, Some(50));
         assert_eq!(args.backend.as_deref(), Some("node"));
         assert_eq!(args.inspect.as_deref(), Some("9229"));
         assert!(args.kernel);

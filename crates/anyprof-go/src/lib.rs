@@ -53,6 +53,10 @@ impl Backend for GoBackend {
         Format::Pprof
     }
 
+    fn default_sampling_interval(&self) -> std::time::Duration {
+        anyprof_core::PERF_SAMPLING_INTERVAL
+    }
+
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
         // TODO(go): lower priority than Node, browser pages, and native C++.
         // Walk a live Go runtime and collect CPU samples. Linux build-info
