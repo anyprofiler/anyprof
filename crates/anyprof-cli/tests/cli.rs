@@ -41,6 +41,7 @@ fn record_help_shows_pid_duration_and_format() {
     assert!(stdout.contains("-d, --duration"));
     assert!(stdout.contains("-f, --format"));
     assert!(stdout.contains("-F, --frequency <HZ>"));
+    assert!(stdout.contains("1..=1000000 Hz"));
     assert!(stdout.contains("--interval <DURATION>"));
     assert!(stdout.contains("100us"));
     assert!(stdout.contains("-B, --browser"));
@@ -287,6 +288,128 @@ fn view_serves_the_profile_on_loopback_until_the_timeout() {
     assert!(printed.contains("ssh -L"), "{printed}");
     assert!(printed.contains("--web-timeout reached"), "{printed}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+mod viewer_interrupts {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::path::Path;
+    use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct Running {
+        child: Child,
+        stderr: BufReader<ChildStderr>,
+        printed: String,
+        url: String,
+    }
+
+    impl Running {
+        fn start(file: &Path) -> Self {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+                .arg("view")
+                .arg(file)
+                .args(["--no-open", "--web-timeout", "2m"])
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stderr = BufReader::new(child.stderr.take().unwrap());
+            let mut printed = String::new();
+            let url = loop {
+                let mut line = String::new();
+                assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "{printed}");
+                printed.push_str(&line);
+                if let Some(url) = line
+                    .split_whitespace()
+                    .find(|word| word.starts_with("http://127.0.0.1:"))
+                {
+                    break url.to_string();
+                }
+            };
+            Self {
+                child,
+                stderr,
+                printed,
+                url,
+            }
+        }
+
+        fn interrupt(&self) {
+            let status = Command::new("kill")
+                .args(["-INT", &self.child.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        fn wait(mut self, within: Duration, what: &str) -> (ExitStatus, String) {
+            let deadline = Instant::now() + within;
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() > deadline {
+                    let _ = self.child.kill();
+                    panic!("{what} did not exit the viewer\n{}", self.printed);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let mut tail = String::new();
+            self.stderr.read_to_string(&mut tail).unwrap();
+            self.printed.push_str(&tail);
+            (status, self.printed)
+        }
+    }
+
+    fn profile_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("anyprof-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn first_interrupt_stops_the_viewer_cleanly() {
+        let dir = profile_dir("view-int");
+        let file = dir.join("cpu.collapsed");
+        std::fs::write(&file, "main;work 3\n").unwrap();
+        let viewer = Running::start(&file);
+        viewer.interrupt();
+        let (status, printed) = viewer.wait(Duration::from_secs(10), "one interrupt");
+        assert!(status.success(), "{printed}");
+        assert!(printed.contains("viewer stopped"), "{printed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_interrupt_exits_while_a_response_write_is_stuck() {
+        let dir = profile_dir("view-stuck");
+        let file = dir.join("big.collapsed");
+        // Far more than loopback socket buffers hold, so the write blocks.
+        std::fs::write(&file, vec![b'a'; 64 << 20]).unwrap();
+        let mut viewer = Running::start(&file);
+        let rest = viewer.url.strip_prefix("http://").unwrap();
+        let (host, path) = rest.split_once('/').unwrap();
+        let mut stalled = std::net::TcpStream::connect(host).unwrap();
+        write!(
+            stalled,
+            "GET /{path}profile HTTP/1.0\r\nHost: {host}\r\n\r\n"
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        viewer.interrupt();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            viewer.child.try_wait().unwrap().is_none(),
+            "the first interrupt should only ask the stuck server to stop"
+        );
+        viewer.interrupt();
+        let (status, printed) = viewer.wait(Duration::from_secs(10), "a second interrupt");
+        drop(stalled);
+        assert_eq!(status.code(), Some(130), "{printed}");
+        assert!(printed.contains("second interrupt"), "{printed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]

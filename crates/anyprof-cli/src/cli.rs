@@ -114,11 +114,12 @@ pub struct RecordArgs {
     #[arg(short = 'f', long, value_enum)]
     pub format: Option<ProfileFormat>,
 
-    /// Samples per second, for example `1000`.
+    /// Samples per second, 1..=1000000 Hz, for example `1000`.
     ///
-    /// Defaults depend on the backend: Node and browser sample every 100us
-    /// (10000 Hz), the same rate as a Chrome DevTools recording, and Go and
-    /// native sample at 99 Hz. Conflicts with `--interval`.
+    /// 1000000 Hz (one sample per microsecond) is the finest rate. Defaults
+    /// depend on the backend: Node and browser sample every 100us (10000 Hz),
+    /// the same rate as a Chrome DevTools recording, and Go and native sample
+    /// at 99 Hz. Conflicts with `--interval`.
     #[arg(
         short = 'F',
         long,

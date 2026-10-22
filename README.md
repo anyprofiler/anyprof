@@ -81,18 +81,18 @@ A frame from a non-native runtime is written as `[runtime] name`, for example `[
 
 ## Install
 
-Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.2` is tag `v0.1.2`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
+Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.3` is tag `v0.1.3`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
 
 macOS and Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.2/anyprof-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.3/anyprof-cli-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.2/anyprof-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.3/anyprof-cli-installer.ps1 | iex"
 ```
 
 The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
@@ -107,7 +107,7 @@ That downloads the latest GitHub Release and replaces the current binary. If thi
 
 Updates only come from `github.com/anyprofiler/anyprof`. The command refuses a receipt that names another repository and ignores the installer's host overrides (`ANYPROF_CLI_INSTALLER_GITHUB_BASE_URL`, `ANYPROF_CLI_INSTALLER_GHE_BASE_URL`, `ANYPROF_CLI_DOWNLOAD_URL`, `INSTALLER_DOWNLOAD_URL`). It also ignores `ANYPROF_CLI_INSTALL_DIR`, so the new binary goes where the release installer put this one. The installer checks the archive's SHA-256 before it unpacks. Once the installer starts, Ctrl+C waits for it to exit. On Windows the running `anyprof.exe` is moved to `anyprof.exe.previous.exe` during the install and moved back if the install fails. If a leftover `anyprof.exe.previous.exe` can't be deleted afterwards, the update still exits 0 and prints its path so you can delete it.
 
-Without a release, build from this repo. That needs Rust 1.85 or newer (the workspace is edition 2024):
+Without a release, build from this repo. That needs Rust 1.88 or newer (the workspace is edition 2024, and the `anyprof update` dependencies need 1.88):
 
 ```bash
 cargo install --git https://github.com/anyprofiler/anyprof anyprof-cli
@@ -217,7 +217,7 @@ anyprof rec -p 1234 -d 10s -w --web-timeout 10m
 | `--port <PORT>` | Listen on `127.0.0.1:<PORT>`. Default: a free port chosen by the OS. |
 | `--web-timeout <DURATION>` | Stop after this long (`humantime`, for example `10m`). Default: serve until Ctrl+C. |
 
-The viewer serves until Ctrl+C (or SIGTERM, or Ctrl+Break on Windows), then exits 0. The browser tab keeps the profile it already loaded.
+The viewer serves until Ctrl+C (or SIGTERM, or Ctrl+Break on Windows), then exits 0. A second Ctrl+C exits immediately with status 130, even if a response is stuck on a client that stopped reading. The browser tab keeps the profile it already loaded.
 
 anyprof opens the default browser with the [`webbrowser`](https://crates.io/crates/webbrowser) crate (macOS `open`, Windows `ShellExecute`, `xdg-open` and friends elsewhere). It prints the URL instead, together with an `ssh -L <port>:127.0.0.1:<port>` command for viewing from another machine, when:
 
@@ -277,14 +277,14 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope JSON in `anyprof view`, and checks that the viewer served the profile, that speedscope used the matching importer, that the page logged no exceptions or CSP violations, and that the screenshot contains a flame graph. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The crate MSRV is 1.85, and the workspace uses Rust edition 2024.
+CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope JSON in `anyprof view`, and checks that the viewer served the profile, that speedscope used the matching importer, that the page logged no exceptions or CSP violations, and that the screenshot contains a flame graph. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The MSRV is Rust 1.88 (`rust-version` in `Cargo.toml`); the `msrv` CI job builds and tests the whole workspace on it. The workspace uses Rust edition 2024.
 
 ### Cutting a release
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. Every crate inherits it.
 2. Commit that change on `main` (the release workflow has to be on the default branch).
-3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.2` is tag `v0.1.2`.
-4. Push the tag: `git push origin v0.1.2`.
+3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.3` is tag `v0.1.3`.
+4. Push the tag: `git push origin v0.1.3`.
 
 Pushing the tag runs `.github/workflows/release.yml`. [cargo-dist](https://axodotdev.github.io/cargo-dist/) builds `anyprof` for Apple Silicon macOS, Intel macOS, 64-bit Windows, and 64-bit Linux (glibc and musl, x86_64 and ARM), then uploads the archives, checksums, shell installer, and PowerShell installer to a GitHub Release.
 

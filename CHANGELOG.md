@@ -1,11 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 - 2026-10-22
 
 - `anyprof view <file>` (alias `v`) opens a `.cpuprofile`, pprof, speedscope JSON, or collapsed-stacks file in speedscope 1.25.0, which is built into the binary and served on `127.0.0.1` under a random 128-bit token path. Nothing is downloaded. `record -w` / `--web` writes the profile as usual, then opens it the same way. `--no-open` prints the URL instead, `--port` picks the port, and `--web-timeout` stops the viewer after a while; otherwise it serves until Ctrl+C. Over SSH or without a display, anyprof prints the URL and an `ssh -L` port-forward command instead of opening a browser. The binary is about 0.8 MiB larger. Release archives include the speedscope (MIT) and Source Code Pro (OFL-1.1) licenses.
 - `-F` above 1000000 Hz is rejected with a clear message. It used to print a `0us` sampling banner while V8 sampled every 1us.
 - The idle warning shows its percentage with one decimal and never rounds a share above 95% down to `95%`.
 - Node's `-v` log reports the V8 sample count in `samples`, not the total of microsecond weights.
+- The minimum supported Rust version is 1.88, up from 1.85. The `anyprof update` dependencies (axoupdater and the crates it pulls in) need 1.88, so 0.1.2 did not build on 1.85. A new `msrv` CI job builds and tests the whole workspace on Rust 1.88.
+- `record --help` says `-F` accepts 1..=1000000 Hz.
+- A second Ctrl+C while the viewer is running exits immediately, even when a response write is stuck on a client that stopped reading. The first Ctrl+C still stops the viewer cleanly, the same as in `record`.
+- The headless Chrome smoke test saves a screenshot and a text report (page state, console, DevTools log, DOM, viewer output) before it fails on a load timeout.
 
 ## 0.1.2
 

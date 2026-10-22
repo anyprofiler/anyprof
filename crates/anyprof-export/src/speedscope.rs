@@ -152,10 +152,11 @@ fn json_weight(value: &serde_json::Value) -> Result<u64, Error> {
             if let Some(weight) = number.as_u64() {
                 return Ok(weight);
             }
-            if let Some(weight) = number.as_f64() {
-                if weight.is_finite() && weight >= 0.0 {
-                    return Ok(weight.round() as u64);
-                }
+            if let Some(weight) = number.as_f64()
+                && weight.is_finite()
+                && weight >= 0.0
+            {
+                return Ok(weight.round() as u64);
             }
             Err(Error::invalid(
                 "speedscope",

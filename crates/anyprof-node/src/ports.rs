@@ -120,10 +120,10 @@ pub(crate) fn parse_proc_net(text: &str, inodes: &HashSet<u64>) -> Vec<u16> {
         let Some((_, port_hex)) = fields[1].rsplit_once(':') else {
             continue;
         };
-        if let Ok(port) = u16::from_str_radix(port_hex, 16) {
-            if port != 0 {
-                ports.push(port);
-            }
+        if let Ok(port) = u16::from_str_radix(port_hex, 16)
+            && port != 0
+        {
+            ports.push(port);
         }
     }
     ports

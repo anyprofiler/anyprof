@@ -76,11 +76,11 @@ pub(crate) fn export(profile: &Profile) -> Result<Vec<u8>, Error> {
     if let Some(duration) = duration_nanos(profile.duration)? {
         message.field_varint(10, duration);
     }
-    if let Some(period) = profile.period {
-        if let Some(period) = duration_nanos(period)? {
-            message.field_message(11, &value_type(cpu_label, nanos_label));
-            message.field_varint(12, period);
-        }
+    if let Some(period) = profile.period
+        && let Some(period) = duration_nanos(period)?
+    {
+        message.field_message(11, &value_type(cpu_label, nanos_label));
+        message.field_varint(12, period);
     }
     gzip(&message.into_vec())
 }

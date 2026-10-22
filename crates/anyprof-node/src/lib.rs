@@ -144,10 +144,10 @@ fn finish_profile(
     if profile.comm.is_none() {
         profile.comm = comm;
     }
-    if profile.duration.is_zero() {
-        if let Some(duration) = opts.duration {
-            profile.duration = duration;
-        }
+    if profile.duration.is_zero()
+        && let Some(duration) = opts.duration
+    {
+        profile.duration = duration;
     }
     if profile.period.is_none() {
         profile.period = Some(Duration::from_micros(u64::from(interval_us)));
