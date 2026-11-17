@@ -10,8 +10,9 @@
 //! lookup. A sampled instruction pointer maps to the last symbol at or below
 //! that address, as long as it is still inside the following symbol.
 //!
-//! On Windows and Linux the sampler is not built, so this module's only caller
-//! there is its unit tests. `dead_code` is allowed on those builds.
+//! Windows and Linux resolve symbols from PE and ELF instead, so this
+//! module's only caller there is its unit tests. `dead_code` is allowed on
+//! those builds.
 //!
 //! Symbol bytes are read with a seek, capped at 2,000,000 symbols and 64 MiB
 //! of string table. A larger on-disk binary is still parsed. A `dyld_v1`

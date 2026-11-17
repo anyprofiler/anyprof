@@ -2,7 +2,8 @@
 //!
 //! Node.js is the first-class pid backend. Browser pages are selected explicitly
 //! and share the DevTools Protocol client. Native C++ sampling works on macOS
-//! (Mach); Windows and Linux native sampling, and Go, are still stubs.
+//! (Mach), Windows x64 (`StackWalk64`), and Linux x86_64 (perf events). Go
+//! sampling is still a stub.
 //! Every runtime implements [`Backend`]. The CLI asks each backend whether it
 //! recognizes a pid, then [`Backend::start`]s a [`Session`]. Stopping the session
 //! yields one [`Profile`], regardless of which runtime produced the samples.

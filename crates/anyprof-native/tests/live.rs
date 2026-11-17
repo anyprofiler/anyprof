@@ -5,10 +5,9 @@
 //! re-executes itself under `sudo` and checks stacks, timing, sample counts,
 //! and collapsed / pprof / speedscope output. The idle fixture is a
 //! user-compiled `pause()` loop, not `/bin/sleep`, because System Integrity
-//! Protection can refuse `task_for_pid` on platform binaries. Windows and
-//! Linux compile this file but do not sample. Their assertion is that the
-//! Mach sampler is absent; [`NativeBackend::start`] returning "not
-//! implemented" is covered by the library tests.
+//! Protection can refuse `task_for_pid` on platform binaries. Windows x64
+//! and Linux x86_64 sample in `windows_live.rs` and `linux_live.rs`. This
+//! file only checks that the host is not macOS.
 
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};

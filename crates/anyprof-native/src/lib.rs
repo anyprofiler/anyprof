@@ -1,23 +1,36 @@
 //! Native (C, C++, and later Rust) CPU sampling backend.
 //!
-//! Roadmap order is macOS, then Windows, then Linux. macOS samples on-CPU
-//! stacks through Mach (`task_for_pid`, frame pointers, Mach-O symbols) and
-//! needs root. Windows is not built yet. The Linux sampler will be
-//! `perf_event_open` plus user-space unwinding, including kernel frames when
-//! requested.
+//! macOS samples on-CPU stacks through Mach (`task_for_pid`, frame pointers,
+//! Mach-O symbols) and needs root. Linux x86_64 samples through
+//! `perf_event_open` task-clock events and can include kernel frames. Windows
+//! x64 suspends threads that are actually running and walks them with
+//! `StackWalk64`. Other architectures compile and `start` returns not
+//! implemented.
 //!
 //! C++ is the native target after Node.js and browser pages. A Rust-specific
 //! sampler comes after that; until then Rust processes fall through to this
-//! backend and, on macOS, get the same Mach stacks.
+//! backend and get the native stacks for the platform.
 //!
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
+mod elf;
+mod kallsyms;
 mod macho;
+mod maps;
+mod perf_parse;
 mod policy;
+mod snapshot;
+mod walk;
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod linux;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod windows;
 
 use std::time::Duration;
 
@@ -25,17 +38,17 @@ use anyprof_core::{
     Backend, Capabilities, Error, Format, RecordOptions, Session, Target, process_exists,
 };
 
-/// Detail for [`Error::NotImplemented`] on platforms without a sampler yet.
-#[cfg(windows)]
-const NOT_IMPLEMENTED: &str = "native on-CPU sampling is not built on Windows yet (macOS Mach sampling is implemented; Windows is next, then Linux perf events)";
+/// Detail for [`Error::NotImplemented`] on Windows builds that are not x64.
+#[cfg(all(windows, not(target_arch = "x86_64")))]
+const NOT_IMPLEMENTED: &str = "native on-CPU sampling on Windows is implemented for x64; this build is another architecture (macOS Mach sampling is implemented)";
 
-/// Detail for [`Error::NotImplemented`] on platforms without a sampler yet.
-#[cfg(target_os = "linux")]
-const NOT_IMPLEMENTED: &str = "native on-CPU sampling is not built on Linux yet (macOS Mach sampling is implemented; Linux perf events come after Windows)";
+/// Detail for [`Error::NotImplemented`] on Linux builds that are not x86_64.
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+const NOT_IMPLEMENTED: &str = "native on-CPU sampling on Linux is implemented for x86_64; this build is another architecture (macOS Mach sampling is implemented)";
 
 /// Detail for [`Error::NotImplemented`] on platforms without a sampler yet.
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-const NOT_IMPLEMENTED: &str = "native on-CPU sampling is not built on this platform (macOS Mach sampling is implemented; Windows is next, then Linux perf events)";
+const NOT_IMPLEMENTED: &str = "native on-CPU sampling is not built on this platform (macOS Mach sampling is implemented; Windows x64 and Linux x86_64 sampling are implemented)";
 
 /// Native (C, C++, Rust, and other non-language-runtime) sampler.
 #[derive(Debug, Default)]
@@ -57,10 +70,14 @@ impl Backend for NativeBackend {
             on_cpu: true,
             off_cpu: false,
             mixed_stacks: false,
-            // Kernel stacks are a Linux perf feature. macOS samples user
-            // frames only and does not claim kernel frames.
+            // Kernel stacks are a Linux perf feature. macOS and Windows
+            // sample user frames only.
             kernel_frames: cfg!(target_os = "linux"),
-            needs_root: true,
+            // macOS `task_for_pid` needs root for an ordinary process.
+            // Windows same-user sampling does not. Linux same-user user-space
+            // sampling does not when `perf_event_paranoid` is 2 or lower;
+            // the permission error names the case that does.
+            needs_root: cfg!(target_os = "macos"),
         }
     }
 
@@ -97,19 +114,43 @@ impl Backend for NativeBackend {
             );
             Ok(Box::new(ReadySession { profile }))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let profile = linux::record(target, opts)?;
+            tracing::info!(
+                pid = target.pid,
+                samples = profile.total_weight(),
+                stacks = profile.stacks.len(),
+                "native profile complete"
+            );
+            Ok(Box::new(ReadySession { profile }))
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let profile = windows::record(target, opts)?;
+            tracing::info!(
+                pid = target.pid,
+                samples = profile.total_weight(),
+                stacks = profile.stacks.len(),
+                "native profile complete"
+            );
+            Ok(Box::new(ReadySession { profile }))
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(windows, target_arch = "x86_64"),
+        )))]
         {
             Err(Error::not_implemented(self.name(), NOT_IMPLEMENTED))
         }
     }
 }
 
-#[cfg(target_os = "macos")]
 struct ReadySession {
     profile: anyprof_core::Profile,
 }
 
-#[cfg(target_os = "macos")]
 impl Session for ReadySession {
     fn stop(self: Box<Self>) -> Result<anyprof_core::Profile, Error> {
         Ok(self.profile)
@@ -169,7 +210,7 @@ mod tests {
         assert!(caps.on_cpu);
         assert!(!caps.off_cpu);
         assert!(!caps.mixed_stacks);
-        assert!(caps.needs_root);
+        assert_eq!(caps.needs_root, cfg!(target_os = "macos"));
         assert_eq!(caps.kernel_frames, cfg!(target_os = "linux"));
         assert_eq!(
             NativeBackend.default_sampling_interval().as_micros(),
@@ -204,9 +245,89 @@ mod tests {
         );
     }
 
-    /// Windows and Linux compile this crate and refuse to sample. macOS is the
-    /// platform that actually records; its live test is `tests/live.rs`.
-    #[cfg(not(target_os = "macos"))]
+    /// Linux x86_64 either samples this process or explains `perf_event_open`.
+    /// Task-clock events do not suspend the target, so self-sampling is safe.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_samples_or_explains_perf_event_open() {
+        let result = NativeBackend.start(
+            &Target {
+                pid: std::process::id(),
+            },
+            &options(),
+        );
+        match result {
+            Ok(session) => {
+                let profile = session.stop().expect("stop");
+                assert_eq!(profile.pid, std::process::id());
+            }
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("perf_event_open"),
+                    "expected a perf error, got {message}"
+                );
+                assert!(!matches!(err, Error::NotImplemented { .. }), "{message}");
+            }
+        }
+    }
+
+    /// `-k` is a real request on Linux x86_64. Paranoid 2 refuses kernel samples.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn kernel_flag_is_a_real_perf_request() {
+        let result = NativeBackend.start(
+            &Target {
+                pid: std::process::id(),
+            },
+            &RecordOptions {
+                duration: Some(Duration::from_millis(50)),
+                include_kernel: true,
+                ..RecordOptions::default()
+            },
+        );
+        match result {
+            Ok(session) => {
+                let _ = session.stop();
+            }
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("perf_event_open") || message.contains("paranoid"),
+                    "{message}"
+                );
+                assert!(!matches!(err, Error::NotImplemented { .. }), "{message}");
+            }
+        }
+    }
+
+    /// Suspending this process can leave the sampler stuck. The refusal has
+    /// to happen before `OpenProcess`.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn sampling_the_current_process_is_refused_before_attach() {
+        let Err(err) = NativeBackend.start(
+            &Target {
+                pid: std::process::id(),
+            },
+            &options(),
+        ) else {
+            panic!("sampling this process must be refused");
+        };
+        let message = err.to_string();
+        assert!(message.contains("suspending"), "{message}");
+        assert!(
+            !message.contains("OpenProcess"),
+            "the refusal must happen before OpenProcess: {message}"
+        );
+    }
+
+    /// Platforms without a sampler still compile and refuse.
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64"),
+    )))]
     #[test]
     fn start_reports_not_implemented_on_this_platform() {
         let Err(err) = NativeBackend.start(
@@ -233,7 +354,31 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn kernel_flag_still_refuses_to_sample_this_process() {
+        let Err(err) = NativeBackend.start(
+            &Target {
+                pid: std::process::id(),
+            },
+            &RecordOptions {
+                duration: Some(Duration::from_millis(50)),
+                include_kernel: true,
+                ..RecordOptions::default()
+            },
+        ) else {
+            panic!("-k must not sample this process");
+        };
+        let message = err.to_string();
+        assert!(message.contains("suspending"), "{message}");
+        assert!(!matches!(err, Error::NotImplemented { .. }), "{message}");
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64"),
+    )))]
     #[test]
     fn kernel_flag_does_not_pretend_to_sample() {
         let Err(err) = NativeBackend.start(
