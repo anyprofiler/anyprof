@@ -12,6 +12,9 @@ use std::process::{Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use anyprof_core::Backend;
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn live_mach_sampler_is_not_executed_on_this_platform() {
