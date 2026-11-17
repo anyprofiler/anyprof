@@ -1,11 +1,12 @@
-//! Decisions the macOS sampler must get right, tested on every platform.
+//! Decisions the samplers must get right, tested on every platform.
 //!
-//! The Mach calls live in `macos`. These functions are the rules those calls
-//! follow: which threads count as on-CPU, how a `task_threads` buffer is
-//! released, how many times `thread_resume` is retried, how a return address
-//! is turned into a symbol, and when a pointer-authentication strip is allowed.
-//! On Windows and Linux nothing in the sampler calls them, so `dead_code` is
-//! allowed there. The unit tests in this file are the callers.
+//! The Mach calls live in `macos`, the perf calls in `linux`, and the Win32
+//! calls in `windows`. These functions are the rules those calls follow:
+//! which threads count as on-CPU, how a `task_threads` buffer is released,
+//! how many times a resume is retried, how a return address is turned into a
+//! symbol, when a pointer-authentication strip is allowed, and what a
+//! permission error tells the user. A helper that one platform does not call
+//! is still called by the tests in this file.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 /// `thread_get_state` flag: pc, lr, sp, and fp are already raw addresses.
@@ -224,13 +225,152 @@ pub(crate) fn should_deallocate_send_right(port: u32) -> bool {
     port != 0
 }
 
+/// What `perf_event_open` was refused, and the sysctls that explain why.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LinuxDenial {
+    /// Target pid.
+    pub pid: u32,
+    /// `errno` from the syscall.
+    pub errno: i32,
+    /// `kernel.perf_event_paranoid`, when it could be read.
+    pub paranoid: Option<i32>,
+    /// `kernel.yama.ptrace_scope`, when Yama is enabled.
+    pub ptrace_scope: Option<i32>,
+    /// Uid that owns the target, when `/proc/<pid>/status` could be read.
+    pub target_uid: Option<u32>,
+    /// Uid of this process.
+    pub self_uid: u32,
+    /// The user passed `-k`.
+    pub kernel: bool,
+}
+
+/// Permission error for a refused `perf_event_open`.
+///
+/// The text names the sysctl values that were actually read. anyprof does not
+/// change them. User-space samples and `-k` are not the same requirement.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn linux_perf_denied(denial: LinuxDenial) -> String {
+    let errno_name = match denial.errno {
+        1 => "EPERM",
+        13 => "EACCES",
+        22 => "EINVAL",
+        other => {
+            let _ = other;
+            "error"
+        }
+    };
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "cannot sample pid {}: perf_event_open failed ({errno_name}, errno {}).",
+        denial.pid, denial.errno
+    ));
+    if let Some(target) = denial.target_uid
+        && target != denial.self_uid
+    {
+        parts.push(format!(
+            "pid {} is uid {target}; this process is uid {}. Sampling another user's process needs root or CAP_SYS_PTRACE.",
+            denial.pid, denial.self_uid
+        ));
+    }
+    match denial.paranoid {
+        Some(value) if value >= 3 => parts.push(format!(
+            "kernel.perf_event_paranoid is {value}. Values of 3 or more block perf_event_open for an unprivileged process, including its own children. `sudo sysctl kernel.perf_event_paranoid=1` allows per-process sampling, or run `sudo anyprof rec -p {}` (CAP_PERFMON or CAP_SYS_ADMIN).",
+            denial.pid
+        )),
+        Some(value) if value >= 2 && denial.kernel => parts.push(format!(
+            "kernel.perf_event_paranoid is {value}. User-space samples of a process you can ptrace are allowed, but -k needs kernel samples, which need paranoid of 1 or less, or root (CAP_PERFMON or CAP_SYS_ADMIN)."
+        )),
+        Some(value) => parts.push(format!(
+            "kernel.perf_event_paranoid is {value}. User-space samples of a process you can ptrace do not need root at this setting. -k needs paranoid of 1 or less, or root."
+        )),
+        None => parts.push("kernel.perf_event_paranoid could not be read.".to_string()),
+    }
+    match denial.ptrace_scope {
+        Some(0) => parts.push(
+            "kernel.yama.ptrace_scope is 0, so a process may sample another process of the same user.".to_string(),
+        ),
+        Some(1) => parts.push(
+            "kernel.yama.ptrace_scope is 1. A process may sample its own children, not an unrelated process of the same user. `sudo sysctl kernel.yama.ptrace_scope=0`, or root (CAP_SYS_PTRACE), can sample other processes.".to_string(),
+        ),
+        Some(2) => parts.push(
+            "kernel.yama.ptrace_scope is 2. Only CAP_SYS_PTRACE can sample another process.".to_string(),
+        ),
+        Some(3) => parts.push(
+            "kernel.yama.ptrace_scope is 3. ptrace-style attach is disabled, so perf_event_open cannot sample another process.".to_string(),
+        ),
+        Some(other) => parts.push(format!("kernel.yama.ptrace_scope is {other}.")),
+        None => parts.push(
+            "Yama ptrace_scope is not enabled. Same-user sampling follows the classic ptrace rule.".to_string(),
+        ),
+    }
+    parts.push(
+        "anyprof does not change these sysctls, and it does not write the target's memory or registers.".to_string(),
+    );
+    parts.join(" ")
+}
+
+/// `PROTECTION_LEVEL_NONE` from the Windows SDK.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const PROTECTION_LEVEL_NONE: u32 = 0xFFFF_FFFE;
+
+/// Whether this process could enable `SeDebugPrivilege`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugPrivilege {
+    /// The token does not have the privilege.
+    NotHeld,
+    /// `AdjustTokenPrivileges` enabled it.
+    Enabled,
+}
+
+/// Permission error for a refused `OpenProcess` on Windows.
+///
+/// A protected process is not the same failure as a missing privilege.
+/// anyprof does not change protection or integrity.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_open_denied(
+    pid: u32,
+    os_error: u32,
+    protection_level: Option<u32>,
+    privilege: DebugPrivilege,
+) -> String {
+    if let Some(level) = protection_level
+        && level != PROTECTION_LEVEL_NONE
+    {
+        return format!(
+            "cannot sample pid {pid}: the process is protected (protection level {level:#x}). \
+             SeDebugPrivilege does not grant access to a protected process. \
+             anyprof will not change that protection."
+        );
+    }
+    if os_error == 87 {
+        return format!(
+            "cannot sample pid {pid}: OpenProcess failed because the process is not running"
+        );
+    }
+    let privilege = match privilege {
+        DebugPrivilege::NotHeld => "This process does not hold SeDebugPrivilege.",
+        DebugPrivilege::Enabled => {
+            "SeDebugPrivilege was enabled and the process is still inaccessible."
+        }
+    };
+    format!(
+        "cannot sample pid {pid}: OpenProcess failed (access denied, error {os_error}). \
+         A same-user, same-integrity process can be sampled without elevation. \
+         Another user's process, or a higher-integrity process, needs an elevated Administrator token with SeDebugPrivilege. \
+         {privilege} anyprof will not change process protection or integrity."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        IB_SIGNED_LR, KERNEL_SIGNED_LR, KERNEL_SIGNED_PC, NO_PTRAUTH, StripKind, ThreadArrayPlan,
-        is_dyld_shared_cache, on_cpu_threads, plan_thread_array, reject_self_sample,
-        retry_until_success, should_deallocate_send_right, should_strip, stack_strip_flags,
-        strip_pointer, symbol_lookup_address, task_for_pid_denied, too_many_threads,
+        DebugPrivilege, IB_SIGNED_LR, KERNEL_SIGNED_LR, KERNEL_SIGNED_PC, LinuxDenial, NO_PTRAUTH,
+        PROTECTION_LEVEL_NONE, StripKind, ThreadArrayPlan, is_dyld_shared_cache, linux_perf_denied,
+        on_cpu_threads, plan_thread_array, reject_self_sample, retry_until_success,
+        should_deallocate_send_right, should_strip, stack_strip_flags, strip_pointer,
+        symbol_lookup_address, task_for_pid_denied, too_many_threads, windows_open_denied,
     };
 
     #[test]
@@ -416,5 +556,65 @@ mod tests {
     fn a_null_mach_port_is_not_deallocated() {
         assert!(!should_deallocate_send_right(0));
         assert!(should_deallocate_send_right(1));
+    }
+
+    #[test]
+    fn linux_permission_text_names_the_sysctls_it_read() {
+        let text = linux_perf_denied(LinuxDenial {
+            pid: 42,
+            errno: 13,
+            paranoid: Some(4),
+            ptrace_scope: Some(1),
+            target_uid: Some(1000),
+            self_uid: 1000,
+            kernel: false,
+        });
+        assert!(text.contains("perf_event_open"), "{text}");
+        assert!(text.contains("EACCES"), "{text}");
+        assert!(text.contains("perf_event_paranoid is 4"), "{text}");
+        assert!(text.contains("ptrace_scope is 1"), "{text}");
+        assert!(text.contains("does not change these sysctls"), "{text}");
+        assert!(!text.contains("uid 1000"), "{text}");
+
+        let cross_user = linux_perf_denied(LinuxDenial {
+            pid: 1,
+            errno: 13,
+            paranoid: Some(2),
+            ptrace_scope: None,
+            target_uid: Some(0),
+            self_uid: 1000,
+            kernel: true,
+        });
+        assert!(cross_user.contains("uid 0"), "{cross_user}");
+        assert!(cross_user.contains("CAP_SYS_PTRACE"), "{cross_user}");
+        assert!(cross_user.contains("-k"), "{cross_user}");
+        assert!(
+            cross_user.contains("Yama ptrace_scope is not enabled"),
+            "{cross_user}"
+        );
+    }
+
+    #[test]
+    fn windows_permission_text_separates_protection_from_privilege() {
+        let protected = windows_open_denied(9, 5, Some(1), DebugPrivilege::Enabled);
+        assert!(protected.contains("protected"), "{protected}");
+        assert!(
+            protected.contains("will not change that protection"),
+            "{protected}"
+        );
+        assert!(!protected.to_lowercase().contains("disable"), "{protected}");
+
+        let denied =
+            windows_open_denied(9, 5, Some(PROTECTION_LEVEL_NONE), DebugPrivilege::NotHeld);
+        assert!(denied.contains("SeDebugPrivilege"), "{denied}");
+        assert!(denied.contains("same-user"), "{denied}");
+        assert!(denied.contains("does not hold"), "{denied}");
+
+        let enabled = windows_open_denied(9, 5, None, DebugPrivilege::Enabled);
+        assert!(enabled.contains("was enabled"), "{enabled}");
+
+        let gone = windows_open_denied(9, 87, None, DebugPrivilege::NotHeld);
+        assert!(gone.contains("not running"), "{gone}");
+        assert!(!gone.contains("SeDebugPrivilege"), "{gone}");
     }
 }

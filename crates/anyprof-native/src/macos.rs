@@ -10,10 +10,8 @@
 //! `xpacd` when the thread-state flags say so; they are not authenticated.
 //!
 //! Kernel frames are not available through this interface. `-k` is ignored and
-//! a warning is logged; the Linux perf backend is what will record them.
-//!
-//! This is the first native platform. Windows is next, then Linux
-//! `perf_event_open`.
+//! a warning is logged. Linux x86_64 records kernel frames with perf events.
+//! Windows x64 samples user frames only, the same as macOS.
 
 use std::collections::HashMap;
 use std::ffi::c_char;
@@ -68,9 +66,7 @@ unsafe extern "C" {
 
 pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
     if opts.include_kernel {
-        tracing::warn!(
-            "ignoring -k/--kernel: the macOS native sampler collects user frames only; kernel frames are planned with the Linux perf backend"
-        );
+        tracing::warn!("ignoring -k/--kernel: the macOS native sampler collects user frames only");
     }
     let interval = opts.sampling_interval.unwrap_or(PERF_SAMPLING_INTERVAL);
     if interval < Duration::from_micros(1) {

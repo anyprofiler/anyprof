@@ -8,6 +8,16 @@ fn anyprof(args: &[&str]) -> std::process::Output {
         .expect("run anyprof")
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn euid() -> u32 {
+    unsafe { geteuid() }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
 #[test]
 fn help_lists_record_and_convert() {
     let output = anyprof(&["--help"]);
@@ -156,9 +166,9 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     let output_path =
         std::env::temp_dir().join(format!("anyprof-record-{}.collapsed", std::process::id()));
     let _ = std::fs::remove_file(&output_path);
-    // macOS `task_for_pid` of the current process can succeed without root and
-    // would write a profile. Sample a different process so this unprivileged
-    // run stops at the permission error. Other platforms reject every pid.
+    // macOS `task_for_pid` of the current process can succeed without root.
+    // Linux task-clock sampling of this process can also succeed. Use a pid
+    // that the sampler refuses so this run does not write a profile.
     #[cfg(target_os = "macos")]
     let mut sleeper = Command::new("sleep")
         .arg("30")
@@ -169,7 +179,19 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
         .expect("spawn sleep");
     #[cfg(target_os = "macos")]
     let pid = sleeper.id().to_string();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let pid = if euid() == 0 {
+        "2147483646".to_string()
+    } else {
+        "1".to_string()
+    };
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let pid = std::process::id().to_string();
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64"),
+    )))]
     let pid = std::process::id().to_string();
     let output = Command::new(env!("CARGO_BIN_EXE_anyprof"))
         .args(["record", "--pid", pid.as_str(), "--duration", "1s", "-o"])
@@ -187,14 +209,48 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
         stderr.contains("sampling every 10101us (99 Hz)"),
         "native should keep the perf default: {stderr}"
     );
-    // macOS implements native sampling and refuses without root. Other
-    // platforms still have no sampler. Either way this run must not write.
+    // macOS refuses without root. Linux pid 1 is another user. Windows
+    // refuses to suspend this process. Other platforms have no sampler.
+    // Either way this run must not write.
     #[cfg(target_os = "macos")]
     assert!(
         stderr.contains("task_for_pid"),
         "macOS should explain the Mach permission failure: {stderr}"
     );
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if euid() == 0 {
+            assert!(
+                stderr.contains("not running"),
+                "a missing pid should be refused: {stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("perf_event_open"),
+                "pid 1 should explain the perf denial: {stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("not implemented yet"),
+            "Linux x86_64 sampling is implemented: {stderr}"
+        );
+    }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        assert!(
+            stderr.contains("suspending"),
+            "sampling this process should be refused: {stderr}"
+        );
+        assert!(
+            !stderr.contains("not implemented yet"),
+            "Windows x64 sampling is implemented: {stderr}"
+        );
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64"),
+    )))]
     assert!(
         stderr.contains("not implemented yet"),
         "platforms without a native sampler should say so: {stderr}"
