@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # The feature branch is included so macOS Mach sampling is tested on push.
+    # pull_request already covers the branch once a pull request is open.
+    branches: [main, cursor/macos-native-sampler-87a3]
   pull_request:
 
 permissions:

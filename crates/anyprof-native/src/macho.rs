@@ -452,7 +452,7 @@ fn try_demangle(raw: &str) -> Option<String> {
     let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
         .to_string_lossy()
         .into_owned();
-    unsafe { free(ptr.cast()) };
+    unsafe { free(ptr.cast::<std::ffi::c_void>()) };
     if text.is_empty() { None } else { Some(text) }
 }
 
