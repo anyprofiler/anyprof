@@ -21,6 +21,25 @@ pub(crate) fn plausible_user_address(addr: u64) -> bool {
     addr > 0x1000 && addr < 0x0000_8000_0000_0000
 }
 
+/// Instruction pointers `StackWalk64` may store as user frames.
+///
+/// A thread that is Running inside the Windows kernel has a kernel RIP.
+/// That address is not a user frame, and this sampler does not record
+/// kernel frames on Windows. Later user addresses in the same walk are kept.
+#[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn user_instruction_pointers(pcs: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut frames = Vec::new();
+    for pc in pcs {
+        if frames.len() == MAX_FRAMES {
+            break;
+        }
+        if plausible_user_address(pc) {
+            frames.push(pc);
+        }
+    }
+    frames
+}
+
 /// A frame pointer is an aligned user address.
 pub(crate) fn plausible_frame_pointer(fp: u64) -> bool {
     plausible_user_address(fp) && fp.is_multiple_of(8)
@@ -134,5 +153,16 @@ mod tests {
     fn a_kernel_pointer_is_not_a_user_frame() {
         let frames = walk_frame_pointer(0xffff_ffff_8100_0010, 0, 0, |_, _| unreachable!());
         assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn a_kernel_rip_is_not_stored_as_a_user_frame() {
+        let frames = super::user_instruction_pointers([
+            0xffff_f800_0010_0000,
+            0x0000_7ff6_1234_5678,
+            0x0000_7ff6_1234_1000,
+        ]);
+        assert_eq!(frames, vec![0x0000_7ff6_1234_5678, 0x0000_7ff6_1234_1000]);
+        assert!(super::user_instruction_pointers([0xffff_f800_0010_0000]).is_empty());
     }
 }

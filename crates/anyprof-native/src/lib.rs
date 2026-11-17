@@ -70,9 +70,10 @@ impl Backend for NativeBackend {
             on_cpu: true,
             off_cpu: false,
             mixed_stacks: false,
-            // Kernel stacks are a Linux perf feature. macOS and Windows
-            // sample user frames only.
-            kernel_frames: cfg!(target_os = "linux"),
+            // Kernel stacks exist only in the Linux x86_64 perf sampler.
+            // Other Linux architectures return not implemented from `start`
+            // and do not advertise `-k`.
+            kernel_frames: cfg!(all(target_os = "linux", target_arch = "x86_64")),
             // macOS `task_for_pid` needs root for an ordinary process.
             // Windows same-user sampling does not. Linux same-user user-space
             // sampling does not when `perf_event_paranoid` is 2 or lower;
@@ -211,7 +212,10 @@ mod tests {
         assert!(!caps.off_cpu);
         assert!(!caps.mixed_stacks);
         assert_eq!(caps.needs_root, cfg!(target_os = "macos"));
-        assert_eq!(caps.kernel_frames, cfg!(target_os = "linux"));
+        assert_eq!(
+            caps.kernel_frames,
+            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        );
         assert_eq!(
             NativeBackend.default_sampling_interval().as_micros(),
             10_101

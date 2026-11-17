@@ -89,6 +89,8 @@ enum AttachFail {
 struct Mapped {
     fd: i32,
     tid: i32,
+    /// `starttime` from `/proc/<pid>/task/<tid>/stat`. A reused tid has a new value.
+    start: u64,
     ptr: *mut u8,
     len: usize,
 }
@@ -173,7 +175,12 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         {
             break;
         }
-        refresh(&mut sampler, target.pid);
+        lost = lost.saturating_add(refresh(
+            &mut sampler,
+            target.pid,
+            opts.include_kernel,
+            &mut counts,
+        ));
         lost = lost.saturating_add(take_samples(
             &sampler,
             target.pid,
@@ -266,9 +273,9 @@ fn event_attr(period: u64, stack: u32, include_kernel: bool) -> PerfEventAttr {
 }
 
 fn attach(pid: u32, attr: &PerfEventAttr) -> Result<Sampler, AttachFail> {
-    let tids =
-        list_tids(pid).map_err(|message| AttachFail::Fatal(Error::backend("native", message)))?;
-    if tids.is_empty() {
+    let threads = list_threads(pid)
+        .map_err(|message| AttachFail::Fatal(Error::backend("native", message)))?;
+    if threads.is_empty() {
         return Err(AttachFail::Fatal(Error::backend(
             "native",
             format!("pid {pid} has no threads to sample"),
@@ -283,10 +290,16 @@ fn attach(pid: u32, attr: &PerfEventAttr) -> Result<Sampler, AttachFail> {
     };
     let mut denied = None;
     let mut other = None;
-    for tid in tids {
-        match open_one(tid, attr) {
+    for thread in threads {
+        match open_one(thread.tid, attr) {
             Ok(fd) => match map_ring(fd) {
-                Ok((ptr, len)) => sampler.events.push(Mapped { fd, tid, ptr, len }),
+                Ok((ptr, len)) => sampler.events.push(Mapped {
+                    fd,
+                    tid: thread.tid,
+                    start: thread.start,
+                    ptr,
+                    len,
+                }),
                 Err(err) => {
                     unsafe { libc::close(fd) };
                     if sampler.events.is_empty() {
@@ -380,7 +393,7 @@ fn classify(errno: i32) -> OpenError {
 
 fn map_ring(fd: i32) -> Result<(*mut u8, usize), i32> {
     let page = page_size();
-    let mut pages = preferred_data_pages();
+    let mut pages = data_pages(read_sysctl("/proc/sys/kernel/perf_event_mlock_kb"), page);
     loop {
         let len = page.saturating_mul(pages.saturating_add(1));
         // SAFETY: a shared mapping of `len` bytes so the kernel can publish
@@ -400,22 +413,33 @@ fn map_ring(fd: i32) -> Result<(*mut u8, usize), i32> {
         }
         let err = errno_now();
         if pages > 4 {
-            pages = (pages / 2).max(4);
+            pages /= 2;
             continue;
         }
         return Err(err);
     }
 }
 
-fn preferred_data_pages() -> usize {
-    // Leave room for several threads under `perf_event_mlock_kb`. Four data
-    // pages hold one 8 KiB stack sample; 32 is enough for a single busy thread
-    // without crowding the others out.
-    let kb = read_sysctl("/proc/sys/kernel/perf_event_mlock_kb").unwrap_or(512);
-    let kb = usize::try_from(kb).unwrap_or(512).max(32);
-    let per_thread = kb.saturating_mul(1024) / 8;
-    let pages = per_thread / page_size();
-    pages.clamp(5, 33).saturating_sub(1)
+/// Data pages in one thread's ring, always a power of two.
+///
+/// `perf_event_open` accepts `1 + 2^n` pages (one metadata page plus the data
+/// ring). A request for 15 data pages is `EINVAL`, and the old retry then
+/// landed on 4. This asks for the largest power of two from 4 through 32
+/// that fits in one eighth of `perf_event_mlock_kb`, leaving room for other
+/// threads. 512 KiB, the usual limit, yields 8 data pages.
+fn data_pages(mlock_kb: Option<i32>, page: usize) -> usize {
+    let kb = mlock_kb
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(512)
+        .max(32);
+    let page = page.max(1);
+    let budget = kb.saturating_mul(1024) / 8;
+    let data = budget.saturating_div(page).saturating_sub(1);
+    let mut sized = 4usize;
+    while sized < 32 && sized.saturating_mul(2) <= data {
+        sized = sized.saturating_mul(2);
+    }
+    if data < 4 { 4 } else { sized }
 }
 
 fn map_error(errno: i32) -> String {
@@ -426,23 +450,45 @@ fn map_error(errno: i32) -> String {
     )
 }
 
-fn refresh(sampler: &mut Sampler, pid: u32) {
-    let Ok(live) = list_tids(pid) else {
-        return;
+/// Attach threads that appeared, and drain rings for threads that exited.
+///
+/// The drain happens before the mapping is dropped, so the last samples of a
+/// short-lived thread are kept. A tid is the same thread only when its
+/// `starttime` still matches. A reused tid is drained and opened again.
+fn refresh(
+    sampler: &mut Sampler,
+    pid: u32,
+    include_kernel: bool,
+    counts: &mut HashMap<SampleKey, u64>,
+) -> u64 {
+    let Ok(live) = list_threads(pid) else {
+        return 0;
     };
-    let attr = event_attr(sampler.period, sampler.stack, sampler.include_kernel);
-    for tid in &live {
-        if sampler.has_tid(*tid) {
+    let mut lost = 0u64;
+    let mut retained = Vec::with_capacity(sampler.events.len());
+    for event in sampler.events.drain(..) {
+        if same_thread(event.tid, event.start, &live) {
+            retained.push(event);
             continue;
         }
-        let Ok(fd) = open_one(*tid, &attr) else {
+        let _ = ioctl_req(event.fd, IOC_DISABLE);
+        lost = lost.saturating_add(ingest_mapped(&event, pid, include_kernel, counts));
+    }
+    sampler.events = retained;
+    let attr = event_attr(sampler.period, sampler.stack, sampler.include_kernel);
+    for thread in &live {
+        if sampler.has_thread(thread.tid, thread.start) {
+            continue;
+        }
+        let Ok(fd) = open_one(thread.tid, &attr) else {
             continue;
         };
         match map_ring(fd) {
             Ok((ptr, len)) => {
                 let mapped = Mapped {
                     fd,
-                    tid: *tid,
+                    tid: thread.tid,
+                    start: thread.start,
                     ptr,
                     len,
                 };
@@ -458,12 +504,19 @@ fn refresh(sampler: &mut Sampler, pid: u32) {
             }
         }
     }
-    sampler.events.retain(|event| live.contains(&event.tid));
+    lost
+}
+
+fn same_thread(tid: i32, start: u64, live: &[LiveThread]) -> bool {
+    live.iter()
+        .any(|thread| thread.tid == tid && thread.start == start)
 }
 
 impl Sampler {
-    fn has_tid(&self, tid: i32) -> bool {
-        self.events.iter().any(|event| event.tid == tid)
+    fn has_thread(&self, tid: i32, start: u64) -> bool {
+        self.events
+            .iter()
+            .any(|event| event.tid == tid && event.start == start)
     }
 
     fn enable(&self) -> Result<(), i32> {
@@ -584,6 +637,27 @@ fn take_samples(
     counts: &mut HashMap<SampleKey, u64>,
 ) -> u64 {
     let (samples, lost) = sampler.drain();
+    record_samples(samples, pid, include_kernel, counts);
+    lost
+}
+
+fn ingest_mapped(
+    mapped: &Mapped,
+    pid: u32,
+    include_kernel: bool,
+    counts: &mut HashMap<SampleKey, u64>,
+) -> u64 {
+    let (samples, lost) = drain_mapped(mapped);
+    record_samples(samples, pid, include_kernel, counts);
+    lost
+}
+
+fn record_samples(
+    samples: Vec<ParsedSample>,
+    pid: u32,
+    include_kernel: bool,
+    counts: &mut HashMap<SampleKey, u64>,
+) {
     for sample in samples {
         if sample.pid != pid && sample.pid != 0 {
             continue;
@@ -593,7 +667,6 @@ fn take_samples(
         };
         *counts.entry(key).or_default() += 1;
     }
-    lost
 }
 
 /// Leaf-first addresses and how many leading frames are kernel addresses.
@@ -805,10 +878,15 @@ fn reject_foreign_elf(pid: u32) -> Result<(), Error> {
     ))
 }
 
-fn list_tids(pid: u32) -> Result<Vec<i32>, String> {
+struct LiveThread {
+    tid: i32,
+    start: u64,
+}
+
+fn list_threads(pid: u32) -> Result<Vec<LiveThread>, String> {
     let dir = std::fs::read_dir(format!("/proc/{pid}/task"))
         .map_err(|err| format!("cannot read /proc/{pid}/task ({err})"))?;
-    let mut tids = Vec::new();
+    let mut threads = Vec::new();
     for entry in dir {
         let Ok(entry) = entry else {
             continue;
@@ -819,17 +897,30 @@ fn list_tids(pid: u32) -> Result<Vec<i32>, String> {
         let Ok(tid) = name.parse::<i32>() else {
             continue;
         };
-        if tid > 0 {
-            tids.push(tid);
+        if tid <= 0 {
+            continue;
         }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")) else {
+            continue;
+        };
+        let Some(start) = task_starttime(&stat) else {
+            continue;
+        };
+        threads.push(LiveThread { tid, start });
     }
-    tids.sort_unstable();
+    threads.sort_unstable_by_key(|thread| thread.tid);
     if let Ok(leader) = i32::try_from(pid)
-        && let Some(index) = tids.iter().position(|tid| *tid == leader)
+        && let Some(index) = threads.iter().position(|thread| thread.tid == leader)
     {
-        tids.swap(0, index);
+        threads.swap(0, index);
     }
-    Ok(tids)
+    Ok(threads)
+}
+
+/// Field 22 of `/proc/<pid>/task/<tid>/stat`, after the comm in parentheses.
+fn task_starttime(stat: &str) -> Option<u64> {
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 fn permission_error(pid: u32, errno: i32, kernel: bool) -> String {
@@ -959,5 +1050,46 @@ mod tests {
         let user_only = assemble_addresses(&sample, false).expect("user frames");
         assert_eq!(user_only.kernel_len, 0);
         assert_eq!(user_only.frames, vec![0x5555_0000_1100, 0x5555_0000_1000]);
+    }
+
+    #[test]
+    fn the_ring_asks_for_a_power_of_two() {
+        assert_eq!(super::data_pages(Some(512), 4096), 8);
+        assert_eq!(super::data_pages(Some(516), 4096), 8);
+        assert_eq!(super::data_pages(None, 4096), 8);
+        assert_eq!(super::data_pages(Some(1024), 4096), 16);
+        assert_eq!(super::data_pages(Some(2048), 4096), 32);
+        assert_eq!(super::data_pages(Some(32), 4096), 4);
+        for kb in [32, 512, 516, 1024, 4096] {
+            let pages = super::data_pages(Some(kb), 4096);
+            assert!(pages.is_power_of_two(), "{kb} -> {pages}");
+            assert_ne!(pages, 15, "{kb}");
+            assert!((4..=32).contains(&pages), "{kb} -> {pages}");
+        }
+    }
+
+    #[test]
+    fn starttime_is_field_22_after_the_comm() {
+        let stat = "12 (a) b) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 431672 0";
+        assert_eq!(super::task_starttime(stat), Some(431672));
+        let text = std::fs::read_to_string("/proc/self/stat").unwrap();
+        assert!(super::task_starttime(&text).is_some_and(|start| start > 0));
+    }
+
+    #[test]
+    fn an_exited_or_reused_tid_is_not_the_same_thread() {
+        let live = [
+            super::LiveThread { tid: 7, start: 100 },
+            super::LiveThread { tid: 9, start: 200 },
+        ];
+        assert!(super::same_thread(7, 100, &live));
+        assert!(
+            !super::same_thread(7, 50, &live),
+            "a reused tid has a new starttime"
+        );
+        assert!(
+            !super::same_thread(8, 100, &live),
+            "an exited tid is absent"
+        );
     }
 }
