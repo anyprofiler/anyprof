@@ -37,8 +37,11 @@ const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
 const SAMPLE_TYPE: u64 = (1 << 0) | (1 << 1) | (1 << 5) | (1 << 12) | (1 << 13);
 const ATTR_SIZE: u32 = 96;
 const FLAG_FD_CLOEXEC: u64 = 1 << 3;
-const IOC_ENABLE: u64 = 0x2400;
-const IOC_DISABLE: u64 = 0x2401;
+// `PERF_EVENT_IOC_ENABLE` / `DISABLE` (`_IO('$', 0)` and `_IO('$', 1)`).
+// `libc::Ioctl` is `c_ulong` with glibc and `c_int` with musl on x86_64.
+// A `u64` request compiles for glibc and fails for musl.
+const IOC_ENABLE: libc::Ioctl = 0x2400;
+const IOC_DISABLE: libc::Ioctl = 0x2401;
 const DATA_HEAD: usize = 1024;
 const DATA_TAIL: usize = 1032;
 const DATA_OFFSET: usize = 1040;
@@ -976,9 +979,10 @@ fn errno_now() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-fn ioctl_req(fd: i32, request: u64) -> bool {
+fn ioctl_req(fd: i32, request: libc::Ioctl) -> bool {
     // SAFETY: `PERF_EVENT_IOC_ENABLE` / `DISABLE` take no payload. The third
-    // argument is ignored for these `_IO` requests.
+    // argument is ignored for these `_IO` requests. `request` is `libc::Ioctl`,
+    // so the same call type-checks for glibc (`c_ulong`) and musl (`c_int`).
     unsafe { libc::ioctl(fd, request, 0) == 0 }
 }
 

@@ -28,6 +28,11 @@ jobs:
         with:
           toolchain: 1.99.1
           components: rustfmt, clippy
+      - name: Install the musl target
+        if: matrix.os == 'ubuntu-latest'
+        # The x86_64 sampler is not compiled for aarch64, so an arm64 musl
+        # release build does not catch an x86_64 musl type error.
+        run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
@@ -36,6 +41,16 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check x86_64 musl
+        if: matrix.os == 'ubuntu-latest'
+        # Type-check the release target. musl-gcc is only for the updater's C
+        # build script. This does not link the binary or run cargo-dist.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          cargo check --workspace --locked --target x86_64-unknown-linux-musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
       - name: Allow per-process perf sampling
         if: matrix.os == 'ubuntu-latest'
         run: |
