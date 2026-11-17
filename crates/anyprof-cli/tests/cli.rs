@@ -185,8 +185,11 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     } else {
         "1".to_string()
     };
+    // The System process exists, so detection selects native, and OpenProcess
+    // fails for this user. The test's own pid is a different process from
+    // anyprof.exe, so the self-suspend refusal does not apply to it.
     #[cfg(all(windows, target_arch = "x86_64"))]
-    let pid = std::process::id().to_string();
+    let pid = "4".to_string();
     #[cfg(not(any(
         target_os = "macos",
         all(target_os = "linux", target_arch = "x86_64"),
@@ -210,7 +213,7 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
         "native should keep the perf default: {stderr}"
     );
     // macOS refuses without root. Linux pid 1 is another user. Windows
-    // refuses to suspend this process. Other platforms have no sampler.
+    // cannot open the System process. Other platforms have no sampler.
     // Either way this run must not write.
     #[cfg(target_os = "macos")]
     assert!(
@@ -238,8 +241,8 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
         assert!(
-            stderr.contains("suspending"),
-            "sampling this process should be refused: {stderr}"
+            stderr.contains("cannot sample pid 4"),
+            "the System process should be refused: {stderr}"
         );
         assert!(
             !stderr.contains("not implemented yet"),

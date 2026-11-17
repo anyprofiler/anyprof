@@ -279,25 +279,25 @@ pub(crate) fn linux_perf_denied(denial: LinuxDenial) -> String {
             denial.pid
         )),
         Some(value) if value >= 2 && denial.kernel => parts.push(format!(
-            "kernel.perf_event_paranoid is {value}. User-space samples of a process you can ptrace are allowed, but -k needs kernel samples, which need paranoid of 1 or less, or root (CAP_PERFMON or CAP_SYS_ADMIN)."
+            "kernel.perf_event_paranoid is {value}. User-space samples of a same-user process are allowed, but -k needs kernel samples, which need paranoid of 1 or less, or root (CAP_PERFMON or CAP_SYS_ADMIN)."
         )),
         Some(value) => parts.push(format!(
-            "kernel.perf_event_paranoid is {value}. User-space samples of a process you can ptrace do not need root at this setting. -k needs paranoid of 1 or less, or root."
+            "kernel.perf_event_paranoid is {value}. User-space samples of a same-user process do not need root at this setting. -k needs paranoid of 1 or less, or root."
         )),
         None => parts.push("kernel.perf_event_paranoid could not be read.".to_string()),
     }
     match denial.ptrace_scope {
         Some(0) => parts.push(
-            "kernel.yama.ptrace_scope is 0, so a process may sample another process of the same user.".to_string(),
+            "kernel.yama.ptrace_scope is 0. That sysctl limits ptrace attach. perf_event_open does not use the attach check, so same-user sampling follows perf_event_paranoid.".to_string(),
         ),
         Some(1) => parts.push(
-            "kernel.yama.ptrace_scope is 1. A process may sample its own children, not an unrelated process of the same user. `sudo sysctl kernel.yama.ptrace_scope=0`, or root (CAP_SYS_PTRACE), can sample other processes.".to_string(),
+            "kernel.yama.ptrace_scope is 1. ptrace attach is limited to descendants. perf_event_open does not use that attach check, so an unrelated process of the same user can still be sampled when perf_event_paranoid allows it.".to_string(),
         ),
         Some(2) => parts.push(
-            "kernel.yama.ptrace_scope is 2. Only CAP_SYS_PTRACE can sample another process.".to_string(),
+            "kernel.yama.ptrace_scope is 2. ptrace attach needs CAP_SYS_PTRACE. perf_event_open of a same-user process does not use that attach check.".to_string(),
         ),
         Some(3) => parts.push(
-            "kernel.yama.ptrace_scope is 3. ptrace-style attach is disabled, so perf_event_open cannot sample another process.".to_string(),
+            "kernel.yama.ptrace_scope is 3. ptrace attach is disabled. perf_event_open of a same-user process does not use that attach check.".to_string(),
         ),
         Some(other) => parts.push(format!("kernel.yama.ptrace_scope is {other}.")),
         None => parts.push(
@@ -573,6 +573,8 @@ mod tests {
         assert!(text.contains("EACCES"), "{text}");
         assert!(text.contains("perf_event_paranoid is 4"), "{text}");
         assert!(text.contains("ptrace_scope is 1"), "{text}");
+        assert!(text.contains("does not use that attach check"), "{text}");
+        assert!(!text.contains("not an unrelated process"), "{text}");
         assert!(text.contains("does not change these sysctls"), "{text}");
         assert!(!text.contains("uid 1000"), "{text}");
 

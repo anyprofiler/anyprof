@@ -349,7 +349,7 @@ fn another_users_process_explains_the_denial() {
 }
 
 #[test]
-fn an_unrelated_same_user_process_follows_ptrace_scope() {
+fn an_unrelated_same_user_process_follows_perf_not_ptrace_scope() {
     let _lock = LiveLock::acquire();
     let dir = fixture_dir("orphan");
     let source = dir.join("orphan.cpp");
@@ -373,6 +373,16 @@ fn an_unrelated_same_user_process_follows_ptrace_scope() {
         .parse()
         .unwrap_or_else(|_| panic!("grandchild pid from {line:?}"));
     std::thread::sleep(Duration::from_millis(50));
+    let parent = ppid(pid);
+    assert_ne!(
+        parent,
+        Some(std::process::id()),
+        "the double-fork was reparented to this test, so it is not an unrelated process"
+    );
+    // `perf_event_open` uses PTRACE_MODE_READ_REALCREDS. Yama applies that
+    // sysctl to PTRACE_MODE_ATTACH, which this sampler does not request.
+    // ubuntu-latest keeps ptrace_scope at 1 and still allows this sample
+    // once perf_event_paranoid is low enough.
     let started = anyprof_native::NativeBackend.start(
         &anyprof_core::Target { pid },
         &anyprof_core::RecordOptions {
@@ -380,26 +390,45 @@ fn an_unrelated_same_user_process_follows_ptrace_scope() {
             ..anyprof_core::RecordOptions::default()
         },
     );
-    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    let state = proc_state(pid);
     let scope = read_i32("/proc/sys/kernel/yama/ptrace_scope");
-    match (scope, euid() == 0) {
-        (Some(scope), false) if scope >= 1 => {
-            let Err(err) = started else {
-                panic!("ptrace_scope {scope} should refuse an unrelated process");
-            };
-            let message = err.to_string();
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    match started {
+        Ok(session) => {
+            let profile = session.stop().expect("stop");
+            assert_eq!(profile.pid, pid);
             assert!(
-                message.contains("ptrace_scope"),
-                "expected the Yama scope in the error, got {message}"
+                profile.duration >= Duration::from_millis(50),
+                "the unrelated sample ended early: {:?}",
+                profile.duration
+            );
+            assert!(
+                state.is_none_or(|state| state != 'T' && state != 't'),
+                "the unrelated process was left stopped (state {state:?}, ppid {parent:?}, ptrace_scope {scope:?})"
             );
         }
-        _ => {
-            started.unwrap_or_else(|err| {
-                panic!("same-user sampling should follow classic ptrace rules: {err}")
-            });
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("perf_event_open") && !native_required() {
+                eprintln!(
+                    "skipping unrelated same-user sample (ptrace_scope {scope:?}): {message}"
+                );
+            } else {
+                panic!(
+                    "same-user sampling failed (ppid {parent:?}, ptrace_scope {scope:?}): {message}"
+                );
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn ppid(pid: u32) -> Option<u32> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix("PPid:")?;
+        rest.trim().parse().ok()
+    })
 }
 
 fn weight_named(profile: &anyprof_core::Profile, needle: &str) -> u64 {
