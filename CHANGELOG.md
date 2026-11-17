@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Native C/C++ on-CPU sampling on macOS. `anyprof rec -p <pid>` attaches with Mach `task_for_pid` (root), walks frame pointers, and resolves Mach-O symbols, including Itanium C++ names. The default is still 99 Hz pprof. Windows and Linux native sampling are unchanged: the crate compiles and sampling returns a not-implemented error. CI on macOS samples a busy C++ program; Windows and Ubuntu only check that error.
+- Native C/C++ on-CPU sampling on macOS. `anyprof rec -p <pid>` attaches with Mach `task_for_pid` (root), walks frame pointers, and resolves Mach-O symbols, including Itanium C++ names. The default is still 99 Hz pprof. Idle ticks are not recorded as CPU. Sampling anyprof's own pid is refused. `thread_resume` is retried, and a `task_threads` buffer is released on the failure paths whose size is known. Return addresses lose one byte before symbol lookup; the leaf program counter does not. Signed arm64 pointers follow Darwin's strip flags (`xpaci` / `xpacd` on Apple Silicon) and are not authenticated. sudo does not override System Integrity Protection or a hardened runtime. Windows and Linux native sampling are unchanged: the crate compiles and sampling returns a not-implemented error. CI samples a busy C++ program and an idle program on arm64 (`macos-latest`) and Intel (`macos-15-intel`); Windows and Ubuntu only check the not-implemented error.
 
 ## 0.1.3 - 2026-10-22
 

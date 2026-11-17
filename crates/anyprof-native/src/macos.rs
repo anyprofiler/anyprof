@@ -3,9 +3,11 @@
 //! `task_for_pid` yields a Mach task port (root, or a debugger entitlement).
 //! Each tick asks `thread_info` which threads are actually running, suspends
 //! those threads, reads `ARM_THREAD_STATE64` / `x86_THREAD_STATE64`, and walks
-//! the frame-pointer chain with `mach_vm_read_overwrite`. Threads are resumed
-//! before the next sleep. Symbols come from each image's Mach-O symbol table
-//! ([`crate::macho`]).
+//! the frame-pointer chain with `mach_vm_read_overwrite`. A tick with no
+//! running thread adds no samples. Threads are resumed before their send
+//! rights are dropped. Symbols come from each image's Mach-O symbol table
+//! ([`crate::macho`]). Signed arm64 pointers are stripped with `xpaci` /
+//! `xpacd` when the thread-state flags say so; they are not authenticated.
 //!
 //! Kernel frames are not available through this interface. `-k` is ignored and
 //! a warning is logged; the Linux perf backend is what will record them.
@@ -33,6 +35,7 @@ use mach2::vm::mach_vm_deallocate;
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 
 use crate::macho::{ImageSymbols, MachCpu, segment_bounds};
+use crate::policy::{self, StripKind};
 
 const MAX_FRAMES: usize = 64;
 const THREAD_BASIC_INFO: u32 = 3;
@@ -76,6 +79,9 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             "sampling interval must be at least 1us",
         ));
     }
+    if let Err(message) = policy::reject_self_sample(target.pid, std::process::id()) {
+        return Err(Error::backend("native", message));
+    }
 
     let task = Task::attach(target.pid)?;
     let symbols = load_symbols(task.port, target.pid);
@@ -106,7 +112,14 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
                     }
                 }
             }
-            Err(err) => {
+            Err(SampleFault::Fatal(err)) => {
+                // A failed resume can leave a target thread suspended, and an
+                // unbounded `task_threads` count can leak a send right. Stop
+                // instead of turning that into a partial profile.
+                tracing::error!(pid = target.pid, %err, "native sample stopped");
+                return Err(Error::backend("native", err));
+            }
+            Err(SampleFault::Tick(err)) => {
                 tracing::debug!(pid = target.pid, %err, "native sample failed");
                 if counts.is_empty() && started.elapsed() < Duration::from_millis(50) {
                     return Err(Error::backend("native", err));
@@ -170,7 +183,8 @@ fn finish_profile(
     for (addresses, weight) in counts {
         let frames = addresses
             .into_iter()
-            .map(|addr| frame_for(addr, symbols))
+            .enumerate()
+            .map(|(index, addr)| frame_for(addr, symbols, index == 0))
             .collect();
         stacks.push(Stack { frames, weight });
     }
@@ -185,9 +199,13 @@ fn finish_profile(
     }
 }
 
-fn frame_for(addr: u64, symbols: &[ImageSymbols]) -> Frame {
-    let image = symbols.iter().find(|image| image.contains(addr));
-    let name = image.and_then(|image| image.name_at(addr)).unwrap_or("");
+fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
+    let lookup = policy::symbol_lookup_address(addr, leaf);
+    let image = symbols
+        .iter()
+        .find(|image| image.contains(lookup))
+        .or_else(|| symbols.iter().find(|image| image.contains(addr)));
+    let name = image.and_then(|image| image.name_at(lookup)).unwrap_or("");
     let mut frame = Frame::new(Runtime::Native, name);
     frame.address = Some(addr);
     frame.module = image.map(|image| image.module.clone());
@@ -214,7 +232,7 @@ impl Task {
         Ok(Self { port })
     }
 
-    fn sample_addresses(&self) -> Result<Vec<Vec<u64>>, String> {
+    fn sample_addresses(&self) -> Result<Vec<Vec<u64>>, SampleFault> {
         let threads = self.threads()?;
         let running: Vec<thread_act_t> = threads
             .ports
@@ -222,39 +240,83 @@ impl Task {
             .copied()
             .filter(|thread| thread_is_running(*thread))
             .collect();
-        // A tight user loop is TH_STATE_RUNNING. If the kernel reports nothing
-        // running (a suspend race, or a thread that just blocked), fall back
-        // to every thread so a busy process still yields a stack.
-        let chosen: &[thread_act_t] = if running.is_empty() {
-            threads.ports.as_slice()
-        } else {
-            running.as_slice()
-        };
+        // Sleeping threads are not on CPU. An idle tick contributes no samples
+        // instead of a weight-1 stack for every waiter.
+        let chosen = policy::on_cpu_threads(running.as_slice(), threads.ports.as_slice());
         let mut stacks = Vec::with_capacity(chosen.len());
         for thread in chosen {
-            if let Some(frames) = unwind_thread(self.port, *thread) {
-                stacks.push(frames);
+            // `threads` stays alive until this function returns, so each
+            // resume in `unwind_thread` happens before `ThreadList` drops the
+            // send rights.
+            match unwind_thread(self.port, *thread) {
+                Ok(Some(frames)) => stacks.push(frames),
+                Ok(None) => {}
+                Err(err) => return Err(err),
             }
         }
         Ok(stacks)
     }
 
-    fn threads(&self) -> Result<ThreadList, String> {
+    fn threads(&self) -> Result<ThreadList, SampleFault> {
         let mut list: thread_act_array_t = std::ptr::null_mut();
         let mut count: mach_msg_type_number_t = 0;
-        // SAFETY: on success the kernel allocates `list` in our task. We copy
-        // the ports out and deallocate that buffer before returning.
+        // SAFETY: on success the kernel allocates `list` in our task. A
+        // failed call does not hand that array back (the stub returns before
+        // publishing it, and deallocating a pointer it did not publish would
+        // be a double free). The outs start as null and zero.
         let kr = unsafe { task_threads(self.port, &mut list, &mut count) };
         if kr != KERN_SUCCESS {
-            return Err(format!("task_threads failed (kern return {kr})"));
+            return Err(SampleFault::Tick(format!(
+                "task_threads failed (kern return {kr})"
+            )));
         }
-        if list.is_null() || count == 0 || count > 100_000 {
-            return Err("task_threads returned no threads".to_string());
+        let plan = policy::plan_thread_array(
+            list.is_null(),
+            count,
+            std::mem::size_of::<thread_act_t>() as u32,
+        );
+        match plan {
+            policy::ThreadArrayPlan::Sample { count } => {
+                let ports = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
+                release_thread_array(list, plan, false);
+                Ok(ThreadList { ports })
+            }
+            policy::ThreadArrayPlan::Release { count } => {
+                release_thread_array(list, plan, true);
+                Err(SampleFault::Tick(format!(
+                    "task_threads returned {count} threads; the ports were released and this sample was skipped"
+                )))
+            }
+            policy::ThreadArrayPlan::Nothing => {
+                // Null, or a zero count. A zero count does not prove how many
+                // bytes were allocated, so the array is not unmapped.
+                Err(SampleFault::Tick(
+                    "task_threads returned no threads".to_string(),
+                ))
+            }
+            policy::ThreadArrayPlan::Unprovable { count } => {
+                tracing::error!(
+                    count,
+                    "task_threads count is not a bounded allocation; leaving it untouched"
+                );
+                eprintln!(
+                    "anyprof: task_threads returned an unbounded count ({count}); the array was not walked or unmapped"
+                );
+                Err(SampleFault::Fatal(format!(
+                    "task_threads returned an unsafe count {count}; the array was not walked or unmapped"
+                )))
+            }
         }
-        let ports = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
-        deallocate_thread_list(list, count);
-        Ok(ThreadList { ports })
     }
+}
+
+/// A sample tick failed, or the recording has to stop.
+enum SampleFault {
+    /// The target may still be suspended, or a Mach allocation was left in
+    /// place because its size could not be proved. Do not return a profile.
+    Fatal(String),
+    /// This tick produced nothing. Keep samples already collected.
+    Tick(String),
 }
 
 /// Send rights returned by `task_threads`. Dropped after the threads have been
@@ -266,7 +328,9 @@ struct ThreadList {
 impl Drop for ThreadList {
     fn drop(&mut self) {
         for port in &self.ports {
-            unsafe { mach_port_deallocate(mach_task_self(), *port) };
+            if policy::should_deallocate_send_right(*port) {
+                unsafe { mach_port_deallocate(mach_task_self(), *port) };
+            }
         }
     }
 }
@@ -279,8 +343,39 @@ impl Drop for Task {
     }
 }
 
-fn deallocate_thread_list(list: thread_act_array_t, count: mach_msg_type_number_t) {
-    let bytes = u64::from(count).saturating_mul(std::mem::size_of::<thread_act_t>() as u64);
+/// Release the vm allocation `task_threads` returned.
+///
+/// `drop_ports` also drops each send right. The sample path copies the ports
+/// out first and then calls this with `drop_ports == false`.
+fn release_thread_array(list: thread_act_array_t, plan: policy::ThreadArrayPlan, drop_ports: bool) {
+    let count = match plan {
+        policy::ThreadArrayPlan::Sample { count } | policy::ThreadArrayPlan::Release { count } => {
+            count
+        }
+        policy::ThreadArrayPlan::Nothing | policy::ThreadArrayPlan::Unprovable { .. } => return,
+    };
+    if list.is_null() || count == 0 {
+        return;
+    }
+    if drop_ports {
+        let ports = unsafe { std::slice::from_raw_parts(list, count as usize) };
+        for port in ports {
+            if policy::should_deallocate_send_right(*port) {
+                unsafe { mach_port_deallocate(mach_task_self(), *port) };
+            }
+        }
+    }
+    deallocate_thread_array(list, count);
+}
+
+fn deallocate_thread_array(list: thread_act_array_t, count: u32) {
+    let Some(bytes) = u64::from(count).checked_mul(std::mem::size_of::<thread_act_t>() as u64)
+    else {
+        return;
+    };
+    if list.is_null() || bytes == 0 {
+        return;
+    }
     unsafe {
         mach_vm_deallocate(mach_task_self(), list as mach_vm_address_t, bytes);
     }
@@ -295,29 +390,60 @@ fn thread_is_running(thread: thread_act_t) -> bool {
     kr == KERN_SUCCESS && count > 6 && info[6] == TH_STATE_RUNNING
 }
 
-struct Suspended(thread_act_t);
+struct Suspended<'a> {
+    thread: thread_act_t,
+    resumed: bool,
+    failure: &'a mut Option<kern_return_t>,
+}
 
-impl Suspended {
-    fn new(thread: thread_act_t) -> Option<Self> {
+impl<'a> Suspended<'a> {
+    fn new(thread: thread_act_t, failure: &'a mut Option<kern_return_t>) -> Option<Self> {
         // SAFETY: suspend increments the thread's suspend count. `Drop`
-        // resumes exactly once so a failed unwind cannot leave it frozen.
+        // resumes exactly once, including when unwinding this function.
         let kr = unsafe { thread_suspend(thread) };
         if kr == KERN_SUCCESS {
-            Some(Self(thread))
+            Some(Self {
+                thread,
+                resumed: false,
+                failure,
+            })
         } else {
             None
         }
     }
 }
 
-impl Drop for Suspended {
+impl Drop for Suspended<'_> {
     fn drop(&mut self) {
-        unsafe { thread_resume(self.0) };
+        if self.resumed {
+            return;
+        }
+        // Three immediate attempts and no sleep: the thread is still
+        // suspended while this runs. A second `thread_resume` after success
+        // returns an error, so a success is recorded and not repeated.
+        match policy::retry_until_success(3, KERN_SUCCESS, || unsafe { thread_resume(self.thread) })
+        {
+            Ok(_) => self.resumed = true,
+            Err(kr) => {
+                *self.failure = Some(kr);
+                tracing::error!(
+                    kern = kr,
+                    thread = self.thread,
+                    "thread_resume failed; the target thread may still be suspended"
+                );
+                eprintln!(
+                    "anyprof: thread_resume failed (kern return {kr}); a target thread may still be suspended"
+                );
+            }
+        }
     }
 }
 
-fn unwind_thread(task: task_t, thread: thread_act_t) -> Option<Vec<u64>> {
-    let _suspended = Suspended::new(thread)?;
+fn unwind_thread(task: task_t, thread: thread_act_t) -> Result<Option<Vec<u64>>, SampleFault> {
+    let mut resume_failure = None;
+    let Some(suspended) = Suspended::new(thread, &mut resume_failure) else {
+        return Ok(None);
+    };
     let mut state = ThreadState::new();
     let mut count = ThreadState::count();
     // SAFETY: `thread_get_state` fills `state`, which is the register struct
@@ -330,43 +456,73 @@ fn unwind_thread(task: task_t, thread: thread_act_t) -> Option<Vec<u64>> {
             &mut count,
         )
     };
-    if kr != KERN_SUCCESS {
-        return None;
-    }
-    let (pc, fp, lr) = registers(&state);
-    let frames = walk_frames(task, pc, fp, lr);
-    if frames.is_empty() {
-        None
+    let frames = if kr == KERN_SUCCESS {
+        let (pc, fp, lr, flags) = registers(&state);
+        let frames = walk_frames(task, pc, fp, lr, flags);
+        if frames.is_empty() {
+            None
+        } else {
+            Some(frames)
+        }
     } else {
-        Some(frames)
+        None
+    };
+    drop(suspended);
+    if let Some(resume_kr) = resume_failure {
+        return Err(SampleFault::Fatal(format!(
+            "thread_resume failed (kern return {resume_kr}); a target thread may still be suspended"
+        )));
     }
+    Ok(frames)
 }
 
 #[cfg(target_arch = "aarch64")]
-fn registers(state: &ThreadState) -> (u64, u64, u64) {
-    (state.__pc, state.__fp, state.__lr)
+fn registers(state: &ThreadState) -> (u64, u64, u64, u32) {
+    let flags = state.__flags;
+    (
+        apply_strip(state.__pc, flags, StripKind::Code, false),
+        apply_strip(state.__fp, flags, StripKind::Data, false),
+        apply_strip(state.__lr, flags, StripKind::Code, true),
+        flags,
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
-fn registers(state: &ThreadState) -> (u64, u64, u64) {
-    (state.__rip, state.__rbp, 0)
+fn registers(state: &ThreadState) -> (u64, u64, u64, u32) {
+    // x86_64 pointers are not authenticated. `NO_PTRAUTH` keeps the walker
+    // from treating a raw address as a signed one.
+    (state.__rip, state.__rbp, 0, policy::NO_PTRAUTH)
 }
 
-fn walk_frames(task: task_t, pc: u64, fp: u64, lr: u64) -> Vec<u64> {
+fn walk_frames(task: task_t, pc: u64, fp: u64, lr: u64, flags: u32) -> Vec<u64> {
     let mut frames = Vec::new();
-    let pc = strip_pac(pc);
     if plausible_code(pc) {
         frames.push(pc);
     }
-    let mut fp = strip_pac(fp);
+    let mut fp = fp;
     let mut guard = 0;
     while frames.len() < MAX_FRAMES && plausible_frame(fp) {
         let mut record = [0u8; 16];
         if !read_task(task, fp, &mut record) {
             break;
         }
-        let next_fp = strip_pac(u64::from_le_bytes(record[0..8].try_into().unwrap()));
-        let ret = strip_pac(u64::from_le_bytes(record[8..16].try_into().unwrap()));
+        // Spilled frame records use the same process-wide rule as the
+        // registers. `NO_PTRAUTH` means this process is not signing user
+        // pointers, including the saved frame pointer and return address.
+        // `IB_SIGNED_LR` applies only to the `lr` register, so a stack slot
+        // is still a code pointer (`is_lr` is false) and uses `xpaci`.
+        let next_fp = apply_strip(
+            u64::from_le_bytes(record[0..8].try_into().unwrap()),
+            flags,
+            StripKind::Data,
+            false,
+        );
+        let ret = apply_strip(
+            u64::from_le_bytes(record[8..16].try_into().unwrap()),
+            flags,
+            StripKind::Code,
+            false,
+        );
         if !plausible_code(ret) {
             break;
         }
@@ -380,7 +536,6 @@ fn walk_frames(task: task_t, pc: u64, fp: u64, lr: u64) -> Vec<u64> {
             break;
         }
     }
-    let lr = strip_pac(lr);
     if frames.len() == 1 && plausible_code(lr) && lr != frames[0] {
         frames.push(lr);
     }
@@ -395,20 +550,62 @@ fn plausible_frame(fp: u64) -> bool {
     fp > 0x1000 && fp < 0x0000_8000_0000_0000 && fp & 0x7 == 0
 }
 
-/// Clear pointer-authentication bits on Apple Silicon user pointers.
+/// Strip a signed pointer the way Darwin's `ptrauth_strip` macro does.
 ///
-/// User addresses fit in 48 bits. arm64e return addresses from system
-/// libraries can carry a PAC in the high bits; masking keeps the walk and
-/// the symbol lookup on the real address. x86_64 pointers are already plain.
-fn strip_pac(addr: u64) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        addr & 0x0000_ffff_ffff_ffff
+/// `xpaci` clears an instruction-key signature and `xpacd` clears a data-key
+/// signature. Neither authenticates, so a bad signature cannot trap. The
+/// instructions are only emitted on Apple Silicon. Intel macOS and every
+/// other build pass the address through when the flags say it is signed;
+/// they do not apply a fixed bit mask. `NO_PTRAUTH` leaves the bits alone on
+/// every architecture.
+fn apply_strip(addr: u64, flags: u32, kind: StripKind, is_lr: bool) -> u64 {
+    policy::strip_pointer(addr, flags, kind, is_lr, hardware_strip)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn hardware_strip(addr: u64, kind: StripKind) -> u64 {
+    match kind {
+        StripKind::Code => xpaci(addr),
+        StripKind::Data => xpacd(addr),
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        addr
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn hardware_strip(addr: u64, kind: StripKind) -> u64 {
+    let _ = kind;
+    addr
+}
+
+/// `XPACI`: strip an instruction signature. It does not authenticate, so a bad
+/// signature cannot trap. The instruction is not compiled for Intel macOS.
+#[cfg(target_arch = "aarch64")]
+fn xpaci(addr: u64) -> u64 {
+    let stripped;
+    // SAFETY: `xpaci` only clears the instruction-key signature bits. Apple
+    // Silicon implements it. This is not built for x86_64.
+    unsafe {
+        std::arch::asm!(
+            "xpaci {p}",
+            p = inout(reg) addr => stripped,
+            options(nomem, nostack, preserves_flags)
+        );
     }
+    stripped
+}
+
+/// `XPACD`: strip a data signature. Same trap rule as [`xpaci`].
+#[cfg(target_arch = "aarch64")]
+fn xpacd(addr: u64) -> u64 {
+    let stripped;
+    // SAFETY: `xpacd` only clears the data-key signature bits.
+    unsafe {
+        std::arch::asm!(
+            "xpacd {p}",
+            p = inout(reg) addr => stripped,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    stripped
 }
 
 fn read_task(task: task_t, addr: u64, buf: &mut [u8]) -> bool {
@@ -606,24 +803,22 @@ fn module_name(path: &str) -> String {
 }
 
 fn permission_message(pid: u32, kr: kern_return_t) -> String {
-    format!(
-        "cannot sample pid {pid}: task_for_pid failed (kern return {kr}). \
-         macOS on-CPU sampling reads another process's registers through Mach, \
-         and the kernel only allows that for root or a binary signed with the \
-         debugger entitlement. Re-run as root, for example: sudo anyprof rec -p {pid}"
-    )
+    policy::task_for_pid_denied(pid, kr)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::strip_pac;
-
+    #[cfg(target_arch = "aarch64")]
     #[test]
-    fn pac_bits_are_stripped_on_apple_silicon_only() {
-        let signed = 0x00f0_0001_2345_6789;
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(strip_pac(signed), 0x0000_0001_2345_6789);
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(strip_pac(signed), signed);
+    fn xpaci_and_xpacd_keep_an_unsigned_low_pointer() {
+        // Apple Silicon implements these instructions. This job is arm64, not
+        // arm64e userspace and not Intel. A green run here does not cover
+        // x86_64 and does not feed a kernel-signed arm64e pointer through.
+        // A raw user pointer has a zero signature, so both strips are the
+        // identity. This does not feed a kernel-signed arm64e pointer through
+        // the instructions; no CI image runs arm64e userspace.
+        let addr = 0x0000_0001_0000_1000u64;
+        assert_eq!(super::xpaci(addr), addr);
+        assert_eq!(super::xpacd(addr), addr);
     }
 }

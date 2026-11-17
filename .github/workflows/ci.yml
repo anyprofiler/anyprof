@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    # The feature branch is included so macOS Mach sampling is tested on push.
-    # pull_request already covers the branch once a pull request is open.
-    branches: [main, cursor/macos-native-sampler-87a3]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -20,8 +18,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is the primary target, then Windows, then Linux.
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        # macOS arm64, then macOS Intel, then Windows, then Linux.
+        # macos-latest is arm64. macos-15-intel is x86_64. A green arm64
+        # job is not Intel coverage.
+        os: [macos-latest, macos-15-intel, windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,10 +42,10 @@ jobs:
           # The runner images ship Chrome; the viewer smoke test must not skip.
           ANYPROF_REQUIRE_CHROME: "1"
           ANYPROF_SMOKE_ARTIFACTS: ${{ runner.temp }}/web-smoke
-          # macOS runs the live Mach sampler under sudo and must not skip.
+          # Both macOS runners sample under sudo and must not skip.
           # Windows and Linux only compile the native crate and assert that
           # sampling is not implemented there.
-          ANYPROF_REQUIRE_NATIVE: ${{ matrix.os == 'macos-latest' && '1' || '0' }}
+          ANYPROF_REQUIRE_NATIVE: ${{ startsWith(matrix.os, 'macos') && '1' || '0' }}
       - name: Upload viewer screenshots
         if: always()
         uses: actions/upload-artifact@v4

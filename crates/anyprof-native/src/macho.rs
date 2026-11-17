@@ -12,6 +12,12 @@
 //!
 //! On Windows and Linux the sampler is not built, so this module's only caller
 //! there is its unit tests. `dead_code` is allowed on those builds.
+//!
+//! Symbol bytes are read with a seek, capped at 2,000,000 symbols and 64 MiB
+//! of string table. A larger on-disk binary is still parsed. A `dyld_v1`
+//! shared cache is not a Mach-O image: system libraries that live only in
+//! that cache keep an address range from the in-memory header and do not get
+//! function names.
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
@@ -112,10 +118,11 @@ impl ImageSymbols {
 
     /// Read the symbol table of the binary at `path`.
     ///
-    /// `load_addr` is the header's address in the target process. Files larger
-    /// than a normal executable are skipped: the dyld shared cache is not a
-    /// Mach-O this parser can map, and reading it would blow the sampler's
-    /// memory. The caller still keeps the in-memory segment range.
+    /// `load_addr` is the header's address in the target process. The file
+    /// size is not a reason to skip it: only the header, load commands, and
+    /// the capped symbol table are read. A dyld shared cache (`dyld_v1`) is
+    /// rejected. The caller still keeps the in-memory segment range when this
+    /// returns `None`.
     pub(crate) fn parse_file(
         path: &Path,
         load_addr: u64,
@@ -124,9 +131,6 @@ impl ImageSymbols {
     ) -> Option<Self> {
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
-        if len > 64 * 1024 * 1024 {
-            return None;
-        }
         parse_reader(file, len, load_addr, module, cpu)
     }
 
@@ -172,6 +176,11 @@ fn parse_reader<R: Read + Seek>(
     module: &str,
     cpu: MachCpu,
 ) -> Option<ImageSymbols> {
+    let mut magic = [0u8; 8];
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    if reader.read(&mut magic).ok()? >= 8 && crate::policy::is_dyld_shared_cache(&magic) {
+        return None;
+    }
     let (offset, size) = select_slice(&mut reader, len, cpu)?;
     if size < 32 || offset.saturating_add(size) > len {
         return None;
@@ -538,6 +547,92 @@ mod tests {
         assert!(ImageSymbols::parse_bytes(&[], 0x1000, "x", MachCpu::Arm64).is_none());
         assert!(ImageSymbols::parse_bytes(&[0xcf, 0xfa], 0x1000, "x", MachCpu::Arm64).is_none());
         assert!(ImageSymbols::parse_bytes(&[0; 64], 0x1000, "x", MachCpu::Arm64).is_none());
+        assert!(
+            ImageSymbols::parse_bytes(b"dyld_v1  arm64e\0\0\0", 0x1000, "cache", MachCpu::Arm64)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_symbol_count_past_the_cap_is_rejected_when_the_file_is_large_enough() {
+        let mut bytes = synthetic_macho(&[("_main", 0x1000_0100)]);
+        // nsyms is 12 bytes into the symtab command: 32-byte header, 72-byte
+        // segment, then cmd/cmdsize/symoff (12).
+        let nsyms_at = 32 + 72 + 12;
+        assert_eq!(&bytes[nsyms_at..nsyms_at + 4], &1u32.to_le_bytes());
+        let nsyms = 2_000_001u32;
+        bytes[nsyms_at..nsyms_at + 4].copy_from_slice(&nsyms.to_le_bytes());
+        // symoff is 128. Pad so the claimed nlist range fits in the file.
+        // Without the cap the parser would return the real `_main` entry.
+        let len = 128 + u64::from(nsyms) * 16;
+        assert!(parse_padded("nsyms", &bytes, len).is_none());
+    }
+
+    #[test]
+    fn a_string_table_past_the_cap_is_rejected_when_the_file_is_large_enough() {
+        let mut bytes = synthetic_macho(&[("_main", 0x1000_0100)]);
+        // strsize is 20 bytes into the symtab command.
+        let strsize_at = 32 + 72 + 20;
+        // "_main" plus the leading and trailing NULs.
+        assert_eq!(&bytes[strsize_at..strsize_at + 4], &7u32.to_le_bytes());
+        let strsize: u32 = 64 * 1024 * 1024 + 1;
+        bytes[strsize_at..strsize_at + 4].copy_from_slice(&strsize.to_le_bytes());
+        // stroff is 144. The claimed string table fits; the cap must reject it
+        // before that buffer is allocated.
+        let len = 144 + u64::from(strsize);
+        assert!(parse_padded("strsize", &bytes, len).is_none());
+    }
+
+    fn parse_padded(label: &str, bytes: &[u8], len: u64) -> Option<ImageSymbols> {
+        let dir = std::env::temp_dir().join(format!(
+            "anyprof-macho-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image");
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        file.write_all(bytes).unwrap();
+        file.set_len(len).unwrap();
+        drop(file);
+        let parsed = ImageSymbols::parse_file(&path, 0x1040_0000, label, MachCpu::Arm64);
+        let _ = std::fs::remove_dir_all(&dir);
+        parsed
+    }
+
+    #[test]
+    fn a_return_address_on_the_next_symbol_resolves_to_the_caller() {
+        let bytes = synthetic_macho(&[("_caller", 0x1000_0100), ("_callee", 0x1000_0200)]);
+        let image = ImageSymbols::parse_bytes(&bytes, 0x1040_0000, "busy", MachCpu::Arm64)
+            .expect("synthetic image");
+        let boundary = 0x1040_0200u64;
+        let leaf = crate::policy::symbol_lookup_address(boundary, true);
+        let ret = crate::policy::symbol_lookup_address(boundary, false);
+        assert_eq!(image.name_at(leaf), Some("callee"));
+        assert_eq!(image.name_at(ret), Some("caller"));
+    }
+
+    #[test]
+    fn a_binary_larger_than_64_mib_still_yields_its_symbol_table() {
+        let bytes = synthetic_macho(&[("_anyprof_native_spin", 0x1000_0100)]);
+        let dir = std::env::temp_dir().join(format!("anyprof-macho-large-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge");
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        file.write_all(&bytes).unwrap();
+        file.set_len(64 * 1024 * 1024 + 4096).unwrap();
+        drop(file);
+        let image = ImageSymbols::parse_file(&path, 0x1040_0000, "huge", MachCpu::Arm64)
+            .expect("large file should still parse");
+        assert_eq!(image.name_at(0x1040_0100), Some("anyprof_native_spin"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn synthetic_macho(symbols: &[(&str, u64)]) -> Vec<u8> {

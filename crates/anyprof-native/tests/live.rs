@@ -1,11 +1,14 @@
-//! Real on-CPU samples of a busy C++ process.
+//! Real on-CPU samples of a busy C++ process, and a check that an idle
+//! process is not recorded as on-CPU.
 //!
 //! macOS CI sets `ANYPROF_REQUIRE_NATIVE=1` and must not skip: the test
 //! re-executes itself under `sudo` and checks stacks, timing, sample counts,
-//! and collapsed / pprof / speedscope output. Windows and Linux compile this
-//! file but do not sample. Their assertion is that the Mach sampler is absent;
-//! [`NativeBackend::start`] returning "not implemented" is covered by the
-//! library tests.
+//! and collapsed / pprof / speedscope output. The idle fixture is a
+//! user-compiled `pause()` loop, not `/bin/sleep`, because System Integrity
+//! Protection can refuse `task_for_pid` on platform binaries. Windows and
+//! Linux compile this file but do not sample. Their assertion is that the
+//! Mach sampler is absent; [`NativeBackend::start`] returning "not
+//! implemented" is covered by the library tests.
 
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
@@ -73,18 +76,32 @@ fn unprivileged_attach_explains_that_root_is_required() {
 #[cfg(target_os = "macos")]
 #[test]
 fn samples_a_busy_cpp_program() {
+    with_root("samples_a_busy_cpp_program", sample_busy_program);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_idle_process_does_not_invent_on_cpu_samples() {
+    with_root(
+        "an_idle_process_does_not_invent_on_cpu_samples",
+        sample_idle_program,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn with_root(test_name: &str, body: fn()) {
     if std::env::var_os("ANYPROF_NATIVE_WORKER").is_none() && unsafe { geteuid() } != 0 {
-        relaunch_under_sudo();
+        relaunch_under_sudo(test_name);
         return;
     }
     if unsafe { geteuid() } != 0 {
         panic!("the native live sampler was not running as root");
     }
-    sample_busy_program();
+    body();
 }
 
 #[cfg(target_os = "macos")]
-fn relaunch_under_sudo() {
+fn relaunch_under_sudo(test_name: &str) {
     let exe = std::env::current_exe().expect("test executable");
     // `env` sets the variable. `sudo VAR=cmd` is rejected when sudoers
     // does not grant SETENV, which is the macOS default.
@@ -94,7 +111,7 @@ fn relaunch_under_sudo() {
             "env",
             "ANYPROF_NATIVE_WORKER=1",
             exe.to_str().expect("test path is utf-8"),
-            "samples_a_busy_cpp_program",
+            test_name,
             "--exact",
             "--nocapture",
         ])
@@ -102,10 +119,7 @@ fn relaunch_under_sudo() {
         .expect("invoke sudo");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success()
-        && stdout.contains("samples_a_busy_cpp_program")
-        && stdout.contains("ok")
-    {
+    if output.status.success() && stdout.contains(test_name) && stdout.contains("ok") {
         return;
     }
     let sudo_missing = stderr.contains("a password is required")
@@ -198,7 +212,7 @@ fn sample_busy_program() {
         .sum::<u64>();
     let total = profile.total_weight();
     assert!(
-        total >= 20 && total <= 1_000,
+        (20..=1_000).contains(&total),
         "expected on the order of 100 samples at 100 Hz for 1s, got {total}\n{}",
         explain(&profile, &binary)
     );
@@ -258,6 +272,64 @@ fn sample_busy_program() {
     assert!(
         !text.contains("[native] "),
         "native frames are bare symbols, not a runtime prefix:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "macos")]
+fn sample_idle_program() {
+    let dir = std::env::temp_dir().join(format!("anyprof-native-idle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let source = dir.join("idle.c");
+    let binary = dir.join("idle");
+    std::fs::write(&source, IDLE_C).expect("write fixture");
+    let compile = Command::new("clang")
+        .args(["-std=c11", "-O0", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .unwrap_or_else(|err| panic!("clang failed to launch: {err}"));
+    if !compile.status.success() {
+        panic!(
+            "clang failed to build the idle fixture\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+    let mut child = Command::new(&binary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn idle process");
+    let pid = child.id();
+    // Let the process reach pause() before the first sample.
+    std::thread::sleep(Duration::from_millis(100));
+    let started = anyprof_native::NativeBackend.start(
+        &anyprof_core::Target { pid },
+        &anyprof_core::RecordOptions {
+            duration: Some(Duration::from_millis(500)),
+            sampling_interval: Some(Duration::from_millis(10)),
+            ..anyprof_core::RecordOptions::default()
+        },
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let session = started.unwrap_or_else(|err| panic!("idle profile failed: {err}"));
+    let profile = session
+        .stop()
+        .unwrap_or_else(|err| panic!("stop failed: {err}"));
+    let total = profile.total_weight();
+    assert!(
+        total <= 2,
+        "an idle process must not be recorded as on-CPU (got {total} samples over {:?})\n{}",
+        profile.duration,
+        explain(&profile, &binary)
+    );
+    assert!(
+        profile.duration >= Duration::from_millis(300),
+        "the idle recording ended early: {:?}",
+        profile.duration
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -330,6 +402,16 @@ fn nm_symbols(binary: &std::path::Path) -> String {
         Err(err) => format!("nm failed: {err}"),
     }
 }
+
+#[cfg(target_os = "macos")]
+const IDLE_C: &str = r#"
+#include <unistd.h>
+int main(void) {
+    for (;;) {
+        pause();
+    }
+}
+"#;
 
 #[cfg(target_os = "macos")]
 const BUSY_CPP: &str = r#"

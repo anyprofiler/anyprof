@@ -14,6 +14,7 @@
 //! pid so it acts as the fallback when no language runtime matched.
 
 mod macho;
+mod policy;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -180,6 +181,27 @@ mod tests {
     #[test]
     fn current_process_is_detected() {
         assert!(NativeBackend.detect(std::process::id()));
+    }
+
+    /// The refusal has to happen before `task_for_pid`. Attaching to this
+    /// process and then suspending it can leave the sampler stuck.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sampling_the_current_process_is_refused_before_attach() {
+        let Err(err) = NativeBackend.start(
+            &Target {
+                pid: std::process::id(),
+            },
+            &options(),
+        ) else {
+            panic!("sampling this process must be refused");
+        };
+        let message = err.to_string();
+        assert!(message.contains("suspending"), "{message}");
+        assert!(
+            !message.contains("task_for_pid"),
+            "the refusal must happen before attach: {message}"
+        );
     }
 
     /// Windows and Linux compile this crate and refuse to sample. macOS is the

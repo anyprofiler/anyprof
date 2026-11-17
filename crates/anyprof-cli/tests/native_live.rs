@@ -170,7 +170,7 @@ fn record_native_writes_a_profile_of_a_busy_cpp_program() {
     );
     let (samples, path) = parse_wrote(&stderr);
     assert!(
-        samples >= 20 && samples <= 1_000,
+        (20..=1_000).contains(&samples),
         "sample count {samples} is not a 1s/100Hz recording\n{stderr}"
     );
     let name = path.file_name().unwrap().to_string_lossy();
