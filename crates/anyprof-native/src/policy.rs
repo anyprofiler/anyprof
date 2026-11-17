@@ -150,6 +150,29 @@ pub(crate) fn should_strip(flags: u32, kind: StripKind, is_lr: bool) -> bool {
     true
 }
 
+/// Flags for a frame-pointer slot loaded from the target's stack.
+///
+/// `__DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH` describes pc, lr, sp, and fp
+/// in the thread-state registers. It does not describe memory. An arm64
+/// process can be inside an arm64e system function whose saved frame pointer
+/// and return address are still signed. Those slots are stripped with
+/// `xpacd` and `xpaci` even when the registers were already raw. The strip is
+/// the identity on an unsigned pointer, so an arm64 user frame is unchanged.
+/// `IB_SIGNED_LR` applies to the `lr` register, not to a spilled return address.
+pub(crate) fn stack_strip_flags() -> u32 {
+    0
+}
+
+/// A `task_threads` list that was too large to sample.
+///
+/// The ports were released. The sampler stops the recording; it does not
+/// continue with later ticks.
+pub(crate) fn too_many_threads(count: u32) -> String {
+    format!(
+        "task_threads returned {count} threads; the ports were released and the profile stopped"
+    )
+}
+
 /// Strip `addr` when [`should_strip`] says so.
 ///
 /// `hw` is `xpaci` or `xpacd` where those instructions exist. Callers without
@@ -206,8 +229,8 @@ mod tests {
     use super::{
         IB_SIGNED_LR, KERNEL_SIGNED_LR, KERNEL_SIGNED_PC, NO_PTRAUTH, StripKind, ThreadArrayPlan,
         is_dyld_shared_cache, on_cpu_threads, plan_thread_array, reject_self_sample,
-        retry_until_success, should_deallocate_send_right, should_strip, strip_pointer,
-        symbol_lookup_address, task_for_pid_denied,
+        retry_until_success, should_deallocate_send_right, should_strip, stack_strip_flags,
+        strip_pointer, symbol_lookup_address, task_for_pid_denied, too_many_threads,
     };
 
     #[test]
@@ -324,6 +347,44 @@ mod tests {
         });
         assert_eq!(zero, 0);
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn spilled_frames_are_stripped_when_the_registers_are_already_raw() {
+        let signed = 0x00F0_0001_0000_1000u64;
+        let stack_flags = stack_strip_flags();
+        assert_eq!(stack_flags & NO_PTRAUTH, 0);
+        assert!(!should_strip(NO_PTRAUTH, StripKind::Code, false));
+        assert!(should_strip(stack_flags, StripKind::Code, false));
+        assert!(should_strip(stack_flags, StripKind::Data, false));
+
+        let kept = strip_pointer(signed, NO_PTRAUTH, StripKind::Code, false, |_, _| {
+            panic!("a raw register must not be stripped");
+        });
+        assert_eq!(kept, signed);
+
+        let mut calls = 0;
+        let stripped = strip_pointer(signed, stack_flags, StripKind::Code, false, |addr, kind| {
+            calls += 1;
+            assert_eq!(kind, StripKind::Code);
+            addr & 0x0000_0000_ffff_ffff
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(stripped, 0x1000);
+
+        let frame = strip_pointer(signed, stack_flags, StripKind::Data, false, |addr, kind| {
+            assert_eq!(kind, StripKind::Data);
+            addr & 0x0000_0000_ffff_ffff
+        });
+        assert_eq!(frame, 0x1000);
+    }
+
+    #[test]
+    fn too_many_threads_stops_the_profile() {
+        let text = too_many_threads(100_001);
+        assert!(text.contains("100001"), "{text}");
+        assert!(text.contains("profile stopped"), "{text}");
+        assert!(!text.to_lowercase().contains("skipped"), "{text}");
     }
 
     #[test]
