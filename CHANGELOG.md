@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Native C/C++ on-CPU sampling on macOS. `anyprof rec -p <pid>` attaches with Mach `task_for_pid` (root), walks frame pointers, and resolves Mach-O symbols, including Itanium C++ names. The default is still 99 Hz pprof. Windows and Linux native sampling are unchanged: the crate compiles and sampling returns a not-implemented error. CI on macOS samples a busy C++ program; Windows and Ubuntu only check that error.
+
 ## 0.1.3 - 2026-10-22
 
 - `anyprof view <file>` (alias `v`) opens a `.cpuprofile`, pprof, speedscope JSON, or collapsed-stacks file in speedscope 1.25.0, which is built into the binary and served on `127.0.0.1` under a random 128-bit token path. Nothing is downloaded. `record -w` / `--web` writes the profile as usual, then opens it the same way. `--no-open` prints the URL instead, `--port` picks the port, and `--web-timeout` stops the viewer after a while; otherwise it serves until Ctrl+C. Over SSH or without a display, anyprof prints the URL and an `ssh -L` port-forward command instead of opening a browser. The binary is about 0.8 MiB larger. Release archives include the speedscope (MIT) and Source Code Pro (OFL-1.1) licenses.

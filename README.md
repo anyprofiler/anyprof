@@ -4,7 +4,7 @@ Capture CPU profiles from any running process, no code changes or restarts neede
 
 anyprof attaches to a live process by pid and writes a CPU profile. The process does not need a profiler baked in, and it does not need to be restarted. Runtimes sit behind one `Backend` trait, and every backend emits the same profile.
 
-**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. `anyprof view` opens any of those in a built-in, offline speedscope viewer. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling and Go sampling are still stubs.
+**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. `anyprof view` opens any of those in a built-in, offline speedscope viewer. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling works on macOS (Mach `task_for_pid`, frame pointers, Mach-O symbols) and needs root. Windows and Linux native sampling are not implemented yet: the crate compiles there and `start` returns a clear error. Go sampling is still a stub.
 
 ## Goals
 
@@ -21,8 +21,8 @@ Platform order for new samplers is **macOS, then Windows, then Linux**. Runtime 
 | --- | --- | --- | --- |
 | Node.js | `anyprof-node` | Works | Attaches by pid. macOS and Linux send `SIGUSR1`; Windows runs `node -e "process._debugProcess(pid)"`. Samples over the V8 inspector (Chrome DevTools Protocol). |
 | Browser page | `anyprof-browser` | Works | Chrome, Chromium, or Edge started with `--remote-debugging-port`. Select a tab by URL, title, or target id. Does not match pids. |
-| C, C++ | `anyprof-native` | Stub (next) | Fallback for any live pid. Planned order is macOS, then Windows, then Linux perf events. |
-| Rust | `anyprof-native` | Later | Rust processes currently use the native fallback. A Rust-specific sampler comes after C++. |
+| C, C++ | `anyprof-native` | macOS works; Windows and Linux not implemented | Fallback for any live pid. macOS is tested in CI with a busy C++ program. See the [support matrix](#support-matrix). |
+| Rust | `anyprof-native` | Later | No Rust-specific sampler yet. On macOS a Rust process uses the native Mach sampler. A Rust-specific sampler comes after C++. |
 | Go | `anyprof-go` | Stub (later) | Linux detection scans the executable for the Go build-info magic so a Go process is not labeled native. Sampling is lower priority than Node, browser pages, and C++. |
 | Python | — | Planned | After Go. |
 | Java | — | Planned | |
@@ -31,6 +31,19 @@ Platform order for new samplers is **macOS, then Windows, then Linux**. Runtime 
 | .NET | — | Planned | |
 
 Auto-detection tries `node`, then `go`, then `native`. The browser backend is only used with `--browser` (or `--backend browser`). Pass `--backend` to skip detection.
+
+## Support matrix
+
+"Works" means a live process is sampled in CI and the profile's stacks, sample count, and timing are checked. "Compilation only" means CI builds the crate and asserts that sampling is refused; it is not a working profiler on that OS.
+
+| Runtime | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| Node.js | Works (CI) | Works (CI) | Works (CI) |
+| Browser page | Works (CI, headless Chrome) | Works (CI, headless Chrome) | Works (CI, headless Chrome) |
+| C, C++ | Works (CI). Root, Mach `task_for_pid`, frame pointers, Mach-O symbols. Busy C++ program. | Compilation only. `start` returns not implemented. | Compilation only. Linux perf events come after Windows. |
+| Rust | No Rust-specific sampler. A Rust pid uses the macOS native sampler. Stacks are frame pointers, so the binary has to keep them. | Compilation only (native fallback, not implemented). | Compilation only (native fallback, not implemented). |
+| Go | Not implemented. Detection does not run (no `/proc`). | Not implemented. | Detection works. Sampling is not implemented. |
+| Python, Java, Ruby, PHP, .NET | Not implemented | Not implemented | Not implemented |
 
 ## Architecture
 
@@ -134,6 +147,9 @@ anyprof rec -p 1234 -i ws://127.0.0.1:9229/<id> -d 10s -o cpu.collapsed
 # Browser tab. Start the browser yourself:
 #   chrome --remote-debugging-port=9222
 anyprof rec -B -t example.com -d 10s -o page.cpuprofile
+
+# C or C++ on macOS. task_for_pid needs root. Omit -o for an auto-named .pb.gz.
+sudo anyprof rec -p 1234 -d 10s
 
 # Import an existing V8 profile.
 anyprof conv -i profile.cpuprofile -o cpu.collapsed -t collapsed
@@ -259,13 +275,15 @@ On Windows, anyprof runs `node -e "process._debugProcess(<pid>)"`, which is Node
 
 The browser backend only connects. Start Chrome, Chromium, or Edge with `--remote-debugging-port` yourself. anyprof does not launch a browser.
 
-Native sampling is not built yet. When the Linux perf sampler lands it will need the same access as `perf`: often root or `CAP_PERFMON` / `CAP_SYS_PTRACE`, depending on `kernel.perf_event_paranoid`. The CLI only profiles the pid you pass it.
+Native sampling on macOS calls `task_for_pid`. The kernel allows that for root, or for a binary signed with the debugger entitlement. A normal `anyprof` build has neither, so `sudo anyprof rec -p <pid>` is the way to sample a C, C++, or other native process. Without it, anyprof exits before suspending any thread and tells you to re-run with sudo. Each sample suspends only the running threads long enough to read registers and walk frame pointers, then resumes them. The process is not restarted and does not need a profiler linked in. `-k` does not add kernel frames on macOS; those are planned with the Linux perf sampler.
+
+Windows native sampling is not built yet. When the Linux perf sampler lands it will need the same access as `perf`: often root or `CAP_PERFMON` / `CAP_SYS_PTRACE`, depending on `kernel.perf_event_paranoid`. The CLI only profiles the pid you pass it.
 
 ## Roadmap
 
 1. **Node.js** via the V8 inspector, on macOS, then Windows, then Linux. This is implemented.
-2. **C++ (native)** on-CPU sampling, in the same platform order, and **browser pages** over the DevTools Protocol. Browser pages are implemented. Native sampling is the next sampler.
-3. **Rust**, then **Go** (detection already exists on Linux), then Python, Java, Ruby, PHP, and .NET. Those scripting backends should default to speedscope (see the format table above). Go already defaults to pprof.
+2. **C++ (native)** on-CPU sampling, in the same platform order, and **browser pages** over the DevTools Protocol. Browser pages are implemented. macOS native sampling is implemented (Mach). Windows native sampling is next.
+3. **Rust**, then **Go** (detection already exists on Linux), then Python, Java, Ruby, PHP, and .NET. Those scripting backends should default to speedscope (see the format table above). Go already defaults to pprof. Until the Rust sampler exists, a Rust process uses the native backend.
 4. Linux perf events are last among the native platform backends, after macOS and Windows.
 
 ## Development
@@ -277,7 +295,9 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope JSON in `anyprof view`, and checks that the viewer served the profile, that speedscope used the matching importer, that the page logged no exceptions or CSP violations, and that the screenshot contains a flame graph. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The MSRV is Rust 1.88 (`rust-version` in `Cargo.toml`); the `msrv` CI job builds and tests the whole workspace on it. The workspace uses Rust edition 2024.
+CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope JSON in `anyprof view`, and checks that the viewer served the profile, that speedscope used the matching importer, that the page logged no exceptions or CSP violations, and that the screenshot contains a flame graph. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact.
+
+On macOS, CI sets `ANYPROF_REQUIRE_NATIVE=1`. `crates/anyprof-native/tests/live.rs` compiles a busy C++ program, re-executes the test under `sudo`, and checks that the Mach sampler records `anyprof_native::spin`, a caller, a sample count and duration in range for 100 Hz over 1s, and that collapsed stacks, pprof, and speedscope all still contain that symbol. The CLI test writes the auto-named `.pb.gz` and converts it. Without sudo locally the live test skips unless `ANYPROF_REQUIRE_NATIVE=1`, in which case a missing sudo is a failure. Windows and Ubuntu do not sample: they compile the crate and assert `start` (and `anyprof rec -b native`) returns "not implemented" and names that OS. A green Windows or Linux job is compilation-only for C/C++. `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The MSRV is Rust 1.88 (`rust-version` in `Cargo.toml`); the `msrv` CI job builds and tests the whole workspace on it. The workspace uses Rust edition 2024.
 
 ### Cutting a release
 
@@ -296,7 +316,7 @@ The live test spawns `node --inspect-port=127.0.0.1:<port>` without telling the 
 | `crates/anyprof-cdp` | DevTools Protocol client shared by Node and browser pages |
 | `crates/anyprof-node` | Node.js backend |
 | `crates/anyprof-browser` | Browser-tab backend |
-| `crates/anyprof-native` | Native backend (stub; pid fallback) |
+| `crates/anyprof-native` | Native backend. macOS Mach sampler; Windows and Linux are not implemented |
 | `crates/anyprof-go` | Go backend (stub; Linux build-info detection works) |
 | `crates/anyprof-export` | collapsed, speedscope, pprof, and `.cpuprofile` |
 | `crates/anyprof-web` | `anyprof view`: localhost server, embedded speedscope, browser opener |

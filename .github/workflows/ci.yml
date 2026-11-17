@@ -40,6 +40,10 @@ jobs:
           # The runner images ship Chrome; the viewer smoke test must not skip.
           ANYPROF_REQUIRE_CHROME: "1"
           ANYPROF_SMOKE_ARTIFACTS: ${{ runner.temp }}/web-smoke
+          # macOS runs the live Mach sampler under sudo and must not skip.
+          # Windows and Linux only compile the native crate and assert that
+          # sampling is not implemented there.
+          ANYPROF_REQUIRE_NATIVE: ${{ matrix.os == 'macos-latest' && '1' || '0' }}
       - name: Upload viewer screenshots
         if: always()
         uses: actions/upload-artifact@v4
