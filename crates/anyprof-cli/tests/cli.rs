@@ -156,6 +156,20 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     let output_path =
         std::env::temp_dir().join(format!("anyprof-record-{}.collapsed", std::process::id()));
     let _ = std::fs::remove_file(&output_path);
+    // macOS `task_for_pid` of the current process can succeed without root and
+    // would write a profile. Sample a different process so this unprivileged
+    // run stops at the permission error. Other platforms reject every pid.
+    #[cfg(target_os = "macos")]
+    let mut sleeper = Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    #[cfg(target_os = "macos")]
+    let pid = sleeper.id().to_string();
+    #[cfg(not(target_os = "macos"))]
     let pid = std::process::id().to_string();
     let output = Command::new(env!("CARGO_BIN_EXE_anyprof"))
         .args(["record", "--pid", pid.as_str(), "--duration", "1s", "-o"])
@@ -187,6 +201,11 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     );
     assert!(!output.status.success(), "{stderr}");
     assert!(!output_path.exists(), "this run must not write a profile");
+    #[cfg(target_os = "macos")]
+    {
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
 }
 
 #[test]

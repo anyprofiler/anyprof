@@ -83,9 +83,12 @@ fn samples_a_busy_cpp_program() {
 #[cfg(target_os = "macos")]
 fn relaunch_under_sudo() {
     let exe = std::env::current_exe().expect("test executable");
+    // `env` sets the variable. `sudo VAR=cmd` is rejected when sudoers
+    // does not grant SETENV, which is the macOS default.
     let output = Command::new("sudo")
         .args([
             "-n",
+            "env",
             "ANYPROF_NATIVE_WORKER=1",
             exe.to_str().expect("test path is utf-8"),
             "samples_a_busy_cpp_program",
