@@ -152,10 +152,24 @@ fn convert_help_shows_from_and_to() {
 }
 
 #[test]
-fn record_dispatches_through_detection_and_reports_the_stub() {
+fn record_dispatches_through_detection_and_stops_without_a_profile() {
     let output_path =
         std::env::temp_dir().join(format!("anyprof-record-{}.collapsed", std::process::id()));
     let _ = std::fs::remove_file(&output_path);
+    // macOS `task_for_pid` of the current process can succeed without root and
+    // would write a profile. Sample a different process so this unprivileged
+    // run stops at the permission error. Other platforms reject every pid.
+    #[cfg(target_os = "macos")]
+    let mut sleeper = Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    #[cfg(target_os = "macos")]
+    let pid = sleeper.id().to_string();
+    #[cfg(not(target_os = "macos"))]
     let pid = std::process::id().to_string();
     let output = Command::new(env!("CARGO_BIN_EXE_anyprof"))
         .args(["record", "--pid", pid.as_str(), "--duration", "1s", "-o"])
@@ -163,7 +177,8 @@ fn record_dispatches_through_detection_and_reports_the_stub() {
         .output()
         .expect("run anyprof record");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!output.status.success(), "{stderr}");
+    // The test binary is not Node. Go detection does not claim it. Native is
+    // the fallback: 99 Hz, and no profile is written from this unprivileged run.
     assert!(
         stderr.contains("using backend"),
         "auto-detection should name the backend: {stderr}"
@@ -172,11 +187,25 @@ fn record_dispatches_through_detection_and_reports_the_stub() {
         stderr.contains("sampling every 10101us (99 Hz)"),
         "native should keep the perf default: {stderr}"
     );
+    // macOS implements native sampling and refuses without root. Other
+    // platforms still have no sampler. Either way this run must not write.
+    #[cfg(target_os = "macos")]
+    assert!(
+        stderr.contains("task_for_pid"),
+        "macOS should explain the Mach permission failure: {stderr}"
+    );
+    #[cfg(not(target_os = "macos"))]
     assert!(
         stderr.contains("not implemented yet"),
-        "stubs should fail clearly: {stderr}"
+        "platforms without a native sampler should say so: {stderr}"
     );
-    assert!(!output_path.exists(), "a stub must not write a profile");
+    assert!(!output.status.success(), "{stderr}");
+    assert!(!output_path.exists(), "this run must not write a profile");
+    #[cfg(target_os = "macos")]
+    {
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
 }
 
 #[test]
