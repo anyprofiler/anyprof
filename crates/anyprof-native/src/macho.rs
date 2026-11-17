@@ -34,11 +34,16 @@ const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
 
 /// CPU slice to select inside a universal (fat) binary.
+///
+/// `dead_code` is allowed on the variant this process is not running, because
+/// `host` constructs only that architecture. Fat parsing still matches both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MachCpu {
     /// `CPU_TYPE_ARM64`, including Apple Silicon.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     Arm64,
     /// `CPU_TYPE_X86_64`.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     X86_64,
 }
 

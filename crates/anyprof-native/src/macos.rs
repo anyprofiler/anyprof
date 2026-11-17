@@ -174,7 +174,7 @@ fn finish_profile(
             .collect();
         stacks.push(Stack { frames, weight });
     }
-    stacks.sort_by(|left, right| right.weight.cmp(&left.weight));
+    stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));
     Profile {
         pid,
         comm,

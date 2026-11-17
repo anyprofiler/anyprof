@@ -94,7 +94,7 @@ impl Backend for NativeBackend {
                 stacks = profile.stacks.len(),
                 "native profile complete"
             );
-            return Ok(Box::new(ReadySession { profile }));
+            Ok(Box::new(ReadySession { profile }))
         }
         #[cfg(not(target_os = "macos"))]
         {
