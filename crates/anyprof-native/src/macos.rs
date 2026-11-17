@@ -283,9 +283,7 @@ impl Task {
             }
             policy::ThreadArrayPlan::Release { count } => {
                 release_thread_array(list, plan, true);
-                Err(SampleFault::Tick(format!(
-                    "task_threads returned {count} threads; the ports were released and this sample was skipped"
-                )))
+                Err(SampleFault::Tick(policy::too_many_threads(count)))
             }
             policy::ThreadArrayPlan::Nothing => {
                 // Null, or a zero count. A zero count does not prove how many
@@ -457,8 +455,8 @@ fn unwind_thread(task: task_t, thread: thread_act_t) -> Result<Option<Vec<u64>>,
         )
     };
     let frames = if kr == KERN_SUCCESS {
-        let (pc, fp, lr, flags) = registers(&state);
-        let frames = walk_frames(task, pc, fp, lr, flags);
+        let (pc, fp, lr) = registers(&state);
+        let frames = walk_frames(task, pc, fp, lr);
         if frames.is_empty() {
             None
         } else {
@@ -477,24 +475,22 @@ fn unwind_thread(task: task_t, thread: thread_act_t) -> Result<Option<Vec<u64>>,
 }
 
 #[cfg(target_arch = "aarch64")]
-fn registers(state: &ThreadState) -> (u64, u64, u64, u32) {
+fn registers(state: &ThreadState) -> (u64, u64, u64) {
     let flags = state.__flags;
     (
         apply_strip(state.__pc, flags, StripKind::Code, false),
         apply_strip(state.__fp, flags, StripKind::Data, false),
         apply_strip(state.__lr, flags, StripKind::Code, true),
-        flags,
     )
 }
 
 #[cfg(target_arch = "x86_64")]
-fn registers(state: &ThreadState) -> (u64, u64, u64, u32) {
-    // x86_64 pointers are not authenticated. `NO_PTRAUTH` keeps the walker
-    // from treating a raw address as a signed one.
-    (state.__rip, state.__rbp, 0, policy::NO_PTRAUTH)
+fn registers(state: &ThreadState) -> (u64, u64, u64) {
+    // x86_64 pointers are not authenticated.
+    (state.__rip, state.__rbp, 0)
 }
 
-fn walk_frames(task: task_t, pc: u64, fp: u64, lr: u64, flags: u32) -> Vec<u64> {
+fn walk_frames(task: task_t, pc: u64, fp: u64, lr: u64) -> Vec<u64> {
     let mut frames = Vec::new();
     if plausible_code(pc) {
         frames.push(pc);
@@ -506,20 +502,20 @@ fn walk_frames(task: task_t, pc: u64, fp: u64, lr: u64, flags: u32) -> Vec<u64> 
         if !read_task(task, fp, &mut record) {
             break;
         }
-        // Spilled frame records use the same process-wide rule as the
-        // registers. `NO_PTRAUTH` means this process is not signing user
-        // pointers, including the saved frame pointer and return address.
-        // `IB_SIGNED_LR` applies only to the `lr` register, so a stack slot
-        // is still a code pointer (`is_lr` is false) and uses `xpaci`.
+        // `flags` applies to the registers already stripped above. A stack
+        // slot keeps its own signature: an arm64 process can be inside an
+        // arm64e callee. `stack_strip_flags` ignores `NO_PTRAUTH` so `xpacd`
+        // and `xpaci` still run. Both are the identity on an unsigned pointer.
+        let stack_flags = policy::stack_strip_flags();
         let next_fp = apply_strip(
             u64::from_le_bytes(record[0..8].try_into().unwrap()),
-            flags,
+            stack_flags,
             StripKind::Data,
             false,
         );
         let ret = apply_strip(
             u64::from_le_bytes(record[8..16].try_into().unwrap()),
-            flags,
+            stack_flags,
             StripKind::Code,
             false,
         );
