@@ -622,6 +622,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn sampling_the_current_process_is_refused() {
         let err = reject_self_sample(10, 10).unwrap_err();
         assert!(err.contains("suspending"), "{err}");
