@@ -120,6 +120,48 @@ pub(crate) fn symbol_lookup_address(addr: u64, leaf: bool) -> u64 {
     if leaf { addr } else { addr.saturating_sub(1) }
 }
 
+/// `IMAGE_FILE_MACHINE_UNKNOWN`. A process that is not running under WOW64.
+pub(crate) const IMAGE_FILE_MACHINE_UNKNOWN: u16 = 0;
+/// `IMAGE_FILE_MACHINE_I386`.
+pub(crate) const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;
+/// `IMAGE_FILE_MACHINE_AMD64`.
+pub(crate) const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+/// `IMAGE_FILE_MACHINE_ARMNT`.
+pub(crate) const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x01c4;
+/// `IMAGE_FILE_MACHINE_ARM64`.
+pub(crate) const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
+
+/// Whether `IsWow64Process2` describes an x64 process.
+///
+/// A native x64 process reports an unknown process machine and an AMD64 host.
+/// An x64 process emulated on an ARM64 host reports AMD64 as the process
+/// machine. A native ARM64 process reports an unknown process machine and an
+/// ARM64 host. `IsWow64Process` cannot tell that last case from x64.
+#[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn windows_process_is_x64(process_machine: u16, native_machine: u16) -> bool {
+    match process_machine {
+        IMAGE_FILE_MACHINE_AMD64 => true,
+        IMAGE_FILE_MACHINE_UNKNOWN => native_machine == IMAGE_FILE_MACHINE_AMD64,
+        _ => false,
+    }
+}
+
+/// Short name for a process `IsWow64Process2` says is not x64.
+#[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn windows_target_kind(process_machine: u16, native_machine: u16) -> &'static str {
+    match process_machine {
+        IMAGE_FILE_MACHINE_I386 => "32-bit",
+        IMAGE_FILE_MACHINE_ARMNT => "32-bit ARM",
+        IMAGE_FILE_MACHINE_ARM64 => "ARM64",
+        IMAGE_FILE_MACHINE_UNKNOWN => match native_machine {
+            IMAGE_FILE_MACHINE_ARM64 => "ARM64",
+            IMAGE_FILE_MACHINE_I386 => "32-bit",
+            _ => "not x64",
+        },
+        _ => "not x64",
+    }
+}
+
 /// Which Darwin strip instruction a signed pointer needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StripKind {
@@ -366,11 +408,13 @@ pub(crate) fn windows_open_denied(
 #[cfg(test)]
 mod tests {
     use super::{
-        DebugPrivilege, IB_SIGNED_LR, KERNEL_SIGNED_LR, KERNEL_SIGNED_PC, LinuxDenial, NO_PTRAUTH,
-        PROTECTION_LEVEL_NONE, StripKind, ThreadArrayPlan, is_dyld_shared_cache, linux_perf_denied,
-        on_cpu_threads, plan_thread_array, reject_self_sample, retry_until_success,
-        should_deallocate_send_right, should_strip, stack_strip_flags, strip_pointer,
-        symbol_lookup_address, task_for_pid_denied, too_many_threads, windows_open_denied,
+        DebugPrivilege, IB_SIGNED_LR, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
+        IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
+        KERNEL_SIGNED_LR, KERNEL_SIGNED_PC, LinuxDenial, NO_PTRAUTH, PROTECTION_LEVEL_NONE,
+        StripKind, ThreadArrayPlan, is_dyld_shared_cache, linux_perf_denied, on_cpu_threads,
+        plan_thread_array, reject_self_sample, retry_until_success, should_deallocate_send_right,
+        should_strip, stack_strip_flags, strip_pointer, symbol_lookup_address, task_for_pid_denied,
+        too_many_threads, windows_open_denied, windows_process_is_x64, windows_target_kind,
     };
 
     #[test]
@@ -539,6 +583,45 @@ mod tests {
     }
 
     #[test]
+    fn windows_sampling_accepts_x64_and_refuses_arm64() {
+        assert!(windows_process_is_x64(
+            IMAGE_FILE_MACHINE_UNKNOWN,
+            IMAGE_FILE_MACHINE_AMD64
+        ));
+        assert!(windows_process_is_x64(
+            IMAGE_FILE_MACHINE_AMD64,
+            IMAGE_FILE_MACHINE_ARM64
+        ));
+        assert!(!windows_process_is_x64(
+            IMAGE_FILE_MACHINE_UNKNOWN,
+            IMAGE_FILE_MACHINE_ARM64
+        ));
+        assert!(!windows_process_is_x64(
+            IMAGE_FILE_MACHINE_ARM64,
+            IMAGE_FILE_MACHINE_ARM64
+        ));
+        assert!(!windows_process_is_x64(
+            IMAGE_FILE_MACHINE_I386,
+            IMAGE_FILE_MACHINE_AMD64
+        ));
+        assert!(!windows_process_is_x64(
+            IMAGE_FILE_MACHINE_ARMNT,
+            IMAGE_FILE_MACHINE_ARM64
+        ));
+        assert_eq!(
+            windows_target_kind(IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_ARM64),
+            "ARM64"
+        );
+        assert_eq!(
+            windows_target_kind(IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARM64),
+            "ARM64"
+        );
+        assert_eq!(
+            windows_target_kind(IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64),
+            "32-bit"
+        );
+    }
+
     fn sampling_the_current_process_is_refused() {
         let err = reject_self_sample(10, 10).unwrap_err();
         assert!(err.contains("suspending"), "{err}");

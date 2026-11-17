@@ -11,7 +11,9 @@
 //! Sampling this process is refused before `OpenProcess`: suspending the
 //! thread that would resume the others can leave the process stuck.
 //!
-//! `-k` is ignored. This interface does not record kernel frames.
+//! `-k` is ignored. A program counter in kernel space is not stored as a
+//! user frame. `IsWow64Process2` refuses 32-bit and ARM64 targets.
+//! `IsWow64Process` alone cannot see ARM64.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -36,7 +38,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     SymGetModuleInfo64, SymInitializeW, SymSetOptions,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessInformation, IsWow64Process, OpenProcess, OpenProcessToken,
+    GetCurrentProcess, GetProcessInformation, IsWow64Process2, OpenProcess, OpenProcessToken,
     OpenThread, PROCESS_PROTECTION_LEVEL_INFORMATION, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, ProcessProtectionLevelInfo, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
@@ -431,6 +433,7 @@ fn walk_suspended(process: HANDLE, thread: HANDLE) -> Option<Vec<u64>> {
         frames.push(pc);
         previous = pc;
     }
+    let frames = crate::walk::user_instruction_pointers(frames);
     if frames.is_empty() {
         None
     } else {
@@ -558,24 +561,29 @@ fn c_string(bytes: &[i8]) -> Option<String> {
 }
 
 fn ensure_x64(process: HANDLE, pid: u32) -> Result<(), Error> {
-    let mut wow = FALSE;
-    let ok = unsafe { IsWow64Process(process, &mut wow) };
+    let mut process_machine = 0u16;
+    let mut native_machine = 0u16;
+    // SAFETY: `IsWow64Process2` reads the process and host machine types.
+    // It does not attach, suspend, or write. `IsWow64Process` alone reports
+    // only a 32-bit WOW64 process, so an ARM64 target looks like x64.
+    let ok = unsafe { IsWow64Process2(process, &mut process_machine, &mut native_machine) };
     if ok == FALSE {
         let err = unsafe { GetLastError() };
         return Err(Error::backend(
             "native",
-            format!("IsWow64Process failed for pid {pid} (error {err})"),
+            format!("IsWow64Process2 failed for pid {pid} (error {err})"),
         ));
     }
-    if wow != FALSE {
-        return Err(Error::backend(
-            "native",
-            format!(
-                "cannot sample pid {pid}: native sampling on Windows walks x64 stacks; this process is 32-bit"
-            ),
-        ));
+    if policy::windows_process_is_x64(process_machine, native_machine) {
+        return Ok(());
     }
-    Ok(())
+    let kind = policy::windows_target_kind(process_machine, native_machine);
+    Err(Error::backend(
+        "native",
+        format!(
+            "cannot sample pid {pid}: native sampling on Windows walks x64 stacks; this process is {kind}"
+        ),
+    ))
 }
 
 fn limited_protection(pid: u32) -> Option<u32> {
