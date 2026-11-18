@@ -75,7 +75,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "anyprof-browser"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-cdp",
  "anyprof-core",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-cdp"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-core",
  "serde",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "anyprof-browser",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "thiserror",
  "tracing",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-export"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-core",
  "flate2",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-go"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-core",
  "anyprof-export",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-java"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-core",
  "anyprof-export",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-native"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-core",
  "anyprof-export",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-node"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-cdp",
  "anyprof-core",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-python"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-core",
  "anyprof-export",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-rust"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyprof-core",
  "anyprof-export",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "anyprof-web"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "flate2",
  "getrandom 0.4.3",
