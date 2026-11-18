@@ -28,10 +28,14 @@
 //! still uses magic `0xFFFFFFF1` but writes that word as zero. Entry offsets
 //! are then relative to `moduledata.text` (`runtime.text`), which the linker
 //! puts in `.go.module` / `__go_module`, or in `.data` on PE. A cgo binary’s
-//! `runtime.text` is not the first byte of the text section, so the section
-//! address is only the fallback when that record is missing. Go older than
-//! 1.18 still matches the build-info header and is sampled with the native
-//! walk; this parser does not read the 1.2 or 1.16 pclntab layouts.
+//! `runtime.text` is not the first byte of the text section, so that section’s
+//! address is not used in its place. An externally linked Mach-O leaves the
+//! Go 1.22 header word as an unrelocated addend from the `__TEXT` vmaddr; the
+//! link address is that sum when it falls inside `__text`. A value already
+//! inside the text section (internal Mach-O, ELF, PE, and Go 1.26’s module
+//! record) is the link address and is not shifted again. Go older than 1.18
+//! still matches the build-info header and is sampled with the native walk;
+//! this parser does not read the 1.2 or 1.16 pclntab layouts.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -389,8 +393,9 @@ fn parse_pclntab(data: &[u8]) -> Option<GoTables> {
     let filetab = usize::try_from(word(5)?).ok()?;
     let pctab = usize::try_from(word(6)?).ok()?;
     let pcln = usize::try_from(word(7)?).ok()?;
-    // Go 1.26 stores this word as zero. `adopt` fills it from moduledata.
-    // Go 1.18 through 1.25 write the link address of runtime.text here.
+    // Go 1.26 stores this word as zero and `adopt` fills it from moduledata.
+    // Go 1.18 through 1.25 write the link address here, except an externally
+    // linked Mach-O, whose file bytes are the addend from the `__TEXT` vmaddr.
     if nfunc == 0 || nfunc > MAX_FUNCS {
         return None;
     }
@@ -463,29 +468,72 @@ struct TextSpan {
     end: u64,
 }
 
-/// A file may leave `textStart` as zero. `fallback` is `moduledata.text`
-/// when that record checks out, otherwise the text section’s link address.
-fn adopt(bytes: &[u8], fallback: Option<u64>) -> Option<GoTables> {
-    let mut tables = parse_pclntab(bytes)?;
-    if tables.text_start == 0 {
-        tables.text_start = fallback.filter(|addr| *addr != 0)?;
+/// Link address of `runtime.text`.
+///
+/// A header or module value already inside the text section is that address.
+/// Go 1.26’s header is zero, so the module record supplies it. An externally
+/// linked Mach-O stores the Go 1.22 header as the addend from `__TEXT`’s
+/// vmaddr (`segment`); the sum is accepted only when it lands in the section.
+/// The section’s own start is not a stand-in. cgo’s `runtime.text` is not
+/// the first byte there.
+fn place_text(
+    header: u64,
+    module: Option<u64>,
+    text: Option<TextSpan>,
+    segment: u64,
+) -> Option<u64> {
+    let inside = |addr: u64| {
+        text.is_some_and(|span| span.start != 0 && addr >= span.start && addr < span.end)
+    };
+    if inside(header) {
+        return Some(header);
     }
+    if let Some(addr) = module.filter(|addr| inside(*addr)) {
+        return Some(addr);
+    }
+    if segment != 0 && header != 0 {
+        let relocated = header.wrapping_add(segment);
+        if inside(relocated) {
+            return Some(relocated);
+        }
+    }
+    if segment != 0
+        && let Some(addr) = module.filter(|addr| *addr != 0)
+    {
+        let relocated = addr.wrapping_add(segment);
+        if inside(relocated) {
+            return Some(relocated);
+        }
+    }
+    None
+}
+
+fn adopt(
+    bytes: &[u8],
+    module: Option<u64>,
+    text: Option<TextSpan>,
+    segment: u64,
+) -> Option<GoTables> {
+    let mut tables = parse_pclntab(bytes)?;
+    tables.text_start = place_text(tables.text_start, module, text, segment)?;
     Some(tables)
 }
 
 /// `moduledata.text` for a Go 1.26 binary.
 ///
-/// The 64-bit struct in `runtime/symtab.go` starts with `pcHeader`. On a
-/// file that has not been relocated, that pointer is the pclntab’s link
-/// address. `text` is 176 bytes later and `etext` 8 bytes after that.
-/// cgo places `runtime.text` inside the text section, not on its first byte,
-/// so a hit has to land in `text_span` with `etext` still above it.
+/// The 64-bit struct in `runtime/symtab.go` starts with `pcHeader`. That
+/// pointer is the pclntab’s link address when the external linker has written
+/// the unslid address, which is what `go tool nm` prints. `text` is 176 bytes
+/// later and `etext` 8 bytes after that. An address already inside the text
+/// section is returned as-is. A smaller word is returned too, so the Mach-O
+/// path can add the `__TEXT` vmaddr when that sum lands in the section.
 fn module_runtime_text(blob: &[u8], pclntab_addr: u64, text_span: TextSpan) -> Option<u64> {
     if pclntab_addr == 0 || text_span.start == 0 || text_span.end <= text_span.start {
         return None;
     }
     let needle = pclntab_addr.to_le_bytes();
     let mut from = 0usize;
+    let mut addend = None;
     while from + 192 <= blob.len() {
         let rel = blob[from..]
             .windows(8)
@@ -494,19 +542,18 @@ fn module_runtime_text(blob: &[u8], pclntab_addr: u64, text_span: TextSpan) -> O
         if at.is_multiple_of(8) && at + 192 <= blob.len() {
             let text = u64::from_le_bytes(blob[at + 176..at + 184].try_into().ok()?);
             let etext = u64::from_le_bytes(blob[at + 184..at + 192].try_into().ok()?);
-            if text >= text_span.start && text < text_span.end && etext > text {
-                return Some(text);
+            if text != 0 && etext > text {
+                if text >= text_span.start && text < text_span.end {
+                    return Some(text);
+                }
+                if addend.is_none() {
+                    addend = Some(text);
+                }
             }
         }
         from = at + 8;
     }
-    None
-}
-
-fn text_fallback(module_text: Option<u64>, text_span: Option<TextSpan>) -> Option<u64> {
-    module_text.filter(|addr| *addr != 0).or(text_span
-        .filter(|span| span.start != 0)
-        .map(|span| span.start))
+    addend
 }
 
 fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
@@ -572,7 +619,7 @@ fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
         let blob = read_span(reader, off, size.min(MAX_TABLE), len)?;
         module_runtime_text(&blob, pcln_addr, text_span?)
     });
-    adopt(&bytes[magic_at..], text_fallback(module_text, text_span))
+    adopt(&bytes[magic_at..], module_text, text_span, 0)
 }
 
 fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
@@ -586,7 +633,12 @@ fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
         let blob = read_span(reader, module.file_off, module.size.min(MAX_TABLE), len)?;
         module_runtime_text(&blob, pcln_addr, layout.text?)
     });
-    adopt(&bytes[magic_at..], text_fallback(module_text, layout.text))
+    adopt(
+        &bytes[magic_at..],
+        module_text,
+        layout.text,
+        layout.text_segment,
+    )
 }
 
 /// ASLR slide: runtime header address minus the link `__TEXT` vmaddr.
@@ -652,7 +704,7 @@ struct MachoBlob {
 
 struct MachoLayout {
     /// `__TEXT` vmaddr. The ASLR slide is the runtime header minus this.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// An externally linked pclntab stores `textStart` as an offset from it.
     text_segment: u64,
     /// `__text` link range. Go 1.26 entry offsets are relative to `runtime.text`.
     text: Option<TextSpan>,
@@ -799,7 +851,7 @@ fn pe_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
             )?;
             module_runtime_text(&blob, pcln_addr, text?)
         });
-        if let Some(tables) = adopt(&bytes[magic_at..], text_fallback(module_text, text)) {
+        if let Some(tables) = adopt(&bytes[magic_at..], module_text, text, 0) {
             return Some(tables);
         }
     }
@@ -1491,6 +1543,185 @@ func spin() {
 
     fn required() -> bool {
         std::env::var("ANYPROF_REQUIRE_NATIVE").ok().as_deref() == Some("1")
+    }
+
+    /// Externally linked Mach-O stores Go 1.22 `textStart` as an addend from
+    /// the `__TEXT` vmaddr. Internal link and Go 1.26 already store the link
+    /// address, and a cgo base that misses `__text` is not replaced with the
+    /// section start.
+    #[test]
+    fn macho_text_start_follows_the_link() {
+        const TEXT_VM: u64 = 0x1_0000_0000;
+        const TEXT_ADDR: u64 = 0x1_0000_1000;
+        const TEXT_SIZE: u64 = 0x1_0000;
+        const PCLN_ADDR: u64 = 0x1_0020_0000;
+        let dir = temp_module("anyprof-macho-text");
+
+        let mut external = synthetic();
+        put_u64(&mut external, 24, 0x1AA0);
+        let image = open_macho(
+            &dir,
+            "external",
+            &macho_image(TEXT_VM, TEXT_ADDR, TEXT_SIZE, PCLN_ADDR, &external, None),
+        );
+        assert_eq!(image.runtime_text, TEXT_VM + 0x1AA0);
+        assert_eq!(
+            image
+                .symbol(image.runtime_text + 0x110)
+                .as_ref()
+                .map(|symbol| symbol.name.as_str()),
+            Some("main.spin")
+        );
+
+        let mut internal = synthetic();
+        put_u64(&mut internal, 24, TEXT_ADDR);
+        let image = open_macho(
+            &dir,
+            "internal-arm64",
+            &macho_image(TEXT_VM, TEXT_ADDR, TEXT_SIZE, PCLN_ADDR, &internal, None),
+        );
+        assert_eq!(image.runtime_text, TEXT_ADDR);
+
+        let mut amd64 = synthetic();
+        put_u64(&mut amd64, 24, 0x10_01000);
+        let image = open_macho(
+            &dir,
+            "internal-amd64",
+            &macho_image(0x100_0000, 0x10_01000, TEXT_SIZE, 0x20_00000, &amd64, None),
+        );
+        assert_eq!(image.runtime_text, 0x10_01000);
+
+        let mut zero = synthetic();
+        put_u64(&mut zero, 24, 0);
+        let missing = dir.join("zero");
+        std::fs::write(
+            &missing,
+            macho_image(TEXT_VM, TEXT_ADDR, TEXT_SIZE, PCLN_ADDR, &zero, None),
+        )
+        .unwrap();
+        assert!(open_image(&missing).is_none());
+
+        let mut miss = synthetic();
+        put_u64(&mut miss, 24, 0x20);
+        let missing = dir.join("miss");
+        std::fs::write(
+            &missing,
+            macho_image(TEXT_VM, TEXT_ADDR, TEXT_SIZE, PCLN_ADDR, &miss, None),
+        )
+        .unwrap();
+        assert!(open_image(&missing).is_none());
+
+        let module_text = TEXT_ADDR + 0x100;
+        let image = open_macho(
+            &dir,
+            "module",
+            &macho_image(
+                TEXT_VM,
+                TEXT_ADDR,
+                TEXT_SIZE,
+                PCLN_ADDR,
+                &zero,
+                Some(module_record(PCLN_ADDR, module_text)),
+            ),
+        );
+        assert_eq!(image.runtime_text, module_text);
+
+        let image = open_macho(
+            &dir,
+            "module-addend",
+            &macho_image(
+                TEXT_VM,
+                TEXT_ADDR,
+                TEXT_SIZE,
+                PCLN_ADDR,
+                &zero,
+                Some(module_record(PCLN_ADDR, module_text - TEXT_VM)),
+            ),
+        );
+        assert_eq!(image.runtime_text, module_text);
+    }
+
+    fn open_macho(dir: &std::path::Path, name: &str, bytes: &[u8]) -> GoImage {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        open_image(&path).unwrap_or_else(|| panic!("pclntab in {name}"))
+    }
+
+    fn module_record(pcln_addr: u64, text: u64) -> Vec<u8> {
+        let mut blob = vec![0u8; 192];
+        blob[..8].copy_from_slice(&pcln_addr.to_le_bytes());
+        blob[176..184].copy_from_slice(&text.to_le_bytes());
+        blob[184..192].copy_from_slice(&(text + 0x100).to_le_bytes());
+        blob
+    }
+
+    fn macho_image(
+        text_vm: u64,
+        text_addr: u64,
+        text_size: u64,
+        pcln_addr: u64,
+        pcln: &[u8],
+        module: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let nsects = if module.is_some() { 3u32 } else { 2 };
+        let cmdsize = 8 + 64 + 80 * nsects;
+        let mut file = Vec::new();
+        for word in [0xFEED_FACF, 0x0100_0007, 0, 2, 1, cmdsize, 0, 0] {
+            file.extend_from_slice(&word.to_le_bytes());
+        }
+        file.extend_from_slice(&0x19u32.to_le_bytes());
+        file.extend_from_slice(&cmdsize.to_le_bytes());
+        macho_name(&mut file, b"__TEXT");
+        file.extend_from_slice(&text_vm.to_le_bytes());
+        file.extend_from_slice(&(text_size + 0x1000).to_le_bytes());
+        file.extend_from_slice(&0u64.to_le_bytes());
+        file.extend_from_slice(&0u64.to_le_bytes());
+        file.extend_from_slice(&7u32.to_le_bytes());
+        file.extend_from_slice(&5u32.to_le_bytes());
+        file.extend_from_slice(&nsects.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        let content_off = file.len() + 80 * nsects as usize;
+        let pcln_off = content_off as u32;
+        macho_section(&mut file, b"__text", text_addr, text_size, 0);
+        macho_section(
+            &mut file,
+            b"__gopclntab",
+            pcln_addr,
+            pcln.len() as u64,
+            pcln_off,
+        );
+        if let Some(bytes) = &module {
+            macho_section(
+                &mut file,
+                b"__go_module",
+                pcln_addr + 0x10000,
+                bytes.len() as u64,
+                pcln_off + pcln.len() as u32,
+            );
+        }
+        assert_eq!(file.len(), content_off);
+        file.extend_from_slice(pcln);
+        if let Some(bytes) = module {
+            file.extend_from_slice(&bytes);
+        }
+        file
+    }
+
+    fn macho_section(out: &mut Vec<u8>, name: &[u8], addr: u64, size: u64, file_off: u32) {
+        macho_name(out, name);
+        macho_name(out, b"__TEXT");
+        out.extend_from_slice(&addr.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&file_off.to_le_bytes());
+        for _ in 0..7 {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+
+    fn macho_name(out: &mut Vec<u8>, name: &[u8]) {
+        let mut bytes = [0u8; 16];
+        bytes[..name.len()].copy_from_slice(name);
+        out.extend_from_slice(&bytes);
     }
 
     fn synthetic() -> Vec<u8> {
