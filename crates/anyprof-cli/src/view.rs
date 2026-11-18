@@ -24,8 +24,8 @@ pub fn validate(viewer: &ViewerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Serve `bytes` (the contents of `path`) in speedscope until Ctrl+C or the
-/// timeout.
+/// Serve `bytes` (the contents of `path`) in the built-in viewer until Ctrl+C
+/// or the timeout.
 pub fn show(path: &Path, bytes: Vec<u8>, viewer: &ViewerArgs) -> anyhow::Result<()> {
     if bytes.is_empty() {
         return Err(anyhow!("{} is empty", path.display()));
@@ -43,7 +43,7 @@ pub fn show(path: &Path, bytes: Vec<u8>, viewer: &ViewerArgs) -> anyhow::Result<
     stop.begin_stopping();
     interrupt::route_to(&stop)?;
 
-    eprintln!("Viewing {} in speedscope at {url}", path.display());
+    eprintln!("Viewing {} at {url}", path.display());
     match anyprof_web::open_browser(&url, viewer.no_open) {
         Launch::Opened => eprintln!("Opened your default browser."),
         Launch::Skipped(reason) => print_fallback(&url, server.port(), reason),

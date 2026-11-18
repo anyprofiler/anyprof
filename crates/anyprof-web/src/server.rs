@@ -5,23 +5,20 @@ use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use anyprof_export::{Trace, load_trace};
+
 use crate::Error;
 use crate::assets;
+use crate::query;
 use crate::token::Token;
 
 /// Applied to every response, including 404s.
 ///
-/// Everything is same-origin. Two exceptions to plain `default-src 'self'`
-/// are needed by speedscope 1.25.0:
-/// - `'wasm-unsafe-eval'`: the C++/Rust symbol demangler is a WebAssembly
-///   module embedded in the JS bundle. This allows compiling wasm only; JS
-///   `eval` stays blocked (protobuf.js probes `eval("require")` in a `try`
-///   and carries on).
-/// - `style-src 'unsafe-inline'`: aphrodite (CSS-in-JS) adds a `<style>`
-///   element and fills it with `insertRule`. Blocking it leaves the page
-///   unstyled and the flame graph's resize loop overflows the stack.
-pub(crate) const CONTENT_SECURITY_POLICY: &str =
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'";
+/// Everything is same-origin. There is no WebAssembly and no remote origin.
+/// `style-src 'unsafe-inline'` covers layout numbers the page writes itself
+/// (row offsets, the ruler, the tooltip). Those values are computed lengths,
+/// never profile text. `script-src` does not allow `eval`.
+pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'none'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 const POLL: Duration = Duration::from_millis(100);
 
@@ -34,7 +31,7 @@ pub enum StopReason {
     TimedOut,
 }
 
-/// A localhost HTTP server for one profile and the embedded speedscope build.
+/// A localhost HTTP server for one profile and the built-in viewer.
 ///
 /// Everything lives under `/t/<token>/`, where the token is 128 random bits.
 /// Any other path, including a wrong token, is a 404.
@@ -47,8 +44,9 @@ pub struct Viewer {
 impl Viewer {
     /// Listen on `127.0.0.1:port`. Port 0 lets the OS pick a free port.
     ///
-    /// `name` is the file name speedscope shows as the title. `profile` is
-    /// served unchanged; speedscope detects the format from its contents.
+    /// `name` is the file name shown in the toolbar. `profile` is served
+    /// unchanged at `profile` and parsed for the call tree. A file that cannot
+    /// be parsed still starts the server; the page explains why.
     pub fn bind(name: &str, profile: Vec<u8>, port: u16) -> Result<Self, Error> {
         let token = Token::generate().map_err(|err| Error::Random(err.to_string()))?;
         let server = Server::http(("127.0.0.1", port)).map_err(|source| Error::Bind {
@@ -73,8 +71,7 @@ impl Viewer {
     /// The URL to open: `http://127.0.0.1:<port>/t/<token>/`.
     ///
     /// It has no `#fragment`, because macOS `open` and Windows `start` drop
-    /// it. The page it serves redirects to speedscope with the hash speedscope
-    /// reads.
+    /// it. The page is the viewer; it does not read a fragment.
     #[must_use]
     pub fn url(&self) -> String {
         format!(
@@ -149,23 +146,38 @@ impl Viewer {
 
 struct Routes {
     token: Token,
-    landing: String,
+    name: String,
     profile: Arc<[u8]>,
+    trace: Result<Trace, String>,
     profile_requests: AtomicUsize,
+    announced: std::sync::atomic::AtomicBool,
 }
 
 impl Routes {
     fn new(token: Token, name: &str, profile: Vec<u8>) -> Self {
+        let trace = load_trace(&profile).map_err(|err| err.to_string());
         Self {
-            landing: landing_page(name),
             token,
+            name: name.to_string(),
             profile: profile.into(),
+            trace,
             profile_requests: AtomicUsize::new(0),
+            announced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn announce(&self) {
+        if !self
+            .announced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::info!(bytes = self.profile.len(), "browser fetched the profile");
         }
     }
 
     fn route(&self, method: &Method, url: &str, accepts_gzip: bool) -> Reply {
-        let path = url.split(['?', '#']).next().unwrap_or_default();
+        let (path, query) = url.split_once('?').unwrap_or((url, ""));
+        let path = path.split('#').next().unwrap_or(path);
         let Some(rest) = path.strip_prefix("/t/") else {
             return Reply::not_found();
         };
@@ -181,78 +193,54 @@ impl Routes {
         }
         match tail {
             None => Reply::redirect(format!("/t/{}/", self.token.as_str())),
-            Some("") => Reply::ok(
-                "text/html; charset=utf-8",
-                Body::Owned(self.landing.clone().into_bytes()),
-            ),
+            Some("" | "index.html") => self.asset("index.html", accepts_gzip),
             Some("profile") => {
-                if self.profile_requests.fetch_add(1, Ordering::Relaxed) == 0 {
-                    tracing::info!(bytes = self.profile.len(), "browser fetched the profile");
-                }
+                self.profile_requests.fetch_add(1, Ordering::Relaxed);
+                self.announce();
                 Reply::ok(
                     "application/octet-stream",
                     Body::Shared(Arc::clone(&self.profile)),
                 )
             }
-            Some(name) => match assets::lookup(name) {
-                Some(asset) if accepts_gzip => {
-                    let mut reply = Reply::ok(asset.content_type, Body::Static(asset.gzip));
-                    reply.gzip = true;
-                    reply
+            Some("session") => {
+                self.announce();
+                match &self.trace {
+                    Ok(trace) => Reply::json(200, &query::session_json(&self.name, trace)),
+                    Err(message) => Reply::json_error(422, message),
                 }
-                Some(asset) => match gunzip(asset.gzip) {
-                    Some(bytes) => Reply::ok(asset.content_type, Body::Owned(bytes)),
-                    None => Reply::not_found(),
+            }
+            Some("tree") => match &self.trace {
+                Ok(trace) => match query::tree_json(trace, query) {
+                    Ok(body) => Reply::json(200, &body),
+                    Err(message) => Reply::json_error(400, &message),
                 },
+                Err(message) => Reply::json_error(422, message),
+            },
+            Some("timeline") => match &self.trace {
+                Ok(trace) => match query::timeline_json(trace, query) {
+                    Ok(body) => Reply::json(200, &body),
+                    Err(message) => Reply::json_error(422, &message),
+                },
+                Err(message) => Reply::json_error(422, message),
+            },
+            Some(name) => self.asset(name, accepts_gzip),
+        }
+    }
+
+    fn asset(&self, name: &str, accepts_gzip: bool) -> Reply {
+        match assets::lookup(name) {
+            Some(asset) if accepts_gzip => {
+                let mut reply = Reply::ok(asset.content_type, Body::Static(asset.gzip));
+                reply.gzip = true;
+                reply
+            }
+            Some(asset) => match gunzip(asset.gzip) {
+                Some(bytes) => Reply::ok(asset.content_type, Body::Owned(bytes)),
                 None => Reply::not_found(),
             },
+            None => Reply::not_found(),
         }
     }
-}
-
-/// The page at `/t/<token>/`. A meta refresh, not a script, so it runs under
-/// `default-src 'self'`.
-fn landing_page(name: &str) -> String {
-    let target = format!(
-        "index.html#profileURL=profile&title={}&view=left-heavy",
-        percent_encode(name)
-    );
-    let target = html_escape(&target);
-    let name = html_escape(name);
-    format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-         <meta http-equiv=\"refresh\" content=\"0; url={target}\">\n\
-         <title>{name} - anyprof</title>\n</head>\n<body>\n\
-         <p><a href=\"{target}\">Open {name} in speedscope</a></p>\n</body>\n</html>\n"
-    )
-}
-
-/// `encodeURIComponent`, minus the `!'()*` it leaves alone.
-fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
-fn html_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 fn accepts_gzip(header: &str) -> bool {
@@ -337,6 +325,21 @@ impl Reply {
         reply
     }
 
+    fn json(status: u16, body: &[u8]) -> Self {
+        Self {
+            status,
+            content_type: "application/json",
+            body: Body::Owned(body.to_vec()),
+            gzip: false,
+            location: None,
+        }
+    }
+
+    fn json_error(status: u16, message: &str) -> Self {
+        let body = serde_json::json!({ "error": message }).to_string();
+        Self::json(status, body.as_bytes())
+    }
+
     fn headers(&self) -> Vec<(&'static str, String)> {
         let mut headers = vec![
             ("Content-Type", self.content_type.to_string()),
@@ -388,10 +391,7 @@ mod tests {
 
     use tiny_http::Method;
 
-    use super::{
-        CONTENT_SECURITY_POLICY, Reply, Routes, StopReason, Viewer, accepts_gzip, gunzip,
-        landing_page, percent_encode,
-    };
+    use super::{CONTENT_SECURITY_POLICY, Reply, Routes, StopReason, Viewer, accepts_gzip, gunzip};
     use crate::token::Token;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn root_without_slash_redirects_and_landing_page_points_at_speedscope() {
+    fn root_without_slash_redirects_and_the_page_is_the_viewer() {
         let routes = routes();
         let reply = get(&routes, &format!("/t/{TOKEN}"));
         assert_eq!(reply.status, 301);
@@ -499,22 +499,58 @@ mod tests {
             header(&reply, "Content-Type").as_deref(),
             Some("text/html; charset=utf-8")
         );
-        let body = std::str::from_utf8(reply.body.as_ref()).unwrap();
-        assert!(
-            body.contains(
-                "url=index.html#profileURL=profile&amp;title=cpu.cpuprofile&amp;view=left-heavy"
-            ),
-            "{body}"
-        );
-        assert!(!body.contains("<script"), "{body}");
+        let body = String::from_utf8(gunzip(reply.body.as_ref()).unwrap()).unwrap();
+        assert!(body.contains("data-testid=\"app\""), "{body}");
+        assert!(body.contains("app.js"), "{body}");
+        assert!(!body.contains("profileURL"), "{body}");
+        assert!(!body.contains("speedscope"), "{body}");
+        assert!(!body.contains("cpu.cpuprofile"), "{body}");
     }
 
     #[test]
-    fn landing_page_escapes_the_file_name() {
-        let page = landing_page("a b&c<\"x'>#=.txt");
-        assert!(page.contains("title=a%20b%26c%3C%22x%27%3E%23%3D.txt&amp;"));
-        assert!(page.contains("Open a b&amp;c&lt;&quot;x&#39;&gt;#=.txt in speedscope"));
-        assert_eq!(percent_encode("héllo"), "h%C3%A9llo");
+    fn file_name_is_json_text_not_markup() {
+        let name = "a b&c<\"x'><img src=x onerror=alert(1)>.txt";
+        let routes = Routes::new(Token::from_hex(TOKEN), name, b"main;work 3\n".to_vec());
+        let page = get(&routes, &format!("/t/{TOKEN}/"));
+        let html = String::from_utf8(gunzip(page.body.as_ref()).unwrap()).unwrap();
+        assert!(!html.contains(name), "{html}");
+        assert!(!html.contains("<img"), "{html}");
+        let session = get(&routes, &format!("/t/{TOKEN}/session"));
+        assert_eq!(session.status, 200);
+        let json: serde_json::Value = serde_json::from_slice(session.body.as_ref()).unwrap();
+        assert_eq!(json["name"], name);
+        assert_eq!(json["timeline"], serde_json::Value::Null);
+        assert!(
+            json["timelineDisabled"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("not when")
+                || json["timelineDisabled"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no timeline")
+                || json["timelineDisabled"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not a clock")
+                || json["timelineDisabled"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Collapsed"),
+            "{}",
+            json["timelineDisabled"]
+        );
+        assert_eq!(json["total"], 3);
+        let tree = get(&routes, &format!("/t/{TOKEN}/tree?invert=1"));
+        assert_eq!(tree.status, 200);
+        let tree: serde_json::Value = serde_json::from_slice(tree.body.as_ref()).unwrap();
+        assert_eq!(tree["total"], 3);
+        assert_eq!(tree["nodes"][0]["depth"], 0);
+        let timeline = get(&routes, &format!("/t/{TOKEN}/timeline"));
+        assert_eq!(timeline.status, 422);
+        let timeline: serde_json::Value = serde_json::from_slice(timeline.body.as_ref()).unwrap();
+        assert!(timeline["error"].as_str().unwrap().len() > 10);
     }
 
     #[test]
@@ -543,7 +579,7 @@ mod tests {
             Some("text/html; charset=utf-8")
         );
         let html = String::from_utf8(gunzip(reply.body.as_ref()).unwrap()).unwrap();
-        assert!(html.contains("<title>speedscope</title>"), "{html}");
+        assert!(html.contains("<title>anyprof</title>"), "{html}");
 
         let plain = routes.route(&Method::Get, &format!("/t/{TOKEN}/index.html"), false);
         assert_eq!(header(&plain, "Content-Encoding"), None);
@@ -575,6 +611,7 @@ mod tests {
         assert!(CONTENT_SECURITY_POLICY.starts_with("default-src 'self';"));
         assert!(!CONTENT_SECURITY_POLICY.contains('*'));
         assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-eval'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("wasm-unsafe-eval"));
         assert!(!CONTENT_SECURITY_POLICY.contains("blob:"));
         assert!(!CONTENT_SECURITY_POLICY.contains("data:"));
     }

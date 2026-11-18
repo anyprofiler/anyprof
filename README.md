@@ -4,7 +4,7 @@ Capture CPU profiles from any running process, no code changes or restarts neede
 
 anyprof attaches to a live process by pid and writes a CPU profile. The process does not need a profiler baked in, and it does not need to be restarted. Runtimes sit behind one `Backend` trait, and every backend emits the same profile.
 
-**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. `anyprof view` opens any of those in a built-in, offline speedscope viewer. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling works on macOS (Mach `task_for_pid`, frame pointers, Mach-O symbols, root), on Windows x64 (suspend only threads that are running, `StackWalk64`, same user), and on Linux x86_64 (`perf_event_open` task-clock events, frame pointers, ELF symbols). Rust uses that same sampler: a Rust pid is detected, Rust names are demangled, and Rust frames are labeled `[rust]`. Go uses the same on-CPU events and unwinds with the Go pclntab, so a leaf without a frame pointer still has its caller, and Go frames are labeled `[go]`. Python uses the same on-CPU events and reads CPython's interpreter frame chain, so a sample whose leaf is inside the interpreter image and whose frame chain can be read is labeled `[python]` with the function, file, and line instead of the interpreter's C frames. A chain that cannot be read keeps the native walk. Java uses the same on-CPU events and reads HotSpot's code cache, so a compiled method or an interpreter frame is labeled `[java]` as `Class.method` instead of `libjvm` frames. A leaf outside the code cache stays native. Other CPU architectures compile and `start` returns not implemented.
+**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. `anyprof view` opens any of those in a built-in, offline viewer. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling works on macOS (Mach `task_for_pid`, frame pointers, Mach-O symbols, root), on Windows x64 (suspend only threads that are running, `StackWalk64`, same user), and on Linux x86_64 (`perf_event_open` task-clock events, frame pointers, ELF symbols). Rust uses that same sampler: a Rust pid is detected, Rust names are demangled, and Rust frames are labeled `[rust]`. Go uses the same on-CPU events and unwinds with the Go pclntab, so a leaf without a frame pointer still has its caller, and Go frames are labeled `[go]`. Python uses the same on-CPU events and reads CPython's interpreter frame chain, so a sample whose leaf is inside the interpreter image and whose frame chain can be read is labeled `[python]` with the function, file, and line instead of the interpreter's C frames. A chain that cannot be read keeps the native walk. Java uses the same on-CPU events and reads HotSpot's code cache, so a compiled method or an interpreter frame is labeled `[java]` as `Class.method` instead of `libjvm` frames. A leaf outside the code cache stays native. Other CPU architectures compile and `start` returns not implemented.
 
 ## Goals
 
@@ -72,7 +72,7 @@ anyprof-core        Backend::detect / start -> Session::stop -> Profile
 anyprof-export       collapsed | speedscope | pprof | cpuprofile
         |
         v
-anyprof-web          anyprof view / record --web: embedded speedscope on 127.0.0.1
+anyprof-web          anyprof view / record --web: local viewer on 127.0.0.1
 ```
 
 `Backend` is the extension point:
@@ -93,7 +93,7 @@ trait Session {
 
 Stacks are leaf-first: `frames[0]` is the leaf (the frame that was on-CPU) and the last frame is the root. That matches pprof. Collapsed stacks and speedscope are root-first, and the exporters reverse the order.
 
-A frame from a non-native runtime is written as `[runtime] name`, for example `[node] work`, in collapsed stacks, speedscope, and pprof, so mixed stacks keep their origin. A `.cpuprofile` recorded from Node or a browser tab is the original V8 document from `Profiler.stop`, not a rebuilt tree. `convert` rebuilds a `.cpuprofile` Chrome DevTools can open: a `(root)` node, `scriptId` on every call frame, and `timeDeltas` the same length as `samples`.
+A frame from a non-native runtime is written as `[runtime] name`, for example `[node] work`, in collapsed stacks, speedscope, pprof, and a `.cpuprofile` rebuilt by `convert`, so mixed stacks keep their origin. A `.cpuprofile` recorded from Node or a browser tab is the original V8 document from `Profiler.stop`, not a rebuilt tree. `convert` rebuilds a `.cpuprofile` Chrome DevTools can open: a `(root)` node, `scriptId` `"0"` on every call frame, `startTime` 0, and `timeDeltas` the same length as `samples`. Native names stay bare. Kernel, Rust, Go, Python, Java, and the other runtimes keep the prefix.
 
 ## Install
 
@@ -168,7 +168,7 @@ anyprof conv -i profile.cpuprofile -o cpu.collapsed -t collapsed
 anyprof conv -i cpu.collapsed -o cpu.speedscope.json -t speedscope
 anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 
-# Look at a profile in the built-in speedscope viewer (offline).
+# Look at a profile in the built-in viewer (offline).
 anyprof view cpu.cpuprofile
 anyprof rec -p 1234 -d 10s -w
 ```
@@ -217,7 +217,7 @@ Default format when `-f` is omitted and `-o` is not a recognized file name:
 
 `-o cpu.collapsed` still writes collapsed stacks for Node. `--format pprof -o cpu.cpuprofile` still writes pprof. A directory named `profiles.cpuprofile` does not select the format; the backend default does.
 
-`convert` (`conv`) reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `-f` / `--from` is inferred from the file name (`.collapsed`, `.folded`, `.txt`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. `-t` / `--to` is the output format. `-i` / `--input` and `-o` / `--output` are the files. A `.cpuprofile` that carries no `[runtime]` prefix is imported as Node. A `.cpuprofile` written by `convert` is rebuilt from the unified stacks and is still a tree Chrome DevTools accepts.
+`convert` (`conv`) reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `-f` / `--from` is inferred from the file name (`.collapsed`, `.folded`, `.txt`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. `-t` / `--to` is the output format. `-i` / `--input` and `-o` / `--output` are the files. A V8 `.cpuprofile` that is not the rebuilt shape is imported as Node, or as browser when the capture used the browser backend. A rebuilt `.cpuprofile` (`scriptId` `"0"` and `startTime` 0) keeps a `[runtime] name` prefix, and a bare name in that shape is native rather than Node. The rebuilt tree is still one Chrome DevTools can open.
 
 Collapsed stacks keep the runtime label and function name. Speedscope also keeps file, line, and column. pprof also keeps the instruction address, duration, and sampling period. A frame's module is not written yet.
 
@@ -230,7 +230,7 @@ main;[node] work 3
 
 ## Viewing profiles
 
-`anyprof view <file>` (alias `v`) opens a profile in [speedscope](https://github.com/jlfwong/speedscope) 1.25.0, which is built into the binary. Nothing is downloaded and the profile never leaves the machine. `anyprof rec ... -w` does the same with the file it just wrote: it prints the path as usual, then starts the viewer.
+`anyprof view <file>` (alias `v`) opens a profile in the viewer built into the binary. Nothing is downloaded and the profile never leaves the machine. `anyprof rec ... -w` does the same with the file it just wrote: it prints the path as usual, then starts the viewer.
 
 ```bash
 anyprof view cpu.cpuprofile
@@ -238,7 +238,19 @@ anyprof v cpu.pb.gz --no-open --port 8123
 anyprof rec -p 1234 -d 10s -w --web-timeout 10m
 ```
 
-`view` reads `.cpuprofile`, pprof (`.pb.gz`, gzip-compressed or raw), speedscope JSON, and collapsed stacks. The file is served as-is and speedscope detects the format from its contents, not the extension. pprof is decoded by speedscope's own protobuf importer, so there is no server-side conversion. Formats speedscope reads that anyprof does not write (Linux `perf script`, Instruments, and so on) work too. Java Flight Recorder files do not, because the JFR importer's wasm is not shipped.
+`view` reads `.cpuprofile`, pprof (`.pb.gz`, gzip-compressed or raw), speedscope JSON, and collapsed stacks. The call tree, flat functions, and flame graph are computed locally from the weights in the file. A file that is not one of those four formats is refused, and the page says why.
+
+The timeline is drawn only when the file is a time series:
+
+- A V8 `.cpuprofile` from Node or a browser (`Profiler.stop`, with `samples` and `timeDeltas` and a stack that was observed more than once) is sampled time. It is one track. The file does not record a thread id, and the chart is sample activity, not CPU utilization.
+- Speedscope `evented` profiles use each event's `at` timestamp as a clock only when the unit is a time unit. `unit` `none`, `bytes`, or any other non-time unit stays an aggregate: the open and close intervals are weights, and there is no timeline. Speedscope `sampled` profiles use the file order as a clock only when the unit is a time unit and a stack is stored more than once.
+- Everything else is an aggregate. The page says **No timeline** and still shows the weighted call tree and flame graph. That includes collapsed stacks, pprof, anyprof's speedscope files (`unit` is `none`), and a `.cpuprofile` rebuilt by `convert` or by `record --format cpuprofile` for a native, Rust, Go, Python, or Java process. Those files use `scriptId` 0 and `startTime` 0, and their `timeDeltas` are folded sample counts, not a clock, even when the same stack is listed more than once.
+
+A stack deeper than 8,192 frames is refused, with the limit in the error. The page walks the call tree and the flame graph without recursion. The flame graph draws the first 40 levels and says when the tree is deeper; the call tree still lists every kept frame, and the weights are the weights from the file.
+
+On a time series the ruler uses one unit for the visible range, a zero weight is shown as `0`, and the marks stay separated. The chart says it is not CPU utilization. Details holds the longer note, including when the tracks are profiles from the file rather than thread ids. The side pane lists the heaviest path through the selected function and labels that scope.
+
+Native, Rust, Go, Python, and Java recordings fold each distinct stack into one weight before the file is written. The samplers see a thread id (and, on Linux, a perf timestamp) while they are sampling, and `Profile` does not keep either. A timeline for those recordings would mean keeping the sample series in the profile and in the exporters. That is not part of this viewer, and neither is a system-wide capture mode. Sample order, a weight copied into `timeDeltas`, and `period * count / wall` are not used as a clock, a thread list, or a CPU curve. CPU time is shown as text only when a pprof profile has a real `cpu` column and a wall duration. anyprof's own pprof files are `samples/count` plus a wall duration and a sampling period, so they do not show CPU time.
 
 | Flag | Meaning |
 | --- | --- |
@@ -246,7 +258,7 @@ anyprof rec -p 1234 -d 10s -w --web-timeout 10m
 | `--port <PORT>` | Listen on `127.0.0.1:<PORT>`. Default: a free port chosen by the OS. |
 | `--web-timeout <DURATION>` | Stop after this long (`humantime`, for example `10m`). Default: serve until Ctrl+C. |
 
-The viewer serves until Ctrl+C (or SIGTERM, or Ctrl+Break on Windows), then exits 0. A second Ctrl+C exits immediately with status 130, even if a response is stuck on a client that stopped reading. The browser tab keeps the profile it already loaded.
+The viewer serves until Ctrl+C (or SIGTERM, or Ctrl+Break on Windows), then exits 0. A second Ctrl+C exits immediately with status 130, even if a response is stuck on a client that stopped reading. The browser tab keeps what it already loaded.
 
 anyprof opens the default browser with the [`webbrowser`](https://crates.io/crates/webbrowser) crate (macOS `open`, Windows `ShellExecute`, `xdg-open` and friends elsewhere). It prints the URL instead, together with an `ssh -L <port>:127.0.0.1:<port>` command for viewing from another machine, when:
 
@@ -255,30 +267,27 @@ anyprof opens the default browser with the [`webbrowser`](https://crates.io/crat
 - on Linux and the BSDs, neither `DISPLAY` nor `WAYLAND_DISPLAY` is set (WSL is exempt), or
 - opening the browser fails.
 
-The URL looks like `http://127.0.0.1:53211/t/<token>/`. It has no `#fragment`, because macOS `open` and Windows `start` drop fragments. That page is a meta-refresh redirect to `index.html#profileURL=profile&title=<file name>&view=left-heavy`, the hash speedscope reads on startup.
+The URL looks like `http://127.0.0.1:53211/t/<token>/`. It has no `#fragment`, because macOS `open` and Windows `start` drop fragments.
 
 ### Security
 
 - The server binds `127.0.0.1` only, never `0.0.0.0` or `::`.
 - Every URL is under `/t/<token>/`, where the token is 128 bits from the OS random number generator (`getrandom`), compared in constant time. A wrong token, or any path outside it, is a 404 that does not reveal whether the token was close.
-- Only the embedded speedscope files and the one profile (`/t/<token>/profile`) are served. Asset names are looked up in a table compiled into the binary, so there is no filesystem access and no path traversal; `..`, `/`, `\`, and percent-encoded names all miss the table and get a 404.
+- The page is `index.html`, `app.css`, and `app.js`, plus the one profile at `/t/<token>/profile` and the JSON views `session`, `tree`, and `timeline`. Asset names are looked up in a table compiled into the binary, so there is no filesystem access and no path traversal; `..`, `/`, `\`, and percent-encoded names all miss the table and get a 404.
 - Only `GET` and `HEAD` are accepted (others are 405). There are no CORS headers, so other origins cannot read responses.
+- Profile names are not interpolated into HTML. The page assigns them with `textContent`.
 - Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, and this Content Security Policy:
 
   ```
-  default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'
+  default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'none'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
   ```
 
-  Everything is same-origin. `'wasm-unsafe-eval'` is there because speedscope's C++/Rust symbol demangler is a WebAssembly module inside its JS bundle; it allows compiling wasm, not JS `eval`. `style-src 'unsafe-inline'` is there because speedscope styles its UI with aphrodite (CSS-in-JS), which writes rules into a `<style>` element; without it the UI is unstyled and the flame graph fails to lay out. No `blob:`, `data:`, or remote sources are allowed.
+  `script-src` does not allow `eval`. `style-src 'unsafe-inline'` is there because the page sets layout lengths (row offsets, the ruler, the tooltip) from numbers it computed. Those strings are not profile text. No `blob:`, `data:`, or remote sources are allowed.
 - Anyone who can read the URL (for example from your shell scrollback, or another user on a shared machine who can see the process's output) can load the profile until the viewer stops. Use `--web-timeout` on shared machines.
 
 ### Binary size
 
-The viewer adds about 0.8 MiB to the binary. On x86_64 Linux (glibc), the `dist` profile used for releases went from 10,964,520 to 11,781,840 bytes (+798 KiB, +7.5%); stripped, from 8,758,528 to 9,417,128 bytes (+643 KiB); xz-compressed, as in the release `.tar.xz`, from 2,773,660 to 3,119,540 bytes (+338 KiB). About 210 KiB of that is the gzip-compressed speedscope build. Most of the rest is `tiny_http` (about 120 KiB of code), `webbrowser` (about 50 KiB), and `anyprof-web` itself.
-
-### Vendored speedscope
-
-`crates/anyprof-web/vendor/speedscope/` holds speedscope 1.25.0's static build, one `<name>.gz` per file. `crates/anyprof-web/scripts/vendor-speedscope.sh` recreates it: it downloads the npm tarball, checks its sha256, drops the example profile (`perf-vertx-*.txt`) and the Java Flight Recorder wasm (`jfrview_bg*.wasm`), and gzips the rest with `gzip -n -9`. The files are embedded with [`include_dir`](https://crates.io/crates/include_dir) and sent with `Content-Encoding: gzip` (decompressed on the fly for a client that does not accept gzip). To upgrade, change `VERSION` and `SHA256` in the script and rerun it.
+The viewer is the three static files above, gzip-compressed into the binary by the crate's build script, plus `tiny_http` and `webbrowser`. There is no Node runtime and no embedded speedscope build. The files are 3,034, 11,117, and 40,249 bytes before compression, and the build script's gzip output is 996, 2,657, and 10,115 bytes (13,768 bytes together). On one Linux x86_64 machine, `cargo build -p anyprof-cli --profile dist` wrote a 12,705,000 byte binary, and `strip` reduced that file to 10,127,368 bytes. Those sizes are that build, not a size for every target.
 
 ## Permissions
 
@@ -334,7 +343,7 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope JSON in `anyprof view`, and checks that the viewer served the profile, that speedscope used the matching importer, that the page logged no exceptions or CSP violations, and that the screenshot contains a flame graph. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact.
+CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a collapsed profile and the pprof, speedscope, and `.cpuprofile` files `convert` writes from it, plus a real V8 time series, a profile whose function name is markup, and a file that is not a profile. It checks that folded files say there is no timeline, that the time series shows sample activity and that dragging the chart filters the call tree, that markup stays text, that the page logged no exceptions or CSP violations, and that the flame graph is visible. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact.
 
 CI sets `ANYPROF_REQUIRE_NATIVE=1` on every OS in the test matrix, so a skipped native, Rust, Go, Python, or Java live test is a failure there. The Python fixtures are CPython 3.11, 3.12, and 3.13 scripts (`spin` and `caller`, `time.sleep`, and two threads). The Java fixtures are Temurin 17, 21, and 25 (`AnyprofSpin.spin` and `AnyprofSpin.caller`, `Thread.sleep`, and two spinning threads, on each version). They take the same `anyprof-native-live.lock` as the C++ tests. The five Java library tests in one process queue before that file lock, so the 180s wait is for a lock another process left behind. On run 44263563861 those tests started together and the last waiter timed out while the other four still held the lock; `samples_a_busy_java_program` never sampled. Run 44266045818 passed the same JIT, `-Xint`, sleep, two-thread, and CLI checks after that queue. The Rust fixtures are compiled with `rustc --edition 2024 -C opt-level=0 -C force-frame-pointers=yes -C debuginfo=2` and sampled by the same jobs. The Go fixtures are compiled with Go 1.22 and again with Go 1.26, `CGO_ENABLED=0`, and `-ldflags=-s -w`. The build is `go build -o <binary> .` in the canonical module directory. On Linux and Windows they take the same `anyprof-native-live.lock` as the C++ tests, so perf and dbghelp are not used by two crates at once.
 
@@ -368,7 +377,7 @@ The live test spawns `node --inspect-port=127.0.0.1:<port>` without telling the 
 | `crates/anyprof-go` | Go backend (pclntab unwind on the native sampler) |
 | `crates/anyprof-python` | CPython backend (interpreter frames on the native sampler) |
 | `crates/anyprof-export` | collapsed, speedscope, pprof, and `.cpuprofile` |
-| `crates/anyprof-web` | `anyprof view`: localhost server, embedded speedscope, browser opener |
+| `crates/anyprof-web` | `anyprof view`: localhost server, local viewer, browser opener |
 | `crates/anyprof-cli` | the `anyprof` binary |
 | `dist-workspace.toml` | cargo-dist release config |
 
@@ -378,11 +387,4 @@ Linux process inspection reads `/proc`. On other Unix systems, detection uses `p
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-### Third-party licenses
-
-The `anyprof` binary embeds third-party files for `anyprof view`:
-
-- [speedscope](https://github.com/jlfwong/speedscope) 1.25.0, MIT License, copyright (c) 2018 Jamie Wong: [`LICENSE-speedscope.txt`](crates/anyprof-web/vendor/licenses/LICENSE-speedscope.txt).
-- Source Code Pro (the font speedscope uses), SIL Open Font License 1.1, copyright 2010-2019 Adobe: [`LICENSE-source-code-pro.md`](crates/anyprof-web/vendor/licenses/LICENSE-source-code-pro.md).
-
-Both license files are included in every release archive next to `LICENSE`.
+The viewer does not embed third-party UI code. Speedscope JSON is a file format anyprof writes and reads; the speedscope application is not included.

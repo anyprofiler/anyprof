@@ -1,14 +1,16 @@
-//! Offline profile viewer: an embedded speedscope build served on 127.0.0.1.
+//! Offline profile viewer served on 127.0.0.1.
 //!
-//! [`Viewer`] binds a loopback port and serves speedscope 1.25.0 plus one
-//! profile, all under a random `/t/<token>/` prefix. [`open_browser`] opens
-//! that URL, or says why it did not so the caller can print it instead.
-//! Nothing is fetched from the network.
+//! [`Viewer`] binds a loopback port and serves one profile under a random
+//! `/t/<token>/` prefix. The page is local HTML, CSS, and JavaScript. Weights
+//! are aggregated in this process. [`open_browser`] opens that URL, or says
+//! why it did not so the caller can print it instead. Nothing is fetched from
+//! the network.
 
 #![warn(missing_docs)]
 
 mod assets;
 mod open;
+mod query;
 mod server;
 mod token;
 

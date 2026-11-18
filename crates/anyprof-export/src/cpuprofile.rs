@@ -3,8 +3,10 @@
 //! Node ids form a tree. `samples` names the leaf of each sample and `timeDeltas`
 //! is that sample's weight in microseconds. Call-frame line and column numbers
 //! are 0-based; the unified profile uses 1-based lines. `(root)` frames are
-//! dropped. A `[runtime] name` prefix on a function is honored; otherwise every
-//! frame is stamped with the runtime passed to [`import_cpuprofile`].
+//! dropped. A `[runtime] name` prefix is honored. `convert` writes that prefix
+//! and `scriptId` `"0"` with `startTime` 0. An unprefixed name in that shape is
+//! native, because the file does not say which runtime it was. Any other
+//! unprefixed name uses the runtime passed to [`import_cpuprofile`].
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -14,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::SampleCounts;
 use crate::error::Error;
-use crate::symbol::split_runtime_prefix;
+use crate::symbol::{format_symbol, split_runtime_prefix};
 
 /// Decode a `.cpuprofile` document, or a CDP `Profiler.stop` result that wraps one.
 pub fn import_cpuprofile(bytes: &[u8], default_runtime: Runtime) -> Result<Profile, Error> {
@@ -23,10 +25,13 @@ pub fn import_cpuprofile(bytes: &[u8], default_runtime: Runtime) -> Result<Profi
     let parsed = parse_nodes(node_array(root)?)?;
     let samples = number_array(root.get("samples"));
     let deltas = time_deltas(root.get("timeDeltas"));
+    // scriptId 0 and startTime 0 is the rebuilt tree. The caller's runtime is
+    // not in that file, so it must not be stamped onto a bare name.
+    let rebuilt = is_rebuilt_cpuprofile(root);
     let stacks = if samples.is_empty() {
-        stacks_from_hit_counts(&parsed, default_runtime)?
+        stacks_from_hit_counts(&parsed, default_runtime, rebuilt)?
     } else {
-        stacks_from_samples(&parsed, &samples, &deltas, default_runtime)?
+        stacks_from_samples(&parsed, &samples, &deltas, default_runtime, rebuilt)?
     };
 
     let start = root.get("startTime").and_then(Value::as_u64).unwrap_or(0);
@@ -229,6 +234,7 @@ fn stacks_from_samples(
     samples: &[u64],
     deltas: &[u64],
     default_runtime: Runtime,
+    rebuilt: bool,
 ) -> Result<Vec<Stack>, Error> {
     let mut order = Vec::new();
     let mut totals: HashMap<Vec<Frame>, u64> = HashMap::new();
@@ -238,7 +244,7 @@ fn stacks_from_samples(
             .copied()
             .filter(|weight| *weight > 0)
             .unwrap_or(1);
-        let frames = walk_stack(parsed, *sample, default_runtime)?;
+        let frames = walk_stack(parsed, *sample, default_runtime, rebuilt)?;
         if frames.is_empty() {
             continue;
         }
@@ -247,7 +253,11 @@ fn stacks_from_samples(
     Ok(finish(order, totals))
 }
 
-fn stacks_from_hit_counts(parsed: &Parsed, default_runtime: Runtime) -> Result<Vec<Stack>, Error> {
+fn stacks_from_hit_counts(
+    parsed: &Parsed,
+    default_runtime: Runtime,
+    rebuilt: bool,
+) -> Result<Vec<Stack>, Error> {
     let mut order = Vec::new();
     let mut totals: HashMap<Vec<Frame>, u64> = HashMap::new();
     for id in parsed.by_id.keys() {
@@ -255,7 +265,7 @@ fn stacks_from_hit_counts(parsed: &Parsed, default_runtime: Runtime) -> Result<V
         if hit == 0 {
             continue;
         }
-        let frames = walk_stack(parsed, *id, default_runtime)?;
+        let frames = walk_stack(parsed, *id, default_runtime, rebuilt)?;
         if frames.is_empty() {
             continue;
         }
@@ -264,9 +274,14 @@ fn stacks_from_hit_counts(parsed: &Parsed, default_runtime: Runtime) -> Result<V
     Ok(finish(order, totals))
 }
 
-fn walk_stack(parsed: &Parsed, mut id: u64, default_runtime: Runtime) -> Result<Vec<Frame>, Error> {
+fn walk_stack(
+    parsed: &Parsed,
+    mut id: u64,
+    default_runtime: Runtime,
+    rebuilt: bool,
+) -> Result<Vec<Frame>, Error> {
     let mut frames = Vec::new();
-    for _ in 0..2048 {
+    for _ in 0..crate::trace::MAX_DEPTH {
         let Some(node) = parsed.by_id.get(&id) else {
             return Err(Error::invalid(
                 "cpuprofile",
@@ -274,7 +289,7 @@ fn walk_stack(parsed: &Parsed, mut id: u64, default_runtime: Runtime) -> Result<
             ));
         };
         let mut frame = node.frame.clone();
-        if node.unprefixed {
+        if node.unprefixed && !rebuilt {
             frame.runtime = default_runtime;
         }
         if frame.name != "(root)" {
@@ -287,8 +302,48 @@ fn walk_stack(parsed: &Parsed, mut id: u64, default_runtime: Runtime) -> Result<
     }
     Err(Error::invalid(
         "cpuprofile",
-        "node parent chain is deeper than 2048 frames",
+        format!(
+            "node parent chain is deeper than {} frames",
+            crate::trace::MAX_DEPTH
+        ),
     ))
+}
+
+/// `convert` and non-V8 `--format cpuprofile` write this shape: `scriptId` `"0"`
+/// on every frame and `startTime` 0. A repeated sample id in that shape is a
+/// folded stack stored twice, not a V8 clock, and a bare name has no runtime.
+pub(crate) fn is_rebuilt_cpuprofile(root: &Value) -> bool {
+    if start_time(root) != 0 {
+        return false;
+    }
+    let Some(nodes) = root.get("nodes").and_then(Value::as_array) else {
+        return false;
+    };
+    !nodes.is_empty()
+        && nodes
+            .iter()
+            .all(|node| match node.pointer("/callFrame/scriptId") {
+                Some(Value::String(text)) => text == "0",
+                Some(Value::Number(number)) => number.as_u64() == Some(0),
+                _ => false,
+            })
+}
+
+fn start_time(root: &Value) -> i64 {
+    let Some(value) = root.get("startTime") else {
+        return 0;
+    };
+    if let Some(number) = value.as_i64() {
+        return number;
+    }
+    let Some(number) = value.as_f64() else {
+        return 0;
+    };
+    if number.is_finite() && number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+        number.round() as i64
+    } else {
+        0
+    }
 }
 
 fn add_stack(
@@ -456,7 +511,7 @@ impl Trie {
                 json!({
                     "id": index as u64 + 1,
                     "callFrame": {
-                        "functionName": node.frame.name,
+                        "functionName": format_symbol(&node.frame),
                         "scriptId": "0",
                         "url": url,
                         "lineNumber": line,
@@ -571,11 +626,13 @@ mod tests {
             .iter()
             .map(|node| node["callFrame"]["functionName"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"work"));
-        assert!(names.contains(&"main"));
-        assert!(names.iter().all(|name| !name.starts_with('[')));
+        assert!(names.contains(&"[browser] work"));
+        assert!(names.contains(&"[browser] main"));
+        assert_eq!(names[0], "(root)");
 
-        let again = import_cpuprofile(&bytes, Runtime::Browser).unwrap();
+        // The prefix is the runtime. Re-importing with a different default
+        // must not relabel the frames.
+        let again = import_cpuprofile(&bytes, Runtime::Node).unwrap();
         assert_eq!(again.stacks.len(), original.stacks.len());
         assert_eq!(again.stacks[0].frames[0].runtime, Runtime::Browser);
         assert_eq!(again.stacks[0].frames[0].name, "work");
@@ -673,5 +730,22 @@ mod tests {
         assert_eq!(profile.stacks[0].frames[0].runtime, Runtime::Native);
         assert_eq!(profile.stacks[0].frames[0].name, "main");
         assert_eq!(profile.stacks[0].weight, 2);
+    }
+
+    #[test]
+    fn rebuilt_file_without_a_prefix_is_native_even_when_the_caller_says_node() {
+        let raw = r#"{
+          "nodes": [
+            {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": [2]},
+            {"id": 2, "callFrame": {"functionName": "work", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": []}
+          ],
+          "startTime": 0,
+          "samples": [2],
+          "timeDeltas": [4]
+        }"#;
+        let profile = import_cpuprofile(raw.as_bytes(), Runtime::Node).unwrap();
+        assert_eq!(profile.stacks[0].frames[0].name, "work");
+        assert_eq!(profile.stacks[0].frames[0].runtime, Runtime::Native);
+        assert_eq!(profile.stacks[0].weight, 4);
     }
 }

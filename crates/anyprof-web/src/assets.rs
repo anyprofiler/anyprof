@@ -1,13 +1,14 @@
-use include_dir::{Dir, include_dir};
-
-/// speedscope's static build, one `<name>.gz` per file. See
-/// `scripts/vendor-speedscope.sh`.
-static SPEEDSCOPE: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/vendor/speedscope");
+//! The viewer's static files, gzip-compressed by `build.rs`.
+//!
+//! `index.html`, `app.css`, and `app.js` are the whole UI. Profile names are
+//! not interpolated into them.
 
 /// One embedded file, stored gzip-compressed.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Asset {
+    /// Gzip-compressed bytes.
     pub gzip: &'static [u8],
+    /// `Content-Type` for the uncompressed file.
     pub content_type: &'static str,
 }
 
@@ -16,32 +17,27 @@ pub(crate) fn lookup(name: &str) -> Option<Asset> {
     if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
         return None;
     }
-    let file = SPEEDSCOPE.get_file(format!("{name}.gz"))?;
-    Some(Asset {
-        gzip: file.contents(),
-        content_type: content_type(name),
-    })
+    let (gzip, content_type) = match name {
+        "index.html" => (
+            include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz")).as_slice(),
+            "text/html; charset=utf-8",
+        ),
+        "app.css" => (
+            include_bytes!(concat!(env!("OUT_DIR"), "/app.css.gz")).as_slice(),
+            "text/css; charset=utf-8",
+        ),
+        "app.js" => (
+            include_bytes!(concat!(env!("OUT_DIR"), "/app.js.gz")).as_slice(),
+            "text/javascript; charset=utf-8",
+        ),
+        _ => return None,
+    };
+    Some(Asset { gzip, content_type })
 }
 
 #[cfg(test)]
 pub(crate) fn names() -> impl Iterator<Item = &'static str> {
-    SPEEDSCOPE
-        .files()
-        .filter_map(|file| file.path().to_str()?.strip_suffix(".gz"))
-}
-
-fn content_type(name: &str) -> &'static str {
-    match name.rsplit_once('.').map(|(_, ext)| ext) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("json") => "application/json",
-        Some("txt") => "text/plain; charset=utf-8",
-        Some("png") => "image/png",
-        Some("ico") => "image/x-icon",
-        Some("woff2") => "font/woff2",
-        _ => "application/octet-stream",
-    }
+    ["index.html", "app.css", "app.js"].into_iter()
 }
 
 #[cfg(test)]
@@ -59,40 +55,23 @@ mod tests {
     }
 
     #[test]
-    fn every_file_index_and_css_reference_is_embedded() {
+    fn the_page_references_only_the_embedded_assets() {
         let index = gunzip(lookup("index.html").unwrap().gzip);
-        let css_name = names().find(|name| name.ends_with(".css")).unwrap();
-        let css = gunzip(lookup(css_name).unwrap().gzip);
-        let mut referenced = Vec::new();
-        for source in [&index, &css] {
-            for piece in source.split(['"', '(', ')']) {
-                let piece = piece.trim_start_matches("./");
-                let is_asset = [".js", ".css", ".png", ".ico", ".woff2"]
-                    .iter()
-                    .any(|ext| piece.ends_with(ext));
-                if is_asset && !piece.contains([' ', '<', '>', '=']) {
-                    referenced.push(piece.to_string());
-                }
-            }
-        }
-        assert!(referenced.len() >= 6, "{referenced:?}");
-        for name in referenced {
-            assert!(lookup(&name).is_some(), "{name} is referenced but missing");
-        }
-    }
-
-    #[test]
-    fn the_example_profile_and_jfr_wasm_are_not_shipped() {
+        assert!(index.contains("app.css"));
+        assert!(index.contains("app.js"));
+        assert!(!index.contains("speedscope"));
+        assert!(!index.contains("http://"));
+        assert!(!index.contains("https://"));
         for name in names() {
-            assert!(!name.starts_with("perf-vertx-"), "{name}");
-            assert!(!name.ends_with(".wasm"), "{name}");
+            assert!(lookup(name).is_some(), "{name}");
         }
-        assert!(gunzip(lookup("release.txt").unwrap().gzip).starts_with("speedscope@1.25.0\n"));
     }
 
     #[test]
     fn lookup_only_accepts_bare_names() {
         assert!(lookup("index.html").is_some());
+        assert!(lookup("app.js").is_some());
+        assert!(lookup("app.css").is_some());
         for name in [
             "",
             "../index.html",
@@ -102,6 +81,7 @@ mod tests {
             "index.html.gz",
             ".",
             "..",
+            "profile",
         ] {
             assert!(lookup(name).is_none(), "{name:?}");
         }
@@ -113,12 +93,13 @@ mod tests {
             lookup("index.html").unwrap().content_type,
             "text/html; charset=utf-8"
         );
-        let js = names().find(|name| name.ends_with(".js")).unwrap();
         assert_eq!(
-            lookup(js).unwrap().content_type,
+            lookup("app.js").unwrap().content_type,
             "text/javascript; charset=utf-8"
         );
-        let font = names().find(|name| name.ends_with(".woff2")).unwrap();
-        assert_eq!(lookup(font).unwrap().content_type, "font/woff2");
+        assert_eq!(
+            lookup("app.css").unwrap().content_type,
+            "text/css; charset=utf-8"
+        );
     }
 }

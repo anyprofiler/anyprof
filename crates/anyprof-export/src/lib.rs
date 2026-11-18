@@ -17,12 +17,17 @@ mod pprof;
 mod proto;
 mod speedscope;
 mod symbol;
+mod trace;
 
 use anyprof_core::{Profile, Runtime};
 
 pub use anyprof_core::Format;
 pub use cpuprofile::import_cpuprofile;
 pub use error::Error;
+pub use trace::{
+    Activity, Aggregate, FunctionRow, Query, Trace, TrackKind, TreeNode, ViewFrame, ViewThread,
+    WeightKind, activity, aggregate, load_trace,
+};
 
 /// Encode `profile` as `format`.
 pub fn export(profile: &Profile, format: Format) -> Result<Vec<u8>, Error> {
@@ -91,8 +96,10 @@ pub fn import(bytes: &[u8], format: Format) -> Result<Profile, Error> {
         Format::Collapsed => collapsed::import(bytes),
         Format::Pprof => pprof::import(bytes),
         Format::Speedscope => speedscope::import(bytes),
-        // Files saved by Node or Chrome have no runtime prefix, so frames are Node.
+        // A V8 document has no runtime prefix, so frames use Node.
         // Browser capture calls [`import_cpuprofile`] with [`Runtime::Browser`].
+        // A rebuilt file (`scriptId` 0, `startTime` 0) keeps a `[runtime]` prefix
+        // and leaves a bare name native.
         Format::Cpuprofile => import_cpuprofile(bytes, Runtime::Node),
     }
 }
