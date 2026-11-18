@@ -4,10 +4,14 @@
 //! interpreter frame, not from a native unwind of `libjvm`.
 //!
 //! `ANYPROF_REQUIRE_NATIVE=1` (set by CI on the sampling jobs) turns a skip
-//! into a failure. CI installs a JDK 21 and leaves `java` on `PATH`.
-//! On Linux, an unrelated same-user process is refused while
-//! `kernel.yama.ptrace_scope` is 1 and is sampled once that scope is 0.
-//! The MSRV job does not set the variable and does not install a JDK.
+//! into a failure and requires `ANYPROF_JAVA_17`, `ANYPROF_JAVA_21`, and
+//! `ANYPROF_JAVA_25`. Each test samples all three. A permission denial is
+//! never skipped in that mode. Without the variable, one JDK from
+//! `ANYPROF_JAVA`, `JAVA_HOME`, or `PATH` is enough, and a documented
+//! permission denial is skipped. On Linux, an unrelated same-user process is
+//! refused while `kernel.yama.ptrace_scope` is 1 and is sampled once that
+//! scope is 0. The MSRV job does not set the variable and does not install
+//! a JDK.
 
 #[cfg(any(
     target_os = "macos",
@@ -142,10 +146,19 @@ public class AnyprofSpin {
     #[test]
     fn unrelated_same_user_read_follows_ptrace_scope() {
         let _lock = LiveLock::acquire();
-        let Some(java) = java_bin() else {
+        let jdks = jdks();
+        if jdks.is_empty() {
             return;
-        };
-        let Some(dir) = compile_fixture("orphan") else {
+        }
+        for jdk in jdks {
+            unrelated_one(&jdk);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unrelated_one(jdk: &Jdk) {
+        let java = &jdk.java;
+        let Some(dir) = compile_fixture(&format!("orphan-{}", jdk.label), java) else {
             return;
         };
         let scope = ptrace_scope();
@@ -175,7 +188,7 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
         let mut child = Command::new(&python)
             .arg("-c")
             .arg(script)
-            .arg(&java)
+            .arg(java)
             .arg(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -233,13 +246,20 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
     }
 
     fn sample_busy(interpret: bool) {
-        let Some(java) = java_bin() else {
+        for jdk in jdks() {
+            sample_busy_one(&jdk, interpret);
+        }
+    }
+
+    fn sample_busy_one(jdk: &Jdk, interpret: bool) {
+        let java = &jdk.java;
+        let Some(dir) = compile_fixture(
+            &format!("{}-{}", if interpret { "xint" } else { "busy" }, jdk.label),
+            java,
+        ) else {
             return;
         };
-        let Some(dir) = compile_fixture(if interpret { "xint" } else { "busy" }) else {
-            return;
-        };
-        let mut command = Command::new(&java);
+        let mut command = Command::new(java);
         command.arg("-XX:CompileCommand=dontinline,AnyprofSpin.spin");
         if interpret {
             command.arg("-Xint");
@@ -297,13 +317,17 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
     }
 
     fn sample_idle() {
-        let Some(java) = java_bin() else {
+        for jdk in jdks() {
+            sample_idle_one(&jdk);
+        }
+    }
+
+    fn sample_idle_one(jdk: &Jdk) {
+        let java = &jdk.java;
+        let Some(dir) = compile_fixture(&format!("idle-{}", jdk.label), java) else {
             return;
         };
-        let Some(dir) = compile_fixture("idle") else {
-            return;
-        };
-        let mut child = Command::new(&java)
+        let mut child = Command::new(java)
             .arg("-cp")
             .arg(&dir)
             .arg("AnyprofSpin")
@@ -340,13 +364,17 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
     }
 
     fn sample_threads() {
-        let Some(java) = java_bin() else {
+        for jdk in jdks() {
+            sample_threads_one(&jdk);
+        }
+    }
+
+    fn sample_threads_one(jdk: &Jdk) {
+        let java = &jdk.java;
+        let Some(dir) = compile_fixture(&format!("threads-{}", jdk.label), java) else {
             return;
         };
-        let Some(dir) = compile_fixture("threads") else {
-            return;
-        };
-        let mut child = Command::new(&java)
+        let mut child = Command::new(java)
             .arg("-cp")
             .arg(&dir)
             .arg("AnyprofSpin")
@@ -490,11 +518,11 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             Ok(session) => Some(session),
             Err(err) => {
                 let message = err.to_string();
-                let denied = !message.contains("process_vm_readv")
-                    && (message.contains("perf_event_open")
-                        || message.contains("task_for_pid")
-                        || message.contains("not permitted")
-                        || message.contains("Operation not permitted"));
+                let denied = message.contains("process_vm_readv")
+                    || message.contains("perf_event_open")
+                    || message.contains("task_for_pid")
+                    || message.contains("not permitted")
+                    || message.contains("Operation not permitted");
                 if denied && !required() {
                     eprintln!("skipping live java sample: {message}");
                     return None;
@@ -504,39 +532,79 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
         }
     }
 
-    fn java_bin() -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("ANYPROF_JAVA")
-            && !path.is_empty()
-            && Path::new(&path).is_file()
-        {
-            return Some(PathBuf::from(path));
-        }
-        if let Ok(home) = std::env::var("JAVA_HOME") {
-            let name = if cfg!(windows) { "java.exe" } else { "java" };
-            let bin = PathBuf::from(home).join("bin").join(name);
-            if bin.is_file() {
-                return Some(bin);
-            }
-        }
-        let found = if cfg!(windows) {
-            Command::new("where").arg("java").output().ok()
-        } else {
-            Command::new("which").arg("java").output().ok()
-        };
-        if let Some(output) = found.filter(|output| output.status.success()) {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Some(line) = text.lines().find(|line| !line.trim().is_empty()) {
-                let path = PathBuf::from(line.trim());
-                if path.is_file() {
-                    return Some(path);
+    struct Jdk {
+        label: &'static str,
+        java: PathBuf,
+    }
+
+    /// JDKs this test must sample.
+    ///
+    /// The required matrix sets `ANYPROF_JAVA_17`, `ANYPROF_JAVA_21`, and
+    /// `ANYPROF_JAVA_25` to a home or a `java` binary. A missing one fails.
+    /// Otherwise one JDK from `ANYPROF_JAVA`, `JAVA_HOME`, or `PATH` is used,
+    /// and no JDK at all is a skip.
+    fn jdks() -> Vec<Jdk> {
+        let required_keys = [
+            ("ANYPROF_JAVA_17", "17"),
+            ("ANYPROF_JAVA_21", "21"),
+            ("ANYPROF_JAVA_25", "25"),
+        ];
+        let mut found = Vec::new();
+        for (key, label) in required_keys {
+            match resolve_java(&std::env::var(key).unwrap_or_default()) {
+                Some(java) => found.push(Jdk { label, java }),
+                None if required() => {
+                    panic!("{key} must be a JDK {label} home or java binary");
                 }
+                None => {}
             }
+        }
+        if !found.is_empty() {
+            return found;
+        }
+        if let Some(java) = resolve_java(&std::env::var("ANYPROF_JAVA").unwrap_or_default())
+            .or_else(|| resolve_java(&std::env::var("JAVA_HOME").unwrap_or_default()))
+            .or_else(java_on_path)
+        {
+            return vec![Jdk {
+                label: "default",
+                java,
+            }];
         }
         if required() {
             panic!("no java executable was found");
         }
         eprintln!("skipping live java sample: java was not found");
-        None
+        Vec::new()
+    }
+
+    fn resolve_java(value: &str) -> Option<PathBuf> {
+        if value.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+        let name = if cfg!(windows) { "java.exe" } else { "java" };
+        let bin = path.join("bin").join(name);
+        bin.is_file().then_some(bin)
+    }
+
+    fn java_on_path() -> Option<PathBuf> {
+        let found = if cfg!(windows) {
+            Command::new("where").arg("java").output().ok()
+        } else {
+            Command::new("which").arg("java").output().ok()
+        }?;
+        if !found.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&found.stdout);
+        text.lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| PathBuf::from(line.trim()))
+            .filter(|path| path.is_file())
     }
 
     fn javac_for(java: &Path) -> Option<PathBuf> {
@@ -560,9 +628,8 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             .filter(|path| path.is_file())
     }
 
-    fn compile_fixture(name: &str) -> Option<PathBuf> {
-        let java = java_bin()?;
-        let Some(javac) = javac_for(&java) else {
+    fn compile_fixture(name: &str, java: &Path) -> Option<PathBuf> {
+        let Some(javac) = javac_for(java) else {
             if required() {
                 panic!("javac was not found next to {}", java.display());
             }
@@ -658,7 +725,14 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
         let exe = std::env::current_exe().expect("test executable");
         let mut command = Command::new("sudo");
         command.args(["-n", "env", "ANYPROF_JAVA_WORKER=1"]);
-        for key in ["ANYPROF_JAVA", "JAVA_HOME", "PATH"] {
+        for key in [
+            "ANYPROF_JAVA_17",
+            "ANYPROF_JAVA_21",
+            "ANYPROF_JAVA_25",
+            "ANYPROF_JAVA",
+            "JAVA_HOME",
+            "PATH",
+        ] {
             if let Ok(value) = std::env::var(key)
                 && !value.is_empty()
             {

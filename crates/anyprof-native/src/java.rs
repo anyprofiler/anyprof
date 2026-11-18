@@ -18,18 +18,31 @@
 //! * A blob whose name is `Interpreter` and whose frame size is 0 is the
 //!   template interpreter. The method is the slot at
 //!   `interpreter_frame_last_sp_offset - 1`. That is `-3` words from the
-//!   frame pointer when the exported constants are `sender_sp = -1` and
-//!   `last_sp = -2`, which is the JDK 17, 21, and 25 layout on x86_64 and
-//!   aarch64. The stored sender SP and the saved frame pointer are the
-//!   caller. Any other pair of constants is refused.
+//!   frame pointer when the constants are `sender_sp = -1` and
+//!   `last_sp = -2`. x86_64 exports that pair and any other exported pair is
+//!   refused. aarch64's `VM_INT_CONSTANTS_CPU` is empty in JDK 17, 21, and 25,
+//!   and those three `frame_aarch64.hpp` headers define the same pair. The
+//!   empty table is used only when the mapped libjvm is aarch64 (ELF
+//!   `e_machine`, the mapped Mach-O `cputype`, or the PE machine) and
+//!   `Abstract_VM_Version._vm_major_version` is 17, 21, or 25. A missing pair
+//!   on x86_64, on another version, or when only one constant is present, is
+//!   refused. The stored sender SP and the saved frame pointer are the caller.
 //!
 //! A stub, an unreadable method, or a leaf outside the code cache keeps the
 //! native walk and is not labeled Java. A denied read does not: `prepare_java`
 //! fails `start` before a profile exists. anyprof does not change sysctls.
 //!
-//! The product `GrowableArrayBase` is 8 bytes and `HeapBlock` is 16. A debug
-//! JVM, a 32-bit JVM, or a HotSpot that does not export these fields is
-//! refused instead of walked with a guessed layout.
+//! `HeapBlock` and `GrowableArrayBase` come from the same tables. JDK 17 and
+//! 21 have a 16-byte `HeapBlock` with `_used` at 8 (`size_t` length) and store
+//! the instruction range in `CodeBlob._code_begin` and `_code_end`. JDK 25
+//! has an 8-byte `HeapBlock` with `_used` at 4 (`uint32_t` length) and stores
+//! `_code_offset` and `_data_offset`; the range is `this + offset`. A JDK 25
+//! build that also exports the pointer fields is refused. The code
+//! cache array is the 8-byte product `GrowableArrayBase` (`_max` on 17,
+//! `_capacity` on 21 and 25, data pointer at 8). The compiled `Method*` is
+//! `CompiledMethod._method` on 17 and 21 and `nmethod._method` on 25. A debug
+//! JVM, a 32-bit JVM, another version, or a HotSpot whose exported offsets do
+//! not match that version is refused instead of walked with a guessed layout.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -70,8 +83,7 @@ const HOTSPOT_SYMBOLS: &[&str] = &[
 /// Byte offsets and the interpreter slot this process's HotSpot actually uses.
 #[derive(Debug)]
 struct Layout {
-    code_begin: u64,
-    code_end: u64,
+    code_range: CodeRange,
     frame_size: u64,
     blob_size: u64,
     blob_name: u64,
@@ -89,6 +101,12 @@ struct Layout {
     vs_low: u64,
     vs_high: u64,
     heap_block: u64,
+    /// Byte offset of `HeapBlock::Header._used` from the start of the block.
+    heap_used: u64,
+    /// `GrowableArrayBase._len`, the capacity field, and `GrowableArray<int>._data`.
+    array_len: u64,
+    array_cap: u64,
+    array_data: u64,
     cp_size: u64,
     /// Words from the interpreter frame pointer to the `Method*`.
     method_words: i32,
@@ -174,12 +192,12 @@ impl JavaVm {
             return None;
         }
         let heaps = read_u64(read, self.heaps)?;
-        let len = read_i32(read, heaps)?;
-        let capacity = read_i32(read, heaps.checked_add(4)?)?;
+        let len = read_i32(read, heaps.checked_add(self.layout.array_len)?)?;
+        let capacity = read_i32(read, heaps.checked_add(self.layout.array_cap)?)?;
         if len <= 0 || len > MAX_HEAPS || capacity < len {
             return None;
         }
-        let data = read_u64(read, heaps.checked_add(WORD)?)?;
+        let data = read_u64(read, heaps.checked_add(self.layout.array_data)?)?;
         for index in 0..len {
             let slot = data.checked_add(u64::from(index as u32) * WORD)?;
             let heap = read_u64(read, slot)?;
@@ -232,18 +250,17 @@ impl JavaVm {
         }
         let block = low.checked_add(seg << log2)?;
         let mut used = [0u8; 1];
-        if !read(block.checked_add(WORD)?, &mut used) || used[0] == 0 {
+        if !read(block.checked_add(self.layout.heap_used)?, &mut used) || used[0] == 0 {
             return None;
         }
         let blob = block.checked_add(self.layout.heap_block)?;
-        let begin = read_u64(read, blob.checked_add(self.layout.code_begin)?)?;
-        let end = read_u64(read, blob.checked_add(self.layout.code_end)?)?;
-        if pc < begin || pc >= end {
-            return None;
-        }
         let frame_words = read_i32(read, blob.checked_add(self.layout.frame_size)?)?;
         let size = read_i32(read, blob.checked_add(self.layout.blob_size)?)?;
         if size <= 0 {
+            return None;
+        }
+        let (begin, end) = code_bounds(blob, size, self.layout.code_range, read)?;
+        if pc < begin || pc >= end {
             return None;
         }
         let name = read_u64(read, blob.checked_add(self.layout.blob_name)?).unwrap_or(0);
@@ -442,6 +459,7 @@ where
 fn open_linux(pid: u32) -> Result<JavaVm, String> {
     let (path, spans) = linux_libjvm(pid)?;
     let file = elf_hotspot(&path)?;
+    let arch = file.arch;
     let slide = elf_slide(&spans, &path, file.load_offset, file.load_vaddr).ok_or_else(|| {
         format!(
             "libjvm at {} is mapped, but its load bias could not be resolved",
@@ -456,9 +474,11 @@ fn open_linux(pid: u32) -> Result<JavaVm, String> {
         .get("gHotSpotVMStructs")
         .ok_or_else(|| "libjvm does not export gHotSpotVMStructs".to_string())?;
     probe_linux(pid, probe)?;
-    load_layout(&runtime, &mut |addr, buf| {
-        linux_read(pid, addr, buf).is_ok()
-    })
+    load_layout(
+        &runtime,
+        &mut |addr, buf| linux_read(pid, addr, buf).is_ok(),
+        arch,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -470,8 +490,9 @@ where
         .iter()
         .find(|(path, _, _)| is_libjvm(path))
         .ok_or_else(|| "libjvm was not in the process image list".to_string())?;
-    let symbols = macho_hotspot(Path::new(path), *load)?;
-    load_layout(&symbols, read)
+    let arch = mapped_mach_arch(*load, read)?;
+    let symbols = macho_hotspot(Path::new(path), *load, arch)?;
+    load_layout(&symbols, read, arch)
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -483,11 +504,15 @@ where
     R: FnMut(u64, &mut [u8]) -> bool,
 {
     let (path, base) = windows_libjvm(process)?;
-    let symbols = pe_hotspot(&path, base)?;
-    load_layout(&symbols, read)
+    let (symbols, arch) = pe_hotspot(&path, base)?;
+    load_layout(&symbols, read, arch)
 }
 
-fn load_layout<R>(symbols: &HashMap<String, u64>, read: &mut R) -> Result<JavaVm, String>
+fn load_layout<R>(
+    symbols: &HashMap<String, u64>,
+    read: &mut R,
+    arch: JvmArch,
+) -> Result<JavaVm, String>
 where
     R: FnMut(u64, &mut [u8]) -> bool,
 {
@@ -577,30 +602,41 @@ where
         }
         Ok(*address)
     };
-    let code_begin = instance("CodeBlob", "_code_begin")?;
-    if !code_begin.is_multiple_of(WORD) {
-        return Err(
-            "HotSpot pointers are not 8 bytes wide, so this JVM was not walked".to_string(),
-        );
-    }
     let types = read_type_sizes(read, &resolved)?;
+    let major = hotspot_major(
+        read,
+        static_addr("Abstract_VM_Version", "_vm_major_version")?,
+    )?;
     let heap_block = *types.get("HeapBlock").ok_or_else(|| {
         "HotSpot VM types are missing HeapBlock, so Java methods were not walked".to_string()
     })?;
-    if heap_block != 16 {
-        return Err(format!(
-            "HeapBlock is {heap_block} bytes; this build walks the 16-byte product header"
-        ));
-    }
+    let heap_used = heap_used_offset(
+        major,
+        heap_block,
+        instance("HeapBlock", "_header")?,
+        instance("HeapBlock::Header", "_length")?,
+        instance("HeapBlock::Header", "_used")?,
+    )?;
     let array_base = *types.get("GrowableArrayBase").ok_or_else(|| {
         "HotSpot VM types are missing GrowableArrayBase, so the code cache was not walked"
             .to_string()
     })?;
-    if array_base != 8 {
-        return Err(format!(
-            "GrowableArrayBase is {array_base} bytes; this build walks the 8-byte product layout"
-        ));
-    }
+    let cap_field = match major {
+        17 => "_max",
+        21 | 25 => "_capacity",
+        _ => {
+            return Err(format!(
+                "HotSpot {major} is not a walked LTS (17, 21, or 25), so Java methods were not walked"
+            ));
+        }
+    };
+    let (array_len, array_cap, array_data) = array_offsets(
+        major,
+        array_base,
+        instance("GrowableArrayBase", "_len")?,
+        instance("GrowableArrayBase", cap_field)?,
+        instance("GrowableArray<int>", "_data")?,
+    )?;
     let cp_size = *types.get("ConstantPool").ok_or_else(|| {
         "HotSpot VM types are missing ConstantPool, so method names were not read".to_string()
     })?;
@@ -609,20 +645,46 @@ where
             "ConstantPool is {cp_size} bytes, which this build does not use for method names"
         ));
     }
-    let (sender_sp, last_sp) = read_frame_constants(read, &resolved)?;
-    let method_words = interpreter_method_words(sender_sp, last_sp).ok_or_else(|| {
-        format!(
-            "HotSpot interpreter frame layout is not the supported one (sender_sp {sender_sp}, last_sp {last_sp}); Java methods were not walked"
-        )
-    })?;
+    let vs_low = instance("VirtualSpace", "_low")?;
+    if vs_low == 0 || !vs_low.is_multiple_of(WORD) {
+        return Err(
+            "HotSpot pointers are not 8 bytes wide, so this JVM was not walked".to_string(),
+        );
+    }
+    let code_range = match major {
+        17 | 21 => pointer_code_range(
+            instance("CodeBlob", "_code_begin")?,
+            instance("CodeBlob", "_code_end")?,
+        )?,
+        25 => {
+            if fields.contains_key(&("CodeBlob".to_string(), "_code_begin".to_string()))
+                || fields.contains_key(&("CodeBlob".to_string(), "_code_end".to_string()))
+            {
+                return Err(
+                    "HotSpot 25 exported stored code pointers, which this build does not walk"
+                        .to_string(),
+                );
+            }
+            offset_code_range(
+                instance("CodeBlob", "_code_offset")?,
+                instance("CodeBlob", "_data_offset")?,
+            )?
+        }
+        _ => {
+            return Err(format!(
+                "HotSpot {major} is not a walked LTS (17, 21, or 25), so Java methods were not walked"
+            ));
+        }
+    };
+    let method_words = interpreter_slot(read_frame_constants(read, &resolved)?, arch, major)?;
+    let method_type = compiled_method_type(major)?;
     Ok(JavaVm {
         layout: Layout {
-            code_begin,
-            code_end: instance("CodeBlob", "_code_end")?,
+            code_range,
             frame_size: instance("CodeBlob", "_frame_size")?,
             blob_size: instance("CodeBlob", "_size")?,
             blob_name: instance("CodeBlob", "_name")?,
-            compiled_method: instance("CompiledMethod", "_method")?,
+            compiled_method: instance(method_type, "_method")?,
             const_method: instance("Method", "_constMethod")?,
             constants: instance("ConstMethod", "_constants")?,
             name_index: instance("ConstMethod", "_name_index")?,
@@ -633,9 +695,13 @@ where
             heap_memory: instance("CodeHeap", "_memory")?,
             heap_segmap: instance("CodeHeap", "_segmap")?,
             heap_log2: instance("CodeHeap", "_log2_segment_size")?,
-            vs_low: instance("VirtualSpace", "_low")?,
+            vs_low,
             vs_high: instance("VirtualSpace", "_high")?,
             heap_block,
+            heap_used,
+            array_len,
+            array_cap,
+            array_data,
             cp_size,
             method_words,
         },
@@ -684,7 +750,173 @@ where
     Ok(sizes)
 }
 
-fn read_frame_constants<R>(read: &mut R, sym: &HashMap<&str, u64>) -> Result<(i32, i32), String>
+/// CPU of the libjvm image that was actually mapped, not of this process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JvmArch {
+    X86_64,
+    Aarch64,
+}
+
+impl JvmArch {
+    fn label(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+}
+
+/// `Abstract_VM_Version._vm_major_version`, which HotSpot sets from
+/// `VERSION_FEATURE`. Only 17, 21, and 25 are walked.
+fn hotspot_major<R>(read: &mut R, address: u64) -> Result<i32, String>
+where
+    R: FnMut(u64, &mut [u8]) -> bool,
+{
+    let major = read_i32(read, address).ok_or_else(|| {
+        "cannot read Abstract_VM_Version._vm_major_version, so Java methods were not walked"
+            .to_string()
+    })?;
+    if matches!(major, 17 | 21 | 25) {
+        Ok(major)
+    } else {
+        Err(format!(
+            "HotSpot {major} is not a walked LTS (17, 21, or 25), so Java methods were not walked"
+        ))
+    }
+}
+
+/// Where a blob's instructions live.
+///
+/// JDK 17 and 21 store absolute `_code_begin` and `_code_end` pointers. JDK 25
+/// stores `_code_offset` and `_data_offset`; `code_begin()` is `this +
+/// _code_offset` and `code_end()` is `this + _data_offset`.
+#[derive(Clone, Copy, Debug)]
+enum CodeRange {
+    Pointers { begin: u64, end: u64 },
+    Offsets { code: u64, data: u64 },
+}
+
+fn pointer_code_range(begin: u64, end: u64) -> Result<CodeRange, String> {
+    if begin.is_multiple_of(WORD) && end.is_multiple_of(WORD) && begin != end {
+        Ok(CodeRange::Pointers { begin, end })
+    } else {
+        Err(format!(
+            "CodeBlob code pointers are not 8-byte fields (begin {begin}, end {end}), so Java methods were not walked"
+        ))
+    }
+}
+
+fn offset_code_range(code: u64, data: u64) -> Result<CodeRange, String> {
+    if code < 4096 && data < 4096 && code != data {
+        Ok(CodeRange::Offsets { code, data })
+    } else {
+        Err(format!(
+            "HotSpot 25 code offsets are not the product header (code {code}, data {data}), so Java methods were not walked"
+        ))
+    }
+}
+
+fn code_bounds<R>(blob: u64, size: i32, range: CodeRange, read: &mut R) -> Option<(u64, u64)>
+where
+    R: FnMut(u64, &mut [u8]) -> bool,
+{
+    match range {
+        CodeRange::Pointers { begin, end } => {
+            let begin = read_u64(read, blob.checked_add(begin)?)?;
+            let end = read_u64(read, blob.checked_add(end)?)?;
+            (begin < end).then_some((begin, end))
+        }
+        CodeRange::Offsets { code, data } => {
+            let code_off = read_i32(read, blob.checked_add(code)?)?;
+            let data_off = read_i32(read, blob.checked_add(data)?)?;
+            if code_off <= 0 || data_off <= code_off || data_off > size {
+                return None;
+            }
+            Some((
+                blob.checked_add(u64::try_from(code_off).ok()?)?,
+                blob.checked_add(u64::try_from(data_off).ok()?)?,
+            ))
+        }
+    }
+}
+
+/// Used-byte offset of the product `HeapBlock` for this major version.
+///
+/// The numbers have to be the ones the struct table exported. JDK 17 and 21
+/// pad `size_t _length` plus `bool _used` to 16 bytes, so `_used` is at 8.
+/// JDK 25 changed the length to `uint32_t` and pads the header to 8 bytes, so
+/// `_used` is at 4. `allocated_space()` is `this + 1`, which is `size`.
+fn heap_used_offset(
+    major: i32,
+    size: u64,
+    header: u64,
+    length: u64,
+    used: u64,
+) -> Result<u64, String> {
+    let (want_size, want_used) = match major {
+        17 | 21 => (16, 8),
+        25 => (8, 4),
+        _ => {
+            return Err(format!(
+                "HotSpot {major} is not a walked LTS (17, 21, or 25), so Java methods were not walked"
+            ));
+        }
+    };
+    let used_at = header.checked_add(used).ok_or_else(|| {
+        "HeapBlock used offset overflowed, so Java methods were not walked".to_string()
+    })?;
+    if size == want_size && header == 0 && length == 0 && used == want_used && used_at < size {
+        return Ok(used_at);
+    }
+    Err(format!(
+        "HeapBlock for HotSpot {major} is size {size}, header {header}, length {length}, used {used}; this build walks the product header (16 bytes, used at 8 on 17 and 21; 8 bytes, used at 4 on 25)"
+    ))
+}
+
+/// Product code-cache array: two ints, then the data pointer.
+///
+/// JDK 17 names the second int `_max`. JDK 21 and 25 name it `_capacity`.
+/// The offsets are the same. `GrowableArray<int>._data` is the pointer used
+/// for every element type, because it sits at the end of the 8-byte base.
+fn array_offsets(
+    major: i32,
+    size: u64,
+    len: u64,
+    cap: u64,
+    data: u64,
+) -> Result<(u64, u64, u64), String> {
+    if matches!(major, 17 | 21 | 25) && size == 8 && len == 0 && cap == 4 && data == 8 {
+        return Ok((len, cap, data));
+    }
+    Err(format!(
+        "GrowableArray for HotSpot {major} is size {size}, _len {len}, capacity {cap}, _data {data}; this build walks the 8-byte product layout with the data pointer at 8"
+    ))
+}
+
+/// Type that holds the compiled `Method*`.
+///
+/// JDK 25 removed `CompiledMethod` and exports `nmethod._method`.
+fn compiled_method_type(major: i32) -> Result<&'static str, String> {
+    match major {
+        17 | 21 => Ok("CompiledMethod"),
+        25 => Ok("nmethod"),
+        _ => Err(format!(
+            "HotSpot {major} is not a walked LTS (17, 21, or 25), so Java methods were not walked"
+        )),
+    }
+}
+
+/// Interpreter slot from the serviceability table, or absent.
+#[derive(Clone, Copy)]
+enum InterpreterLayout {
+    Exported { sender_sp: i32, last_sp: i32 },
+    Unexported,
+}
+
+fn read_frame_constants<R>(
+    read: &mut R,
+    sym: &HashMap<&str, u64>,
+) -> Result<InterpreterLayout, String>
 where
     R: FnMut(u64, &mut [u8]) -> bool,
 {
@@ -699,12 +931,14 @@ where
     }
     let mut sender_sp = None;
     let mut last_sp = None;
+    let mut saw_end = false;
     for index in 0..MAX_CONSTANTS {
         let entry = table
             .checked_add(index as u64 * stride)
             .ok_or_else(|| "HotSpot int-constant table is too large to walk".to_string())?;
         let name_ptr = read_u64(read, entry.checked_add(name_off).unwrap_or(0)).unwrap_or(0);
         if name_ptr == 0 {
+            saw_end = true;
             break;
         }
         let Some(name) = read_cstr(read, name_ptr, 160) else {
@@ -720,12 +954,47 @@ where
             break;
         }
     }
-    match (sender_sp, last_sp) {
-        (Some(sender), Some(last)) => Ok((sender, last)),
+    match (sender_sp, last_sp, saw_end) {
+        (Some(sender_sp), Some(last_sp), _) => {
+            Ok(InterpreterLayout::Exported { sender_sp, last_sp })
+        }
+        (None, None, true) => Ok(InterpreterLayout::Unexported),
+        (None, None, false) => Err(
+            "HotSpot int-constant table did not end, so Java methods were not walked".to_string(),
+        ),
         _ => Err(
-            "HotSpot did not export the interpreter frame constants, so Java methods were not walked"
+            "HotSpot exported only one interpreter frame constant, so Java methods were not walked"
                 .to_string(),
         ),
+    }
+}
+
+/// Method slot from an exported pair, or from the checked aarch64 header.
+///
+/// An exported pair is accepted only when it is `sender_sp = -1` and
+/// `last_sp = -2`. An empty table is accepted only for an aarch64 libjvm
+/// whose major version is 17, 21, or 25: those three `frame_aarch64.hpp`
+/// headers define that pair and their `VM_INT_CONSTANTS_CPU` is empty. x86_64
+/// exports the pair in those releases, so a missing pair there is refused.
+fn interpreter_slot(layout: InterpreterLayout, arch: JvmArch, major: i32) -> Result<i32, String> {
+    match layout {
+        InterpreterLayout::Exported { sender_sp, last_sp } => {
+            interpreter_method_words(sender_sp, last_sp).ok_or_else(|| {
+                format!(
+                    "HotSpot interpreter frame layout is not the supported one (sender_sp {sender_sp}, last_sp {last_sp}); Java methods were not walked"
+                )
+            })
+        }
+        InterpreterLayout::Unexported => {
+            if arch == JvmArch::Aarch64 && matches!(major, 17 | 21 | 25) {
+                Ok(-3)
+            } else {
+                Err(format!(
+                    "HotSpot {} {major} did not export the interpreter frame constants, so Java methods were not walked",
+                    arch.label()
+                ))
+            }
+        }
     }
 }
 
@@ -955,6 +1224,7 @@ fn linux_denied(pid: u32, err: i32) -> String {
 
 #[cfg(target_os = "linux")]
 struct ElfHotspot {
+    arch: JvmArch,
     load_offset: u64,
     load_vaddr: u64,
     values: HashMap<String, u64>,
@@ -978,6 +1248,17 @@ fn elf_hotspot(path: &Path) -> Result<ElfHotspot, String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|_| elf_reject(path))?;
     file.read_exact(&mut ehdr).map_err(|_| elf_reject(path))?;
+    let machine = u16::from_le_bytes(ehdr[18..20].try_into().unwrap());
+    let arch = match machine {
+        62 => JvmArch::X86_64,
+        183 => JvmArch::Aarch64,
+        _ => {
+            return Err(format!(
+                "libjvm at {} has ELF machine {machine}, which this build does not walk",
+                path.display()
+            ));
+        }
+    };
     let phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
     let shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
     let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap());
@@ -1086,6 +1367,7 @@ fn elf_hotspot(path: &Path) -> Result<ElfHotspot, String> {
         ));
     }
     Ok(ElfHotspot {
+        arch,
         load_offset,
         load_vaddr,
         values: wanted,
@@ -1115,15 +1397,52 @@ fn elf_slide(
         .map(|span| span.start.wrapping_sub(load_vaddr))
 }
 
+/// CPU of the Mach-O header mapped at `load`, not of this process.
 #[cfg(target_os = "macos")]
-fn macho_hotspot(path: &Path, load: u64) -> Result<HashMap<String, u64>, String> {
+fn mapped_mach_arch<R>(load: u64, read: &mut R) -> Result<JvmArch, String>
+where
+    R: FnMut(u64, &mut [u8]) -> bool,
+{
+    let mut header = [0u8; 8];
+    if !read(load, &mut header) {
+        return Err(
+            "cannot read the mapped libjvm Mach-O header, so Java methods were not walked"
+                .to_string(),
+        );
+    }
+    let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let cputype = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    // MH_MAGIC_64. A fat header is not what dyld maps.
+    if magic != 0xfeed_facf {
+        return Err(format!(
+            "mapped libjvm magic is {magic:#x}, so Java methods were not walked"
+        ));
+    }
+    match cputype {
+        0x0100_0007 => Ok(JvmArch::X86_64),
+        0x0100_000C => Ok(JvmArch::Aarch64),
+        _ => Err(format!(
+            "mapped libjvm cputype is {cputype:#x}, so Java methods were not walked"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macho_cpu(arch: JvmArch) -> crate::macho::MachCpu {
+    match arch {
+        JvmArch::Aarch64 => crate::macho::MachCpu::Arm64,
+        JvmArch::X86_64 => crate::macho::MachCpu::X86_64,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macho_hotspot(path: &Path, load: u64, arch: JvmArch) -> Result<HashMap<String, u64>, String> {
     let module = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("libjvm.dylib");
-    let image =
-        crate::macho::ImageSymbols::parse_file(path, load, module, crate::macho::MachCpu::host())
-            .ok_or_else(|| {
+    let image = crate::macho::ImageSymbols::parse_file(path, load, module, macho_cpu(arch))
+        .ok_or_else(|| {
             format!(
                 "libjvm at {} has no Mach-O symbol table, so Java methods cannot be read",
                 path.display()
@@ -1311,7 +1630,7 @@ fn windows_libjvm(
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn pe_hotspot(path: &Path, base: u64) -> Result<HashMap<String, u64>, String> {
+fn pe_hotspot(path: &Path, base: u64) -> Result<(HashMap<String, u64>, JvmArch), String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).map_err(|_| {
         format!(
@@ -1335,6 +1654,17 @@ fn pe_hotspot(path: &Path, base: u64) -> Result<HashMap<String, u64>, String> {
     if &pe[0..4] != b"PE\0\0" {
         return Err(pe_reject(path));
     }
+    let machine = u16::from_le_bytes(pe[4..6].try_into().unwrap());
+    let arch = match machine {
+        0x8664 => JvmArch::X86_64,
+        0xAA64 => JvmArch::Aarch64,
+        _ => {
+            return Err(format!(
+                "jvm.dll at {} has PE machine {machine:#x}, which this build does not walk",
+                path.display()
+            ));
+        }
+    };
     let sections = u16::from_le_bytes(pe[6..8].try_into().unwrap());
     let optional_size = u16::from_le_bytes(pe[20..22].try_into().unwrap());
     if sections > 96 || !(120..=4096).contains(&optional_size) {
@@ -1454,7 +1784,7 @@ fn pe_hotspot(path: &Path, base: u64) -> Result<HashMap<String, u64>, String> {
             path.display()
         ));
     }
-    Ok(values)
+    Ok((values, arch))
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -1467,13 +1797,82 @@ fn pe_reject(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::interpreter_method_words;
+    use super::{
+        InterpreterLayout, JvmArch, array_offsets, compiled_method_type, heap_used_offset,
+        interpreter_method_words, interpreter_slot,
+    };
 
     #[test]
-    fn interpreter_slot_is_last_sp_minus_one_for_the_jdk_17_through_25_constants() {
+    fn interpreter_slot_uses_the_header_only_for_checked_aarch64_lts() {
         assert_eq!(interpreter_method_words(-1, -2), Some(-3));
         assert_eq!(interpreter_method_words(-1, -3), None);
         assert_eq!(interpreter_method_words(0, -2), None);
+        let exported = InterpreterLayout::Exported {
+            sender_sp: -1,
+            last_sp: -2,
+        };
+        assert_eq!(
+            interpreter_slot(exported, JvmArch::X86_64, 21).ok(),
+            Some(-3)
+        );
+        assert_eq!(
+            interpreter_slot(exported, JvmArch::Aarch64, 25).ok(),
+            Some(-3)
+        );
+        assert!(
+            interpreter_slot(
+                InterpreterLayout::Exported {
+                    sender_sp: -1,
+                    last_sp: -4,
+                },
+                JvmArch::Aarch64,
+                21,
+            )
+            .is_err()
+        );
+        for major in [17, 21, 25] {
+            assert_eq!(
+                interpreter_slot(InterpreterLayout::Unexported, JvmArch::Aarch64, major).ok(),
+                Some(-3),
+                "aarch64 {major}"
+            );
+            assert!(
+                interpreter_slot(InterpreterLayout::Unexported, JvmArch::X86_64, major).is_err(),
+                "x86_64 {major} must export the pair"
+            );
+        }
+        assert!(interpreter_slot(InterpreterLayout::Unexported, JvmArch::Aarch64, 11).is_err());
+        assert!(interpreter_slot(InterpreterLayout::Unexported, JvmArch::Aarch64, 22).is_err());
+    }
+
+    #[test]
+    fn heap_and_array_layouts_match_only_the_checked_product_headers() {
+        assert_eq!(heap_used_offset(17, 16, 0, 0, 8).ok(), Some(8));
+        assert_eq!(heap_used_offset(21, 16, 0, 0, 8).ok(), Some(8));
+        assert_eq!(heap_used_offset(25, 8, 0, 0, 4).ok(), Some(4));
+        assert!(heap_used_offset(25, 16, 0, 0, 8).is_err());
+        assert!(heap_used_offset(21, 8, 0, 0, 4).is_err());
+        assert!(heap_used_offset(22, 16, 0, 0, 8).is_err());
+        assert!(heap_used_offset(21, 16, 0, 0, 4).is_err());
+        assert_eq!(array_offsets(17, 8, 0, 4, 8).ok(), Some((0, 4, 8)));
+        assert_eq!(array_offsets(25, 8, 0, 4, 8).ok(), Some((0, 4, 8)));
+        assert!(array_offsets(21, 16, 0, 4, 8).is_err());
+        assert!(array_offsets(21, 8, 0, 4, 16).is_err());
+        assert_eq!(compiled_method_type(17).ok(), Some("CompiledMethod"));
+        assert_eq!(compiled_method_type(21).ok(), Some("CompiledMethod"));
+        assert_eq!(compiled_method_type(25).ok(), Some("nmethod"));
+        assert!(compiled_method_type(24).is_err());
+        assert!(matches!(
+            super::pointer_code_range(8, 16),
+            Ok(super::CodeRange::Pointers { begin: 8, end: 16 })
+        ));
+        assert!(super::pointer_code_range(4, 12).is_err());
+        assert!(matches!(
+            super::offset_code_range(32, 40),
+            Ok(super::CodeRange::Offsets { code: 32, data: 40 })
+        ));
+        assert!(super::offset_code_range(32, 32).is_err());
+        assert!(super::offset_code_range(5000, 40).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -1494,5 +1893,12 @@ mod tests {
         let file = super::elf_hotspot(path).expect("libjvm exports");
         assert!(file.values["gHotSpotVMStructs"] > 0);
         assert_eq!(file.values.len(), super::HOTSPOT_SYMBOLS.len());
+        let text = path.to_string_lossy();
+        if text.contains("amd64") || text.contains("x86_64") {
+            assert_eq!(file.arch, super::JvmArch::X86_64);
+        }
+        if text.contains("arm64") || text.contains("aarch64") {
+            assert_eq!(file.arch, super::JvmArch::Aarch64);
+        }
     }
 }

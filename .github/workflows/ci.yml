@@ -55,9 +55,20 @@ jobs:
         with:
           python-version: "3.13"
       - uses: actions/setup-java@v4
+        id: java17
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-java@v4
+        id: java21
         with:
           distribution: temurin
           java-version: "21"
+      - uses: actions/setup-java@v4
+        id: java25
+        with:
+          distribution: temurin
+          java-version: "25"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -120,6 +131,9 @@ jobs:
         # not an ancestor. anyprof does not write the sysctl.
         env:
           ANYPROF_REQUIRE_NATIVE: "1"
+          ANYPROF_JAVA_17: ${{ steps.java17.outputs.path }}
+          ANYPROF_JAVA_21: ${{ steps.java21.outputs.path }}
+          ANYPROF_JAVA_25: ${{ steps.java25.outputs.path }}
         run: |
           set -eu
           scope=$(cat /proc/sys/kernel/yama/ptrace_scope)
@@ -153,10 +167,16 @@ jobs:
           # skip is a failure. The MSRV job does not set this and does not
           # change sysctls. musl is cargo check only, above. Go fixtures use
           # the toolchain from setup-go. Python fixtures use the three
-          # setup-python interpreters and the Temurin 21 JDK. They run inside
-          # this job, so each Go version also samples 3.11, 3.12, 3.13, and
-          # HotSpot 21. The MSRV job does not install a JDK.
+          # setup-python interpreters and Temurin 17, 21, and 25. They run
+          # inside this job, so each Go version also samples 3.11, 3.12, 3.13,
+          # and those three HotSpot releases. The MSRV job does not install a
+          # JDK and does not set ANYPROF_REQUIRE_NATIVE. A JDK that happens to
+          # be on that image may skip a documented permission denial. This
+          # matrix must not.
           ANYPROF_REQUIRE_NATIVE: "1"
+          ANYPROF_JAVA_17: ${{ steps.java17.outputs.path }}
+          ANYPROF_JAVA_21: ${{ steps.java21.outputs.path }}
+          ANYPROF_JAVA_25: ${{ steps.java25.outputs.path }}
           ANYPROF_PYTHON_311: ${{ steps.py311.outputs.python-path }}
           ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
           ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}

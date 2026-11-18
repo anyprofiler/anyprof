@@ -82,9 +82,21 @@ fn java_record_is_not_implemented_on_this_platform() {
 fn record_auto_detects_a_busy_java_program() {
     #[cfg(not(target_os = "macos"))]
     let _lock = live_lock();
-    let Some(java) = java_bin() else {
+    let jdks = java_bins();
+    if jdks.is_empty() {
         return;
-    };
+    }
+    for java in jdks {
+        record_one(&java);
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64"),
+))]
+fn record_one(java: &Path) {
     let dir = std::env::temp_dir().join(format!(
         "anyprof-java-cli-{}-{}",
         std::process::id(),
@@ -120,7 +132,7 @@ fn record_auto_detects_a_busy_java_program() {
         "javac failed\n{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let mut child = Command::new(&java)
+    let mut child = Command::new(java)
         .arg("-XX:CompileCommand=dontinline,AnyprofSpin.spin")
         .arg("-cp")
         .arg(&dir)
@@ -155,11 +167,11 @@ fn record_auto_detects_a_busy_java_program() {
     let stderr = String::from_utf8_lossy(&recorded.stderr);
     let stdout = String::from_utf8_lossy(&recorded.stdout);
     if !recorded.status.success() {
-        let denied = !stderr.contains("process_vm_readv")
-            && (stderr.contains("perf_event_open")
-                || stderr.contains("task_for_pid")
-                || stderr.contains("a password is required")
-                || stderr.contains("not permitted"));
+        let denied = stderr.contains("process_vm_readv")
+            || stderr.contains("perf_event_open")
+            || stderr.contains("task_for_pid")
+            || stderr.contains("a password is required")
+            || stderr.contains("not permitted");
         if denied && !required() {
             eprintln!("skipping CLI java sample:\n{stderr}");
             let _ = std::fs::remove_dir_all(&dir);
@@ -211,39 +223,65 @@ fn record_auto_detects_a_busy_java_program() {
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64"),
 ))]
-fn java_bin() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("ANYPROF_JAVA")
-        && !path.is_empty()
-        && Path::new(&path).is_file()
+/// Homes or binaries from `ANYPROF_JAVA_17`, `ANYPROF_JAVA_21`, and
+/// `ANYPROF_JAVA_25` when the sampling matrix requires them. Otherwise one
+/// JDK from `ANYPROF_JAVA`, `JAVA_HOME`, or `PATH`.
+fn java_bins() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for (key, label) in [
+        ("ANYPROF_JAVA_17", "17"),
+        ("ANYPROF_JAVA_21", "21"),
+        ("ANYPROF_JAVA_25", "25"),
+    ] {
+        match resolve_java(&std::env::var(key).unwrap_or_default()) {
+            Some(java) => found.push(java),
+            None if required() => panic!("{key} must be a JDK {label} home or java binary"),
+            None => {}
+        }
+    }
+    if !found.is_empty() {
+        return found;
+    }
+    if let Some(java) = resolve_java(&std::env::var("ANYPROF_JAVA").unwrap_or_default())
+        .or_else(|| resolve_java(&std::env::var("JAVA_HOME").unwrap_or_default()))
+        .or_else(java_on_path)
     {
-        return Some(PathBuf::from(path));
-    }
-    if let Ok(home) = std::env::var("JAVA_HOME") {
-        let name = if cfg!(windows) { "java.exe" } else { "java" };
-        let bin = PathBuf::from(home).join("bin").join(name);
-        if bin.is_file() {
-            return Some(bin);
-        }
-    }
-    let found = if cfg!(windows) {
-        Command::new("where").arg("java").output().ok()
-    } else {
-        Command::new("which").arg("java").output().ok()
-    };
-    if let Some(output) = found.filter(|output| output.status.success()) {
-        let text = String::from_utf8_lossy(&output.stdout);
-        if let Some(line) = text.lines().find(|line| !line.trim().is_empty()) {
-            let path = PathBuf::from(line.trim());
-            if path.is_file() {
-                return Some(path);
-            }
-        }
+        return vec![java];
     }
     if required() {
         panic!("no java executable was found");
     }
     eprintln!("skipping CLI java sample: java was not found");
-    None
+    Vec::new()
+}
+
+fn resolve_java(value: &str) -> Option<PathBuf> {
+    if value.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    if path.is_file() {
+        return Some(path);
+    }
+    let name = if cfg!(windows) { "java.exe" } else { "java" };
+    let bin = path.join("bin").join(name);
+    bin.is_file().then_some(bin)
+}
+
+fn java_on_path() -> Option<PathBuf> {
+    let found = if cfg!(windows) {
+        Command::new("where").arg("java").output().ok()
+    } else {
+        Command::new("which").arg("java").output().ok()
+    }?;
+    if !found.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&found.stdout);
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| PathBuf::from(line.trim()))
+        .filter(|path| path.is_file())
 }
 
 #[cfg(any(

@@ -17,11 +17,17 @@
 //!
 //! The walk uses the serviceability tables HotSpot exports
 //! (`gHotSpotVMStructs`, `gHotSpotVMTypes`, `gHotSpotVMIntConstants`). It
-//! accepts the product layout whose interpreter constants are
-//! `sender_sp = -1` and `last_sp = -2` (the JDK 17, 21, and 25 x86_64 and
-//! aarch64 headers; the method slot is `last_sp - 1`). A missing table, a
-//! different pair of constants, a debug `GrowableArrayBase`, or a 32-bit JVM
-//! is an error, not a native profile of `libjvm`. On Linux the frame read is
+//! accepts JDK 17, 21, and 25, read from
+//! `Abstract_VM_Version._vm_major_version`. The interpreter constants have to
+//! be `sender_sp = -1` and `last_sp = -2` (method slot `last_sp - 1`). x86_64
+//! exports that pair. aarch64 does not in those three releases, and the empty
+//! table is used only when the mapped libjvm is aarch64 and the version is
+//! one of those three. `HeapBlock` is 16 bytes with `_used` at 8 on 17 and
+//! 21, and 8 bytes with `_used` at 4 on 25. The instruction range is the
+//! stored `_code_begin`/`_code_end` pointers on 17 and 21, and
+//! `this + _code_offset` through `this + _data_offset` on 25. A missing table, a different
+//! exported pair, a debug `GrowableArrayBase`, another version, or a 32-bit
+//! JVM is an error, not a native profile of `libjvm`. On Linux the frame read is
 //! `process_vm_readv`, which needs ptrace attach permission.
 //! `perf_event_open` permission is not enough when `kernel.yama.ptrace_scope`
 //! is 1 and the target is not a descendant. That refusal names the errno and
