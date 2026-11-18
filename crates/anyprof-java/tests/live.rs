@@ -21,6 +21,8 @@
 mod supported {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    #[cfg(not(target_os = "macos"))]
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
     #[cfg(not(target_os = "macos"))]
     use std::time::Instant;
@@ -772,14 +774,25 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
         fn geteuid() -> u32;
     }
 
+    /// One queue for the live tests in this process. Each one samples Temurin
+    /// 17, 21, and 25 while it holds the file lock, and they start together.
+    /// On ubuntu-latest Go 1.26 (run 44263563861, job 134662487546) the other
+    /// four held that lock for about 41s, 42s, 62s, and 43s. The last waiter
+    /// crossed the 180s file-lock timeout before it sampled. Waiting here
+    /// first leaves that 180s for a lock another process did not release.
+    #[cfg(not(target_os = "macos"))]
+    static LIVE_QUEUE: Mutex<()> = Mutex::new(());
+
     #[cfg(not(target_os = "macos"))]
     struct LiveLock {
         path: PathBuf,
+        _queue: MutexGuard<'static, ()>,
     }
 
     #[cfg(not(target_os = "macos"))]
     impl LiveLock {
         fn acquire() -> Self {
+            let queue = LIVE_QUEUE.lock().unwrap_or_else(|err| err.into_inner());
             let path = std::env::temp_dir().join("anyprof-native-live.lock");
             let start = Instant::now();
             loop {
@@ -788,7 +801,12 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
                     .create_new(true)
                     .open(&path)
                 {
-                    Ok(_) => return Self { path },
+                    Ok(_) => {
+                        return Self {
+                            path,
+                            _queue: queue,
+                        };
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                         if start.elapsed() > Duration::from_secs(180) {
                             panic!("timed out waiting for {path:?}");
