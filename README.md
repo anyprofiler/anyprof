@@ -41,7 +41,7 @@ Auto-detection tries `node`, then `rust`, then `go`, then `native`. The browser 
 | Node.js | Works (CI) | Works (CI) | Works (CI) |
 | Browser page | Works (CI, headless Chrome) | Works (CI, headless Chrome) | Works (CI, headless Chrome) |
 | C, C++ | Works (CI) on Apple Silicon and Intel. Root, Mach `task_for_pid`, frame pointers, Mach-O symbols. Busy and idle programs. User frames only. | Works (CI) on x64. Same user, no administrator token. Suspends only threads whose state is Running, walks with `StackWalk64`, resolves dbghelp symbols. Busy and idle programs. Refuses this process before `OpenProcess`. 32-bit processes, ARM64 processes, and non-x64 builds are not sampled. A kernel address is not stored as a user frame. | Works (CI) on x86_64. `perf_event_open` task clock (on-CPU; the thread is not suspended). Frame-pointer walk of the user stack copy, ELF symbols. Busy, idle, and two running threads. Kernel frames with `-k` when `perf_event_paranoid` is 1 or lower. aarch64 and other architectures are not sampled and do not advertise `-k`. |
-| Rust | Works (CI) on Apple Silicon and Intel. Same Mach sampler and root requirement as C/C++. rustc 1.99 does not emit frame pointers unless `-C force-frame-pointers=yes`. The library tests sample a busy program, an idle park, and two running threads. | Works (CI) on x64. Same user, no administrator token. `StackWalk64` uses the PE unwind data rustc emits. Names come from dbghelp, or from the PDB next to the exe when dbghelp returns none. The fixture passes `-C force-frame-pointers=yes` and `-C debuginfo=2`. Busy, idle, and two running threads. Refuses this process before `OpenProcess`. Non-x64 builds are not sampled. | Works (CI) on x86_64. Same `perf_event_open` sampler as C/C++. rustc 1.99 does not emit frame pointers at `-O0` or `-O2` unless `-C force-frame-pointers=yes`. Busy, idle, and two running threads. `-k` is the native Linux behavior. musl x86_64 is the same code and is only `cargo check`ed. aarch64 and other architectures are not sampled and do not advertise `-k`. |
+| Rust | Works (CI) on Apple Silicon and Intel. Same Mach sampler and root requirement as C/C++. rustc 1.99 does not emit frame pointers unless `-C force-frame-pointers=yes`. The library tests sample a busy program, an idle park, and two running threads. | Works (CI) on x64. Same user, no administrator token. `StackWalk64` uses the PE unwind data rustc emits. Names come from dbghelp, or from a PDB whose GUID and age match the image when dbghelp returns none. The fixture passes `-C force-frame-pointers=yes` and `-C debuginfo=2`. Busy, idle, and two running threads. Refuses this process before `OpenProcess`. Non-x64 builds are not sampled. | Works (CI) on x86_64. Same `perf_event_open` sampler as C/C++. rustc 1.99 does not emit frame pointers at `-O0` or `-O2` unless `-C force-frame-pointers=yes`. Busy, idle, and two running threads. `-k` is the native Linux behavior. musl x86_64 is the same code and is only `cargo check`ed. aarch64 and other architectures are not sampled and do not advertise `-k`. |
 | Go | Not implemented. Detection does not run (no `/proc`). | Not implemented. | Detection works. Sampling is not implemented. |
 | Python, Java, Ruby, PHP, .NET | Not implemented | Not implemented | Not implemented |
 
@@ -97,18 +97,18 @@ A frame from a non-native runtime is written as `[runtime] name`, for example `[
 
 ## Install
 
-Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.5` is tag `v0.1.5`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
+Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.6` is tag `v0.1.6`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
 
 macOS and Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.5/anyprof-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.6/anyprof-cli-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.5/anyprof-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.6/anyprof-cli-installer.ps1 | iex"
 ```
 
 The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
@@ -309,7 +309,7 @@ Detection does not attach. It reads the executable and stops at the first marker
 
 The markers are the ELF `.comment` string `rustc version `, the standard-library panic text for `Option::unwrap` and `Result::unwrap`, the prefix `fatal runtime error:`, and a remapped panic path `/rustc/` plus 40 hex digits plus `/library/`. Executables do not carry the `.rustc` section; that section is for dylibs and proc-macros. On ELF, `rustc version ` is in `.comment` and survives `strip --strip-all`, including a `no_std` binary. Cross-compiled Mach-O and PE objects do not contain that string. A normal Rust binary on those platforms is recognized from the standard-library strings, which live in the binary and survive strip. A fully stripped `no_std` Mach-O or PE that contains none of the markers is not auto-detected. A non-Rust file that happens to contain one of those byte strings in the first 32 MiB is detected as Rust; the same class of false positive exists for the Go build-info scan.
 
-Names: legacy Rust mangling (`_ZN…17h<16 hex>E`) and v0 (`_R…`) are demangled with `rustc-demangle` before Itanium C++ demangling, and the legacy crate hash is omitted. Mach-O adds one extra leading underscore (`__R…`, `__ZN…`); ELF and PE do not. A C++ Itanium name demangles to `ns::fn()` and stays native even when the file is a Rust image. An MSVC `?` name stays native. On Windows, an already-undecorated `crate::function` with no parameter list is labeled Rust when the file is a Rust image. A C symbol in that image (`main`) has no `::` and stays native. dbghelp is given the executable's directory and is not pointed at a symbol server. When `SymFromAddr` returns no name, anyprof reads the PDB named by the PE CodeView record, or the `.pdb` beside the image, and demangles those procedures. Put that PDB next to the exe (`-C debuginfo=2`); without it the frames keep the address and the module name.
+Names: legacy Rust mangling (`_ZN…17h<16 hex>E`) and v0 (`_R…`) are demangled with `rustc-demangle` before Itanium C++ demangling, and the legacy crate hash is omitted. Mach-O adds one extra leading underscore (`__R…`, `__ZN…`); ELF and PE do not. A C++ Itanium name demangles to `ns::fn()` and stays native even when the file is a Rust image. An MSVC `?` name stays native. On Windows, an already-undecorated `crate::function` with no parameter list is labeled Rust when the file is a Rust image, including a rustc segment such as `{closure#0}` or `{impl#0}`. An already-undecorated generic (`foo::<T>`) or trait path (`<T as Trait>`) stays native in that fallback, so a C++ template is not relabeled; a mangled closure or generic is still demangled and labeled Rust. A C symbol in that image (`main`) has no `::` and stays native. dbghelp is given the executable's directory and is not pointed at a symbol server. When `SymFromAddr` returns no name, anyprof reads the PDB named by the PE CodeView record, then the `.pdb` beside the image. The debug directory is read from its file offset, including past the first 1 MiB. A relative CodeView path is used only when it stays inside the executable's directory (`..` is ignored). An absolute path is still opened. Either file is applied only when its GUID matches that record, its PDB-info age is at least the image age, and its DBI age equals the image age when the PDB has one. A stale PDB is skipped and the address stays unnamed. With no CodeView record, the sibling `.pdb` is still tried and cannot be checked. A PDB larger than 1 GiB is not parsed. Put the matching PDB next to the exe (`-C debuginfo=2`); without it the frames keep the address and the module name.
 
 Frame pointers are required on macOS and Linux. `rustc` 1.99 does not emit them at `-O0` or `-O2` unless the binary was built with `-C force-frame-pointers=yes`. Without that flag the leaf is recorded and the callers are not. Windows does not need the flag: `StackWalk64` uses the unwind data rustc emits. The CI fixtures pass the flag on every OS so the program is the same, and they pass `-C debuginfo=2` for the PDB. Permissions, self-pid refusal, `-k`, and the not-implemented architectures are the native ones above. Linux musl x86_64 is the same sampler; CI `cargo check`s it and does not live-sample it.
 
@@ -344,8 +344,8 @@ On `windows-latest`, `crates/anyprof-native/tests/windows_live.rs` compiles a bu
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. Every crate inherits it.
 2. Commit that change on `main` (the release workflow has to be on the default branch).
-3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.5` is tag `v0.1.5`.
-4. Push the tag: `git push origin v0.1.5`.
+3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.6` is tag `v0.1.6`.
+4. Push the tag: `git push origin v0.1.6`.
 
 Pushing the tag runs `.github/workflows/release.yml`. [cargo-dist](https://axodotdev.github.io/cargo-dist/) builds `anyprof` for Apple Silicon macOS, Intel macOS, 64-bit Windows, and 64-bit Linux (glibc and musl, x86_64 and ARM), then uploads the archives, checksums, shell installer, and PowerShell installer to a GitHub Release.
 
