@@ -2020,8 +2020,13 @@ mod tests {
         let aggregated = started.elapsed();
         assert!(trace.timeline.is_none());
         assert_eq!(tree.total, 200_000);
+        // 64 stacks share `main`, then each has 15 private frames.
+        assert!(tree.nodes.len() <= 1 + 64 * 15);
+        // Debug builds on the Intel macOS runner have passed this in about
+        // 15s and have also taken about 35s. The check is for a quadratic
+        // blow-up, not for one host's clock.
         assert!(
-            loaded.as_secs() < 15 && aggregated.as_secs() < 5,
+            loaded.as_secs() < 90 && aggregated.as_secs() < 30,
             "load {loaded:?} aggregate {aggregated:?}"
         );
     }
