@@ -393,10 +393,12 @@ mod supported {
         {
             return compile_missing(&go, &String::from_utf8_lossy(&init.stderr));
         }
+        // `.` stays inside the module. An absolute temp path on macOS
+        // canonicalizes through `/private` and Go rejects it as outside the module.
         match Command::new(&go)
             .args(["build", "-ldflags=-s -w", "-o"])
             .arg(binary)
-            .arg(dir)
+            .arg(".")
             .current_dir(dir)
             .env("CGO_ENABLED", "0")
             .env("GO111MODULE", "on")
@@ -459,7 +461,17 @@ mod supported {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("fixture dir");
-        dir
+        // macOS temp is /var/folders, and /var is a symlink to /private/var.
+        // `go build` of the lexical /var path is outside the module Go sees
+        // after canonicalization. Build from the canonical directory.
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(&dir).unwrap_or(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            dir
+        }
     }
 
     fn exe(stem: &str) -> String {

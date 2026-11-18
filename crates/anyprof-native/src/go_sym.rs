@@ -23,6 +23,15 @@
 //! `__gopclntab`, or, on PE, the blob inside `.rdata` (Go does not give it
 //! its own section). Only a file that also contains `\xff Go buildinf:` is
 //! scanned on PE, so a C++ image is not parsed looking for a lucky magic.
+//!
+//! Go 1.18 through 1.25 store the text base in the pclntab header. Go 1.26
+//! still uses magic `0xFFFFFFF1` but writes that word as zero. Entry offsets
+//! are then relative to `moduledata.text` (`runtime.text`), which the linker
+//! puts in `.go.module` / `__go_module`, or in `.data` on PE. A cgo binary’s
+//! `runtime.text` is not the first byte of the text section, so the section
+//! address is only the fallback when that record is missing. Go older than
+//! 1.18 still matches the build-info header and is sampled with the native
+//! walk; this parser does not read the 1.2 or 1.16 pclntab layouts.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -338,18 +347,18 @@ fn read_tables(path: &Path) -> Option<GoTables> {
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).ok()?;
     if magic == [0x7f, b'E', b'L', b'F'] {
-        return elf_pclntab(&mut file, len).and_then(|bytes| parse_pclntab(&bytes));
+        return elf_pclntab(&mut file, len);
     }
     let macho = u32::from_le_bytes(magic);
     let fat = u32::from_be_bytes(magic);
     if macho == 0xFEED_FACF || fat == 0xCAFE_BABE {
-        return macho_pclntab(&mut file, len).and_then(|bytes| parse_pclntab(&bytes));
+        return macho_pclntab(&mut file, len);
     }
     if magic[0] == b'M' && magic[1] == b'Z' {
         if !file_contains_build_info(&mut file, len) {
             return None;
         }
-        return pe_pclntab(&mut file, len).and_then(|bytes| parse_pclntab(&bytes));
+        return pe_pclntab(&mut file, len);
     }
     None
 }
@@ -380,7 +389,9 @@ fn parse_pclntab(data: &[u8]) -> Option<GoTables> {
     let filetab = usize::try_from(word(5)?).ok()?;
     let pctab = usize::try_from(word(6)?).ok()?;
     let pcln = usize::try_from(word(7)?).ok()?;
-    if nfunc == 0 || nfunc > MAX_FUNCS || text_start == 0 {
+    // Go 1.26 stores this word as zero. `adopt` fills it from moduledata.
+    // Go 1.18 through 1.25 write the link address of runtime.text here.
+    if nfunc == 0 || nfunc > MAX_FUNCS {
         return None;
     }
     for off in [funcname, cutab, filetab, pctab, pcln] {
@@ -445,7 +456,60 @@ fn parse_pclntab(data: &[u8]) -> Option<GoTables> {
     Some(tables)
 }
 
-fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
+/// Link address and exclusive end of the text section.
+#[derive(Clone, Copy)]
+struct TextSpan {
+    start: u64,
+    end: u64,
+}
+
+/// A file may leave `textStart` as zero. `fallback` is `moduledata.text`
+/// when that record checks out, otherwise the text section’s link address.
+fn adopt(bytes: &[u8], fallback: Option<u64>) -> Option<GoTables> {
+    let mut tables = parse_pclntab(bytes)?;
+    if tables.text_start == 0 {
+        tables.text_start = fallback.filter(|addr| *addr != 0)?;
+    }
+    Some(tables)
+}
+
+/// `moduledata.text` for a Go 1.26 binary.
+///
+/// The 64-bit struct in `runtime/symtab.go` starts with `pcHeader`. On a
+/// file that has not been relocated, that pointer is the pclntab’s link
+/// address. `text` is 176 bytes later and `etext` 8 bytes after that.
+/// cgo places `runtime.text` inside the text section, not on its first byte,
+/// so a hit has to land in `text_span` with `etext` still above it.
+fn module_runtime_text(blob: &[u8], pclntab_addr: u64, text_span: TextSpan) -> Option<u64> {
+    if pclntab_addr == 0 || text_span.start == 0 || text_span.end <= text_span.start {
+        return None;
+    }
+    let needle = pclntab_addr.to_le_bytes();
+    let mut from = 0usize;
+    while from + 192 <= blob.len() {
+        let rel = blob[from..]
+            .windows(8)
+            .position(|window| window == needle)?;
+        let at = from + rel;
+        if at.is_multiple_of(8) && at + 192 <= blob.len() {
+            let text = u64::from_le_bytes(blob[at + 176..at + 184].try_into().ok()?);
+            let etext = u64::from_le_bytes(blob[at + 184..at + 192].try_into().ok()?);
+            if text >= text_span.start && text < text_span.end && etext > text {
+                return Some(text);
+            }
+        }
+        from = at + 8;
+    }
+    None
+}
+
+fn text_fallback(module_text: Option<u64>, text_span: Option<TextSpan>) -> Option<u64> {
+    module_text.filter(|addr| *addr != 0).or(text_span
+        .filter(|span| span.start != 0)
+        .map(|span| span.start))
+}
+
+fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
     reader.seek(SeekFrom::Start(0)).ok()?;
     let mut ehdr = [0u8; 64];
     reader.read_exact(&mut ehdr).ok()?;
@@ -474,6 +538,9 @@ fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
     let mut strings = vec![0u8; str_size as usize];
     reader.seek(SeekFrom::Start(str_off)).ok()?;
     reader.read_exact(&mut strings).ok()?;
+    let mut text_span = None;
+    let mut pcln = None;
+    let mut module = None;
     for index in 0..shnum {
         let hdr = shoff.checked_add(index.checked_mul(shentsize)?)?;
         reader.seek(SeekFrom::Start(hdr)).ok()?;
@@ -481,22 +548,45 @@ fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
         reader.read_exact(&mut buf).ok()?;
         let name_off = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
         let name = cstr_at(&strings, name_off)?;
-        if name != ".gopclntab" && name != ".data.rel.ro.gopclntab" {
-            continue;
-        }
+        let addr = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let off = u64::from_le_bytes(buf[24..32].try_into().ok()?);
         let size = u64::from_le_bytes(buf[32..40].try_into().ok()?);
-        return read_span(reader, off, size, len);
+        if name == ".text" && text_span.is_none() {
+            text_span = Some(TextSpan {
+                start: addr,
+                end: addr.saturating_add(size),
+            });
+        }
+        if pcln.is_none() && (name == ".gopclntab" || name == ".data.rel.ro.gopclntab") {
+            pcln = Some((addr, off, size));
+        }
+        if name == ".go.module" && module.is_none() {
+            module = Some((off, size));
+        }
     }
-    None
+    let (paddr, poff, psize) = pcln?;
+    let bytes = read_span(reader, poff, psize, len)?;
+    let magic_at = pcln_magic_at(&bytes)?;
+    let pcln_addr = paddr.checked_add(magic_at as u64)?;
+    let module_text = module.and_then(|(off, size)| {
+        let blob = read_span(reader, off, size.min(MAX_TABLE), len)?;
+        module_runtime_text(&blob, pcln_addr, text_span?)
+    });
+    adopt(&bytes[magic_at..], text_fallback(module_text, text_span))
 }
 
-fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
+fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
     let (offset, size) = macho_slice(reader, len)?;
-    let (text, section) = macho_sections(reader, offset, size)?;
-    let _ = text;
-    let (off, size) = section?;
-    read_span(reader, off, size, len)
+    let layout = macho_sections(reader, offset, size)?;
+    let pcln = layout.pclntab?;
+    let bytes = read_span(reader, pcln.file_off, pcln.size, len)?;
+    let magic_at = pcln_magic_at(&bytes)?;
+    let pcln_addr = pcln.addr.checked_add(magic_at as u64)?;
+    let module_text = layout.module.and_then(|module| {
+        let blob = read_span(reader, module.file_off, module.size.min(MAX_TABLE), len)?;
+        module_runtime_text(&blob, pcln_addr, layout.text?)
+    });
+    adopt(&bytes[magic_at..], text_fallback(module_text, layout.text))
 }
 
 /// ASLR slide: runtime header address minus the link `__TEXT` vmaddr.
@@ -505,8 +595,8 @@ pub(crate) fn macho_bias(path: &Path, load_addr: u64) -> Option<u64> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let (offset, size) = macho_slice(&mut file, len)?;
-    let (text, _) = macho_sections(&mut file, offset, size)?;
-    Some(load_addr.wrapping_sub(text))
+    let layout = macho_sections(&mut file, offset, size)?;
+    Some(load_addr.wrapping_sub(layout.text_segment))
 }
 
 fn macho_slice<R: Read + Seek>(reader: &mut R, len: u64) -> Option<(u64, u64)> {
@@ -554,12 +644,30 @@ fn macho_host_cpu() -> Option<u32> {
     }
 }
 
-/// `__TEXT` vmaddr, and the file span of `__gopclntab` when that section exists.
+struct MachoBlob {
+    addr: u64,
+    file_off: u64,
+    size: u64,
+}
+
+struct MachoLayout {
+    /// `__TEXT` vmaddr. The ASLR slide is the runtime header minus this.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    text_segment: u64,
+    /// `__text` link range. Go 1.26 entry offsets are relative to `runtime.text`.
+    text: Option<TextSpan>,
+    /// `__gopclntab` link address and file span.
+    pclntab: Option<MachoBlob>,
+    /// `__go_module` file span. That is `.go.module` with Mach-O’s name rules.
+    module: Option<MachoBlob>,
+}
+
+/// `__TEXT` vmaddr, the `__text` link address, and `__gopclntab`’s file span.
 fn macho_sections<R: Read + Seek>(
     reader: &mut R,
     slice_off: u64,
     slice_size: u64,
-) -> Option<(u64, Option<(u64, u64)>)> {
+) -> Option<MachoLayout> {
     reader.seek(SeekFrom::Start(slice_off)).ok()?;
     let mut header = [0u8; 32];
     reader.read_exact(&mut header).ok()?;
@@ -575,7 +683,9 @@ fn macho_sections<R: Read + Seek>(
     reader.read_exact(&mut commands).ok()?;
     let end = slice_off.saturating_add(slice_size);
     let mut text = None;
+    let mut text_section = None;
     let mut section = None;
+    let mut module = None;
     let mut at = 0usize;
     for _ in 0..ncmds {
         if at + 8 > commands.len() {
@@ -600,49 +710,111 @@ fn macho_sections<R: Read + Seek>(
                     break;
                 }
                 let raw = &data[sect..sect + 80];
-                if sect_name(&raw[0..16]) == "__gopclntab" {
-                    let size = u64::from_le_bytes(raw[40..48].try_into().ok()?);
-                    let file_off = u64::from(u32::from_le_bytes(raw[48..52].try_into().ok()?));
-                    let abs = slice_off.checked_add(file_off)?;
-                    if abs.checked_add(size)? <= end {
-                        section = Some((abs, size));
-                    }
+                let sect_name = sect_name(&raw[0..16]);
+                let addr = u64::from_le_bytes(raw[32..40].try_into().ok()?);
+                let size = u64::from_le_bytes(raw[40..48].try_into().ok()?);
+                let file_off = u64::from(u32::from_le_bytes(raw[48..52].try_into().ok()?));
+                let abs = slice_off.checked_add(file_off);
+                let in_slice = abs
+                    .and_then(|off| off.checked_add(size))
+                    .is_some_and(|last| last <= end);
+                if sect_name == "__text" && text_section.is_none() {
+                    text_section = Some(TextSpan {
+                        start: addr,
+                        end: addr.saturating_add(size),
+                    });
+                }
+                if sect_name == "__gopclntab" && in_slice {
+                    section = Some(MachoBlob {
+                        addr,
+                        file_off: abs?,
+                        size,
+                    });
+                }
+                if sect_name == "__go_module" && module.is_none() && in_slice {
+                    module = Some(MachoBlob {
+                        addr,
+                        file_off: abs?,
+                        size,
+                    });
                 }
                 sect += 80;
             }
         }
         at += cmdsize;
     }
-    Some((text?, section))
+    Some(MachoLayout {
+        text_segment: text?,
+        text: text_section,
+        pclntab: section,
+        module,
+    })
 }
 
-fn pe_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
+fn pe_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
     let sections = pe_sections(reader, len)?;
+    let base = image_base(reader, len).unwrap_or(0);
+    let text = sections
+        .iter()
+        .find(|section| section.name == ".text")
+        .map(|section| {
+            let start = base.wrapping_add(section.virtual_addr);
+            let size = if section.virtual_size == 0 {
+                section.raw_size
+            } else {
+                section.virtual_size
+            };
+            TextSpan {
+                start,
+                end: start.saturating_add(size),
+            }
+        });
     for name in [".gopclntab", ".rdata", ".data"] {
-        if let Some((off, size)) = sections
-            .iter()
-            .find(|(section, _, _)| section == name)
-            .map(|(_, off, size)| (*off, *size))
-            && let Some(bytes) = read_span(reader, off, size.min(MAX_TABLE), len)
-            && let Some(table) = find_pclntab(&bytes)
-        {
-            return Some(table);
+        let Some(section) = sections.iter().find(|section| section.name == name) else {
+            continue;
+        };
+        let Some(bytes) = read_span(
+            reader,
+            section.raw_ptr,
+            section.raw_size.min(MAX_TABLE),
+            len,
+        ) else {
+            continue;
+        };
+        let Some(magic_at) = pcln_magic_at(&bytes) else {
+            continue;
+        };
+        let pcln_addr = base
+            .wrapping_add(section.virtual_addr)
+            .wrapping_add(magic_at as u64);
+        let module_text = sections.iter().find_map(|candidate| {
+            if candidate.name != ".go.module" && candidate.name != ".data" {
+                return None;
+            }
+            let blob = read_span(
+                reader,
+                candidate.raw_ptr,
+                candidate.raw_size.min(MAX_TABLE),
+                len,
+            )?;
+            module_runtime_text(&blob, pcln_addr, text?)
+        });
+        if let Some(tables) = adopt(&bytes[magic_at..], text_fallback(module_text, text)) {
+            return Some(tables);
         }
     }
     None
 }
 
-fn find_pclntab(bytes: &[u8]) -> Option<Vec<u8>> {
+fn pcln_magic_at(bytes: &[u8]) -> Option<usize> {
     let magic = [0xf1, 0xff, 0xff, 0xff];
     let older = [0xf0, 0xff, 0xff, 0xff];
     let mut at = 0usize;
     while at + 16 < bytes.len() {
         if (bytes[at..at + 4] == magic || bytes[at..at + 4] == older)
-            && let Some(tables) = parse_pclntab(&bytes[at..])
+            && parse_pclntab(&bytes[at..]).is_some()
         {
-            // The parsed copy starts at the magic and includes the tail of
-            // the section. Offsets inside the header stay valid.
-            return Some(tables.data);
+            return Some(at);
         }
         at += 4;
     }
@@ -676,7 +848,15 @@ fn file_contains_build_info<R: Read + Seek>(reader: &mut R, len: u64) -> bool {
     false
 }
 
-fn pe_sections<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<(String, u64, u64)>> {
+struct PeSection {
+    name: String,
+    virtual_size: u64,
+    virtual_addr: u64,
+    raw_size: u64,
+    raw_ptr: u64,
+}
+
+fn pe_sections<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<PeSection>> {
     reader.seek(SeekFrom::Start(0x3c)).ok()?;
     let mut lfanew_buf = [0u8; 4];
     reader.read_exact(&mut lfanew_buf).ok()?;
@@ -704,14 +884,21 @@ fn pe_sections<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<(String, 
         reader.read_exact(&mut raw).ok()?;
         let name_end = raw[..8].iter().position(|byte| *byte == 0).unwrap_or(8);
         let name = String::from_utf8_lossy(&raw[..name_end]).into_owned();
+        let virtual_size = u32::from_le_bytes(raw[8..12].try_into().ok()?) as u64;
+        let virtual_addr = u32::from_le_bytes(raw[12..16].try_into().ok()?) as u64;
         let raw_size = u32::from_le_bytes(raw[16..20].try_into().ok()?) as u64;
         let raw_ptr = u32::from_le_bytes(raw[20..24].try_into().ok()?) as u64;
-        sections.push((name, raw_ptr, raw_size));
+        sections.push(PeSection {
+            name,
+            virtual_size,
+            virtual_addr,
+            raw_size,
+            raw_ptr,
+        });
     }
     Some(sections)
 }
 
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn image_base<R: Read + Seek>(reader: &mut R, len: u64) -> Option<u64> {
     reader.seek(SeekFrom::Start(0x3c)).ok()?;
     let mut lfanew_buf = [0u8; 4];
@@ -824,8 +1011,9 @@ mod tests {
 
         let sp = 0x7fff_0000_1000u64;
         let mut memory = HashMap::new();
-        // spin's pcsp is 0, so the return PC is at SP. The caller's pcsp is 8,
-        // and after the first step SP has moved by one pointer.
+        // spin's pcsp is 0, so the return PC is at SP. 0x401190 is 16 bytes
+        // into main.caller (entry 0x401180), the same split gentraceback uses:
+        // the walk keeps the raw return PC and symbol lookup names that PC.
         memory.insert(sp, 0x401190u64);
         memory.insert(sp + 16, 0x5555_0000_2000u64);
         let frames = unwind(
@@ -1021,8 +1209,233 @@ func spin() {
                     Some("main.spin")
                 );
             }
+            // The stripped scan above still names a function if runtime_text
+            // is wrong by a constant. The linker's runtime.text is the check.
+            let linked = dir.join(format!("linked-{goos}-{goarch}"));
+            go_build(&go, &source, &linked, &dir, Some((goos, goarch)), false);
+            assert_link_text(&go, &linked);
         }
+        let linked = dir.join(if cfg!(windows) {
+            "linked.exe"
+        } else {
+            "linked"
+        });
+        go_build(&go, &source, &linked, &dir, None, false);
+        assert_link_text(&go, &linked);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// cgo's `runtime.text` sits past the first byte of the text section.
+    /// Using that section address shifts every entry. `go tool nm` is the
+    /// link address the pclntab offsets are relative to.
+    #[test]
+    fn a_cgo_binary_uses_moduledata_text() {
+        let go = match which_go() {
+            Some(go) => go,
+            None if required() => panic!("CI requires a Go toolchain"),
+            None => return,
+        };
+        if !c_compiler_runs() {
+            if required() && cfg!(unix) {
+                panic!("cgo text check needs a C compiler");
+            }
+            return;
+        }
+        let dir = temp_module("anyprof-go-cgo");
+        let source = r#"package main
+/*
+static volatile int sink;
+void touch(void) { sink++; }
+*/
+import "C"
+func main() { caller() }
+//go:noinline
+func caller() { C.touch(); spin() }
+//go:noinline
+func spin() {
+    var x uint64
+    for { x++ }
+}
+"#;
+        std::fs::write(dir.join("main.go"), source).unwrap();
+        let init = std::process::Command::new(&go)
+            .args(["mod", "init", "anyprof.cgo"])
+            .current_dir(&dir)
+            .env("GO111MODULE", "on")
+            .env("CGO_ENABLED", "1")
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {go}: {err}"));
+        assert!(
+            init.status.success(),
+            "go mod init\n{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let binary = dir.join(if cfg!(windows) { "cgo.exe" } else { "cgo" });
+        let build = std::process::Command::new(&go)
+            .args(["build", "-o"])
+            .arg(&binary)
+            .arg(".")
+            .current_dir(&dir)
+            .env("GO111MODULE", "on")
+            .env("CGO_ENABLED", "1")
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {go}: {err}"));
+        if !build.status.success() {
+            let err = String::from_utf8_lossy(&build.stderr);
+            if required() && cfg!(unix) {
+                panic!("cgo build failed\n{err}");
+            }
+            eprintln!("skipping cgo text check: {err}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_link_text(&go, &binary);
+        let stripped = dir.join(if cfg!(windows) {
+            "cgo-stripped.exe"
+        } else {
+            "cgo-stripped"
+        });
+        let strip = std::process::Command::new(&go)
+            .args(["build", "-ldflags=-s -w", "-o"])
+            .arg(&stripped)
+            .arg(".")
+            .current_dir(&dir)
+            .env("GO111MODULE", "on")
+            .env("CGO_ENABLED", "1")
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {go}: {err}"));
+        assert!(
+            strip.status.success(),
+            "stripped cgo build\n{}",
+            String::from_utf8_lossy(&strip.stderr)
+        );
+        // Two cgo links do not share addresses. The stripped file has to
+        // open, and its text base has to name main.spin. The nm check above
+        // is what rejects a base of `.text` when runtime.text is further in.
+        let image = open_image(&stripped).expect("pclntab in a stripped cgo binary");
+        let _ = find_named(&image, "main.spin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_module(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::canonicalize(&dir).unwrap_or(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            dir
+        }
+    }
+
+    fn c_compiler_runs() -> bool {
+        for compiler in ["cc", "gcc", "clang"] {
+            if std::process::Command::new(compiler)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn go_build(
+        go: &str,
+        source: &std::path::Path,
+        binary: &std::path::Path,
+        dir: &std::path::Path,
+        target: Option<(&str, &str)>,
+        strip: bool,
+    ) {
+        let mut command = std::process::Command::new(go);
+        command.arg("build");
+        if strip {
+            command.arg("-ldflags=-s -w");
+        }
+        command
+            .arg("-o")
+            .arg(binary)
+            .arg(source)
+            .env("CGO_ENABLED", "0")
+            .current_dir(dir);
+        if let Some((goos, goarch)) = target {
+            command.env("GOOS", goos).env("GOARCH", goarch);
+        }
+        let compile = command
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {go}: {err}"));
+        let label = target
+            .map(|(goos, goarch)| format!("{goos}/{goarch}"))
+            .unwrap_or_else(|| "host".to_string());
+        assert!(
+            compile.status.success(),
+            "go build {label}\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    fn assert_link_text(go: &str, binary: &std::path::Path) {
+        let image = open_image(binary).unwrap_or_else(|| panic!("pclntab in {}", binary.display()));
+        let runtime_text = nm_symbol(go, binary, "runtime.text");
+        assert_eq!(
+            image.runtime_text,
+            runtime_text,
+            "runtime.text in {}",
+            binary.display()
+        );
+        let spin = nm_symbol(go, binary, "main.spin");
+        let symbol = image.symbol(spin).unwrap_or_else(|| {
+            panic!(
+                "main.spin at {spin:#x} with runtime.text {:#x}",
+                image.runtime_text
+            )
+        });
+        assert_eq!(symbol.name, "main.spin");
+        assert!(
+            symbol
+                .file
+                .as_deref()
+                .is_some_and(|file| file.ends_with("main.go")),
+            "file {:?}",
+            symbol.file
+        );
+        assert!(symbol.line.is_some_and(|line| line > 0), "{symbol:?}");
+    }
+
+    fn nm_symbol(go: &str, binary: &std::path::Path, name: &str) -> u64 {
+        let output = std::process::Command::new(go)
+            .args(["tool", "nm"])
+            .arg(binary)
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {go} tool nm: {err}"));
+        assert!(
+            output.status.success(),
+            "go tool nm {}\n{}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(addr) = parts.next() else { continue };
+            if parts.next_back() == Some(name) {
+                return u64::from_str_radix(addr, 16)
+                    .unwrap_or_else(|err| panic!("nm address {addr}: {err}"));
+            }
+        }
+        panic!("go tool nm did not list {name} in {}", binary.display());
     }
 
     fn find_pc(image: &GoImage, name: &str) -> u64 {

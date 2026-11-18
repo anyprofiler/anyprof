@@ -71,6 +71,11 @@ fn record_auto_detects_a_busy_go_program() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // macOS temp is /var/folders, and /var is a symlink to /private/var.
+    // Go's module check compares the lexical package path with the module
+    // root it sees after that canonicalization, so the directory used for
+    // `go build` is the canonical one.
+    let dir = canonical_module_dir(&dir);
     let binary = dir.join(if cfg!(windows) {
         "go-busy.exe"
     } else {
@@ -207,6 +212,7 @@ func spin(f *os.File) {
     let init = Command::new(&go)
         .args(["mod", "init", "anyprof.cli"])
         .current_dir(dir)
+        .env("GO111MODULE", "on")
         .output();
     let Ok(init) = init else {
         return skip_or_panic("go is not installed");
@@ -214,17 +220,36 @@ func spin(f *os.File) {
     if !init.status.success() {
         return skip_or_panic(&String::from_utf8_lossy(&init.stderr));
     }
+    // `.` stays inside the module. An absolute temp path on macOS
+    // canonicalizes through `/private` and Go rejects it as outside the module.
     let build = Command::new(&go)
         .args(["build", "-ldflags=-s -w", "-o"])
         .arg(binary)
-        .arg(dir)
+        .arg(".")
         .current_dir(dir)
         .env("CGO_ENABLED", "0")
+        .env("GO111MODULE", "on")
         .output();
     match build {
         Ok(output) if output.status.success() => true,
         Ok(output) => skip_or_panic(&String::from_utf8_lossy(&output.stderr)),
         Err(err) => skip_or_panic(&err.to_string()),
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64"),
+))]
+fn canonical_module_dir(dir: &Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        dir.to_path_buf()
     }
 }
 
