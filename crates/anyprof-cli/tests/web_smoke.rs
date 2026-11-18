@@ -69,6 +69,9 @@ fn viewer_renders_profiles_in_headless_chrome() {
     )
     .unwrap();
     cases.push((markup, "markup"));
+    let synthetic = dir.join("synthetic-workers.speedscope.json");
+    std::fs::write(&synthetic, synthetic_workers()).unwrap();
+    cases.push((synthetic, "studio"));
     let broken = dir.join("broken.cpuprofile");
     std::fs::write(&broken, b"{").unwrap();
     cases.push((broken, "broken"));
@@ -201,6 +204,21 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
                 "{name}: markup name was not shown as text:\n{text}"
             );
             assert!(lower.contains("no timeline"), "{name}:\n{text}");
+        }
+        "studio" => {
+            assert!(
+                lower.contains("sample activity"),
+                "{name}: synthetic series had no sample activity:\n{text}"
+            );
+            assert!(!lower.contains("no timeline"), "{name}:\n{text}");
+            assert!(
+                text.contains("Main thread") && text.contains("Worker"),
+                "{name}: both profiles were not listed:\n{text}"
+            );
+            assert!(
+                !lower.contains("cpu usage"),
+                "{name}: sample activity was labeled as CPU usage:\n{text}"
+            );
         }
         "broken" => assert!(
             lower.contains("could not read this profile"),
@@ -365,6 +383,35 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
         base64_decode(shot["data"].as_str().unwrap()),
     )
     .unwrap();
+    if kind == "studio" {
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "document.querySelector('#detail').textContent.includes('main') && document.querySelectorAll('[data-testid=tree-row]').length > 8"
+            ),
+            "{name}: the call tree did not select a function or stayed too small to read"
+        );
+        drag_timeline(cdp, session);
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "!document.body.innerText.includes('tokenize') && document.body.innerText.includes('commit_frame')"
+            ),
+            "{name}: the late interval did not keep commit_frame and drop tokenize"
+        );
+        let selected = cdp.call(
+            session,
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+        );
+        std::fs::write(
+            keep.join(format!("{name}.selection.png")),
+            base64_decode(selected["data"].as_str().unwrap()),
+        )
+        .unwrap();
+    }
     cdp.call(
         session,
         "Runtime.evaluate",
@@ -395,14 +442,14 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
     let png = base64_decode(shot["data"].as_str().unwrap());
     std::fs::write(keep.join(format!("{name}.png")), &png).unwrap();
 
-    let colored = flame_graph_coverage(&png);
+    let colored = canvas_colored_ratio(cdp, session);
     assert!(
-        colored >= 0.02,
-        "{name}: no flame graph in the screenshot ({:.1}% colored pixels)",
+        colored >= 0.08,
+        "{name}: flame graph canvas was almost empty ({:.1}% colored pixels)",
         colored * 100.0
     );
 
-    if kind == "aggregate" && name.ends_with(".collapsed") {
+    if (kind == "aggregate" && name.ends_with(".collapsed")) || kind == "studio" {
         cdp.call(
             session,
             "Runtime.evaluate",
@@ -411,6 +458,24 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
                 "returnByValue": true,
             }),
         );
+        if kind == "studio" {
+            cdp.call(
+                session,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "document.querySelector('[data-testid=tab-tree]').click()",
+                    "returnByValue": true,
+                }),
+            );
+            assert!(
+                wait_for(
+                    cdp,
+                    session,
+                    "!!document.querySelector('[data-testid=tree-row]')"
+                ),
+                "{name}: dark call tree did not render"
+            );
+        }
         std::thread::sleep(Duration::from_millis(150));
         let dark = cdp.call(
             session,
@@ -443,7 +508,7 @@ fn drag_timeline(cdp: &mut Cdp, session: Option<&str>) {
         session,
         "Runtime.evaluate",
         json!({
-            "expression": "(function(){ const canvas = document.querySelector('#timeline'); const rect = canvas.getBoundingClientRect(); const gutter = 120; const plot = Math.max(1, rect.width - gutter); return {y: rect.top + Math.min(8, rect.height / 2), x0: rect.left + gutter + plot * 0.80, x1: rect.left + gutter + plot * 0.97}; })()",
+            "expression": "(function(){ const canvas = document.querySelector('#timeline'); const rect = canvas.getBoundingClientRect(); const gutter = 128; const plot = Math.max(1, rect.width - gutter); return {y: rect.top + Math.min(8, rect.height / 2), x0: rect.left + gutter + plot * 0.80, x1: rect.left + gutter + plot * 0.97}; })()",
             "returnByValue": true,
         }),
     );
@@ -551,35 +616,116 @@ fn save_timeout_diagnostics(
     saved
 }
 
-/// Share of saturated pixels between 20% and 60% of the page height.
+/// Share of chromatic pixels on the flame canvas itself.
 ///
-/// That band is below the toolbar, so it is white with gray grid lines and
-/// black text unless the WebGL flame graph drew its colored frames.
-fn flame_graph_coverage(png: &[u8]) -> f64 {
-    let decoder = png::Decoder::new(std::io::Cursor::new(png));
-    let mut reader = decoder.read_info().unwrap();
-    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
-    let info = reader.next_frame(&mut pixels).unwrap();
-    let channels = info.color_type.samples();
-    assert!(
-        channels >= 3,
-        "unexpected PNG color type {:?}",
-        info.color_type
+/// Compact rows no longer stretch to fill the page, so the page-band check
+/// would call a real graph blank. The canvas is only as tall as its rows.
+fn canvas_colored_ratio(cdp: &mut Cdp, session: Option<&str>) -> f64 {
+    let value = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "(function(){ const canvas = document.querySelector('[data-testid=flame]'); if (!canvas || !canvas.width || !canvas.height) return 0; const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data; let colored = 0, total = 0; for (let i = 0; i < data.length; i += 16) { const max = Math.max(data[i], data[i+1], data[i+2]); const min = Math.min(data[i], data[i+1], data[i+2]); total++; if (data[i+3] > 0 && max - min > 24) colored++; } return total ? colored / total : 0; })()",
+            "returnByValue": true,
+        }),
     );
-    let (width, height) = (info.width as usize, info.height as usize);
-    let (mut colored, mut total) = (0_usize, 0_usize);
-    for y in height / 5..height * 3 / 5 {
-        let row = &pixels[y * info.line_size..y * info.line_size + width * channels];
-        for pixel in row.chunks_exact(channels) {
-            let max = pixel[..3].iter().max().unwrap();
-            let min = pixel[..3].iter().min().unwrap();
-            total += 1;
-            if max - min > 24 {
-                colored += 1;
+    value
+        .pointer("/result/value")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn synthetic_workers() -> String {
+    let frames = [
+        "main",
+        "event_loop",
+        "accept",
+        "read_headers",
+        "parse_request",
+        "tokenize",
+        "lex_ident",
+        "lex_string",
+        "decode_query",
+        "render_tree",
+        "layout_boxes",
+        "measure_text",
+        "place_flex",
+        "paint_layer",
+        "fill_rect",
+        "commit_frame",
+        "swap_buffers",
+        "worker_loop",
+        "pop_job",
+        "decode_block",
+        "inflate_chunk",
+        "hash_block",
+        "write_buffer",
+        "checksum",
+        "flush_buffer",
+        "fsync_batch",
+    ];
+    let frame_json = frames
+        .iter()
+        .map(|name| format!(r#"{{"name":"{name}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut main_samples = Vec::new();
+    let mut worker_samples = Vec::new();
+    for i in 0..80 {
+        let main: &[u64] = if i < 32 {
+            match i % 4 {
+                0 => &[0, 1, 2, 3, 4, 5, 6],
+                1 => &[0, 1, 2, 3, 4, 5, 7],
+                2 => &[0, 1, 2, 3, 4, 8],
+                _ => &[0, 1, 2, 3, 4, 5],
             }
-        }
+        } else if i < 64 {
+            match i % 4 {
+                0 => &[0, 1, 2, 9, 10, 11],
+                1 => &[0, 1, 2, 9, 10, 12],
+                2 => &[0, 1, 2, 9, 13, 14],
+                _ => &[0, 1, 2, 9, 10],
+            }
+        } else if i % 2 == 0 {
+            &[0, 1, 2, 9, 10, 15, 16]
+        } else {
+            &[0, 1, 2, 9, 13, 15]
+        };
+        let worker: &[u64] = if i < 32 {
+            if i % 2 == 0 {
+                &[17, 18, 19, 20]
+            } else {
+                &[17, 18, 21]
+            }
+        } else if i < 64 {
+            &[17, 18, 22, 23]
+        } else {
+            &[17, 18, 24, 25]
+        };
+        main_samples.push(format!(
+            "[{}]",
+            main.iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        worker_samples.push(format!(
+            "[{}]",
+            worker
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
     }
-    colored as f64 / total.max(1) as f64
+    let weights = vec!["25"; 80].join(",");
+    format!(
+        r#"{{"shared":{{"frames":[{frames}]}},"profiles":[{{"type":"sampled","name":"Main thread","unit":"milliseconds","startValue":0,"endValue":2000,"samples":[{main}],"weights":[{weights}]}},{{"type":"sampled","name":"Worker","unit":"milliseconds","startValue":0,"endValue":2000,"samples":[{worker}],"weights":[{weights}]}}]}}"#,
+        frames = frame_json,
+        main = main_samples.join(","),
+        worker = worker_samples.join(","),
+        weights = weights,
+    )
 }
 
 fn collapsed_fixture() -> String {

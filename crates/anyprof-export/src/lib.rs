@@ -96,8 +96,10 @@ pub fn import(bytes: &[u8], format: Format) -> Result<Profile, Error> {
         Format::Collapsed => collapsed::import(bytes),
         Format::Pprof => pprof::import(bytes),
         Format::Speedscope => speedscope::import(bytes),
-        // Files saved by Node or Chrome have no runtime prefix, so frames are Node.
+        // A V8 document has no runtime prefix, so frames use Node.
         // Browser capture calls [`import_cpuprofile`] with [`Runtime::Browser`].
+        // A rebuilt file (`scriptId` 0, `startTime` 0) keeps a `[runtime]` prefix
+        // and leaves a bare name native.
         Format::Cpuprofile => import_cpuprofile(bytes, Runtime::Node),
     }
 }

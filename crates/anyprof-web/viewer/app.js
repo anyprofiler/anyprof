@@ -3,14 +3,18 @@
 // Profile text is written with textContent or canvas fillText. Nothing from
 // the file is parsed as HTML.
 
-const ROW = 22;
+const ROW = 20;
+const TRACK = 26;
+const GUTTER = 128;
+const FLAME_ROW = 18;
+const FLAME_LEVELS = 40;
 const PALETTE = [
-  [90, 140, 180],
-  [70, 128, 148],
-  [112, 148, 132],
-  [132, 138, 162],
-  [78, 118, 168],
-  [148, 132, 112],
+  [186, 214, 232],
+  [176, 210, 204],
+  [214, 206, 176],
+  [196, 196, 214],
+  [176, 204, 186],
+  [214, 190, 184],
 ];
 
 const state = {
@@ -171,8 +175,10 @@ function showError(message) {
   clear(overview);
   const box = el("div", "notice");
   box.dataset.testid = "timeline-status";
-  box.append(el("h2", null, "Could not read this profile"));
-  box.append(el("p", "error", message));
+  box.append(el("strong", null, "Could not read this profile"));
+  const copy = el("div", "copy");
+  copy.append(el("p", "error", message));
+  box.append(copy);
   overview.append(box);
   const pane = $("pane");
   clear(pane);
@@ -210,13 +216,15 @@ function renderOverview() {
   if (!session.timeline) {
     const box = el("div", "notice");
     box.dataset.testid = "timeline-status";
-    box.append(el("h2", null, "No timeline"));
-    box.append(el("p", null, session.timelineDisabled || "This profile has no timeline."));
+    box.append(el("strong", null, "No timeline"));
+    const copy = el("div", "copy");
+    copy.append(el("p", null, session.timelineDisabled || "This profile has no timeline."));
     if (session.notes && session.notes.length) {
       const list = el("ul", "notes");
       for (const note of session.notes) list.append(el("li", null, note));
-      box.append(list);
+      copy.append(list);
     }
+    box.append(copy);
     overview.append(box);
     document.documentElement.dataset.timeline = "0";
     return;
@@ -228,17 +236,18 @@ function renderOverview() {
   head.append(el("strong", null, "Sample activity"));
   const hint = el("span", "hint");
   const kinds = new Set(session.threads.map((thread) => thread.kind));
+  const sentences = ["Each mark is sample weight in that bucket, not CPU utilization."];
   if (kinds.size === 1 && kinds.has("profile")) {
-    hint.textContent = "Thread ids were not recorded.";
-  } else {
-    hint.textContent = "Each mark is sample weight in that bucket, not CPU utilization.";
+    sentences.unshift("Thread ids were not recorded.");
   }
+  if (session.notes && session.notes.length) sentences.push(session.notes.join(" "));
+  hint.textContent = sentences.join(" ");
   head.append(hint);
   head.append(el("span", "hint", ""));
   const range = el("span", "hint");
   range.id = "range-label";
   head.append(range);
-  const zoom = el("button", null, "Zoom");
+  const zoom = el("button", "mini", "Zoom");
   zoom.id = "zoom-range";
   zoom.dataset.testid = "zoom-range";
   zoom.hidden = true;
@@ -250,7 +259,7 @@ function renderOverview() {
     refreshTimeline();
     refreshTree();
   });
-  const reset = el("button", null, "Reset");
+  const reset = el("button", "mini", "Reset");
   reset.id = "reset-range";
   reset.dataset.testid = "reset-range";
   reset.hidden = true;
@@ -360,9 +369,9 @@ function drawTimeline() {
     bindTimelineDrag(canvas);
   }
   const width = Math.max(1, host.clientWidth);
-  const gutter = 120;
+  const gutter = GUTTER;
   const plotWidth = Math.max(1, width - gutter);
-  const height = Math.max(1, threads.length) * ROW;
+  const height = Math.max(1, threads.length) * TRACK;
   const ratio = window.devicePixelRatio || 1;
   canvas.width = Math.floor(width * ratio);
   canvas.height = Math.floor(height * ratio);
@@ -379,35 +388,55 @@ function drawTimeline() {
   const span = Math.max(1, Number(data.end) - Number(data.start));
   ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
   threads.forEach((thread, index) => {
-    const y = index * ROW;
+    const y = index * TRACK;
     ctx.fillStyle = track;
-    ctx.fillRect(gutter, y, plotWidth, ROW - 1);
+    ctx.fillRect(gutter, y, plotWidth, TRACK - 1);
     ctx.fillStyle = ink;
     ctx.save();
     ctx.beginPath();
-    ctx.rect(0, y, gutter - 6, ROW);
+    ctx.rect(0, y, gutter - 6, TRACK);
     ctx.clip();
-    ctx.fillText(thread.name, 8, y + 15);
+    ctx.fillText(thread.name, 8, y + 17);
     ctx.restore();
     const row = rows[index] || [];
     const bucketWidth = plotWidth / Math.max(1, row.length);
     row.forEach((value, bucket) => {
       if (!value) return;
-      const bar = Math.max(1, ((ROW - 6) * Number(value)) / max);
+      const bar = Math.max(2, (8 * Number(value)) / max);
+      const markWidth = Math.max(1, Math.min(1.5, bucketWidth * 0.45));
       ctx.fillStyle = mark;
-      ctx.fillRect(gutter + bucket * bucketWidth, y + ROW - 3 - bar, Math.max(1, bucketWidth - 0.5), bar);
+      ctx.fillRect(
+        gutter + bucket * bucketWidth + (bucketWidth - markWidth) / 2,
+        y + TRACK - 5 - bar,
+        markWidth,
+        bar
+      );
     });
     ctx.strokeStyle = line;
     ctx.beginPath();
-    ctx.moveTo(gutter, y + ROW - 0.5);
-    ctx.lineTo(width, y + ROW - 0.5);
+    ctx.moveTo(gutter, y + TRACK - 0.5);
+    ctx.lineTo(width, y + TRACK - 0.5);
     ctx.stroke();
   });
+  ctx.strokeStyle = line;
+  ctx.beginPath();
+  ctx.moveTo(gutter - 0.5, 0);
+  ctx.lineTo(gutter - 0.5, height);
+  ctx.stroke();
   if (state.selection && span > 0) {
     const x0 = gutter + ((state.selection.start - data.start) / span) * plotWidth;
     const x1 = gutter + ((state.selection.end - data.start) / span) * plotWidth;
-    ctx.fillStyle = "rgba(10, 95, 212, 0.18)";
-    ctx.fillRect(Math.min(x0, x1), 0, Math.abs(x1 - x0), height);
+    const left = Math.min(x0, x1);
+    const wide = Math.max(1, Math.abs(x1 - x0));
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(gutter, 0, plotWidth, height);
+    ctx.clip();
+    ctx.fillStyle = "rgba(10, 95, 212, 0.22)";
+    ctx.fillRect(left, 0, wide, height);
+    ctx.strokeStyle = "rgba(10, 95, 212, 0.9)";
+    ctx.strokeRect(left + 0.5, 0.5, wide - 1, height - 1);
+    ctx.restore();
   }
   paintRuler(data, gutter, plotWidth);
 }
@@ -424,6 +453,8 @@ function paintRuler(data, gutter, width) {
   for (let index = 0; index <= ticks; index += 1) {
     const tick = el("span", null, formatNs(start + (span * index) / ticks));
     tick.style.left = (width * index) / ticks + "px";
+    if (index === 0) tick.style.transform = "translateX(0)";
+    else if (index === ticks) tick.style.transform = "translateX(-100%)";
     ruler.append(tick);
   }
 }
@@ -436,7 +467,7 @@ function bindTimelineDrag(canvas) {
     const data = state.timeline;
     if (!data) return 0;
     const rect = canvas.getBoundingClientRect();
-    const gutter = 120;
+    const gutter = GUTTER;
     const plot = Math.max(1, rect.width - gutter);
     const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - gutter) / plot));
     const span = Math.max(1, Number(data.end) - Number(data.start));
@@ -515,6 +546,15 @@ async function refreshTree() {
   }
   state.tree = body;
   indexTree();
+  if (!state.tree.nodes.some((node) => node.id === state.selectedNode)) {
+    state.selectedNode = null;
+    state.selectedFrame = null;
+    const roots = kidsOf("root");
+    if (roots[0]) {
+      state.selectedNode = roots[0].id;
+      state.selectedFrame = roots[0].frame;
+    }
+  }
   if (state.expanded.size === 0) expandDefaults();
   renderPane();
   renderInspector();
@@ -568,26 +608,39 @@ function nameMatches(frameId) {
 function flatten() {
   const show = state.query ? matchingIds() : null;
   const out = [];
-  const walk = (node) => {
-    if (show && !show.has(node.id)) return;
+  const pending = [];
+  const roots = kidsOf("root");
+  for (let index = roots.length - 1; index >= 0; index -= 1) pending.push(roots[index]);
+  while (pending.length) {
+    const node = pending.pop();
+    if (show && !show.has(node.id)) continue;
     out.push(node);
-    const open = state.query || state.expanded.has(node.id);
-    if (open) for (const kid of kidsOf(node.id)) walk(kid);
-  };
-  for (const root of kidsOf("root")) walk(root);
+    if (!(state.query || state.expanded.has(node.id))) continue;
+    const kids = kidsOf(node.id);
+    for (let index = kids.length - 1; index >= 0; index -= 1) pending.push(kids[index]);
+  }
   state.flat = out;
   return out;
 }
 
 function matchingIds() {
   const show = new Set();
-  const walk = (node) => {
-    let hit = nameMatches(node.frame);
-    for (const kid of state.byParent.get(node.id) || []) if (walk(kid)) hit = true;
-    if (hit) show.add(node.id);
-    return hit;
-  };
-  for (const root of state.byParent.get("root") || []) walk(root);
+  const pending = [];
+  for (const root of state.byParent.get("root") || []) pending.push({ node: root, seen: false });
+  while (pending.length) {
+    const item = pending.pop();
+    const kids = state.byParent.get(item.node.id) || [];
+    if (!item.seen) {
+      pending.push({ node: item.node, seen: true });
+      for (let index = kids.length - 1; index >= 0; index -= 1) {
+        pending.push({ node: kids[index], seen: false });
+      }
+      continue;
+    }
+    let hit = nameMatches(item.node.frame);
+    for (const kid of kids) if (show.has(kid.id)) hit = true;
+    if (hit) show.add(item.node.id);
+  }
   return show;
 }
 
@@ -597,8 +650,8 @@ function renderPane() {
   else renderTree();
 }
 
-function renderTree() {
-  const pane = $("pane");
+function renderTree(host) {
+  const pane = host || $("pane");
   const previous = pane.querySelector(".scroll");
   const scrollTop = previous ? previous.scrollTop : 0;
   clear(pane);
@@ -633,15 +686,20 @@ function renderTree() {
   scroll.scrollTop = scrollTop;
 }
 
+function headerLabel(key, text) {
+  if (state.sortKey !== key) return text;
+  return text + (state.sortDir < 0 ? " ↓" : " ↑");
+}
+
 function columnHeader() {
   const header = el("div", "cols");
-  const name = el("button", null, "Symbol");
+  const name = el("button", "name-head", headerLabel("name", "Symbol"));
   name.type = "button";
   name.addEventListener("click", () => setSort("name"));
-  const weight = el("button", "num", "Weight");
+  const weight = el("button", null, headerLabel("weight", "Weight"));
   weight.type = "button";
   weight.addEventListener("click", () => setSort("weight"));
-  const self = el("button", "num", "Self");
+  const self = el("button", null, headerLabel("self", "Self"));
   self.type = "button";
   self.addEventListener("click", () => setSort("self"));
   header.append(name, weight, self, el("span", "num", "%"));
@@ -784,6 +842,8 @@ function renderFlame() {
     pane.append(el("div", "empty", "No functions match."));
     return;
   }
+  const column = el("div", "flame-column");
+  const band = el("div", "flame-band");
   const host = el("div", "flame-host");
   const canvas = document.createElement("canvas");
   canvas.id = "flame";
@@ -792,37 +852,65 @@ function renderFlame() {
   const tip = el("div", "tip");
   tip.hidden = true;
   host.append(tip);
-  pane.append(host);
+  band.append(host);
+  const levels = state.tree.nodes.reduce((max, node) => Math.max(max, node.depth), 0) + 1;
+  if (levels > FLAME_LEVELS) {
+    band.append(el(
+      "p",
+      "flame-note",
+      "The flame graph shows the first " + FLAME_LEVELS + " of " + levels + " levels. The call tree lists every frame, and weights are unchanged."
+    ));
+  }
+  const tree = el("div", "flame-tree");
+  column.append(band, tree);
+  pane.append(column);
   drawFlame();
+  renderTree(tree);
 }
 
 function flameRects(rowH, pixelWidth) {
   const rects = [];
   const minimum = 0.5 / Math.max(1, pixelWidth);
-  const walk = (node, x, y, width) => {
-    rects.push({ node, x, y, width, height: Math.max(8, rowH - 1) });
-    let cursor = x;
-    const kids = kidsOf(node.id).filter((kid) => !state.query || matchingIdsCached(kid.id));
-    for (const kid of kids) {
-      const childWidth = node.weight ? (width * kid.weight) / node.weight : 0;
-      if (childWidth >= minimum) walk(kid, cursor, y + rowH, childWidth);
-      cursor += childWidth;
-    }
-  };
   const show = state.query ? matchingIds() : null;
-  matchingIdsCached = (id) => !show || show.has(id);
-  const roots = kidsOf("root").filter((node) => matchingIdsCached(node.id));
+  const roots = kidsOf("root").filter((node) => !show || show.has(node.id));
   const total = roots.reduce((sum, node) => sum + node.weight, 0) || 1;
+  const pending = [];
   let cursor = 0;
   for (const root of roots) {
     const width = root.weight / total;
-    walk(root, cursor, 0, width);
+    pending.push({ node: root, x: cursor, y: 0, width, level: 0 });
     cursor += width;
+  }
+  while (pending.length) {
+    const item = pending.pop();
+    if (item.level >= FLAME_LEVELS) continue;
+    rects.push({
+      node: item.node,
+      x: item.x,
+      y: item.y,
+      width: item.width,
+      height: Math.max(8, rowH - 1),
+    });
+    const kids = kidsOf(item.node.id).filter((kid) => !show || show.has(kid.id));
+    let childCursor = item.x;
+    const next = [];
+    for (const kid of kids) {
+      const childWidth = item.node.weight ? (item.width * kid.weight) / item.node.weight : 0;
+      if (childWidth >= minimum) {
+        next.push({
+          node: kid,
+          x: childCursor,
+          y: item.y + rowH,
+          width: childWidth,
+          level: item.level + 1,
+        });
+      }
+      childCursor += childWidth;
+    }
+    for (let index = next.length - 1; index >= 0; index -= 1) pending.push(next[index]);
   }
   return rects;
 }
-
-let matchingIdsCached = () => true;
 
 function drawFlame() {
   const canvas = $("flame");
@@ -830,9 +918,10 @@ function drawFlame() {
   const host = canvas.parentElement;
   const width = Math.max(1, host.clientWidth);
   const levels = state.tree.nodes.reduce((max, node) => Math.max(max, node.depth), 0) + 1;
-  const rowH = Math.max(18, Math.floor((Math.max(host.clientHeight, 120) - 4) / levels));
+  const shown = Math.min(levels, FLAME_LEVELS);
+  const rowH = FLAME_ROW;
   const rects = flameRects(rowH, width);
-  const height = Math.max(host.clientHeight, levels * rowH);
+  const height = Math.max(rowH, shown * rowH);
   const ratio = window.devicePixelRatio || 1;
   canvas.width = Math.floor(width * ratio);
   canvas.height = Math.floor(height * ratio);
@@ -841,7 +930,6 @@ function drawFlame() {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  const text = cssColor("--text", "#1c1c1e");
   for (const rect of rects) {
     const pixel = rect.width * width;
     if (pixel < 0.5) continue;
@@ -854,7 +942,7 @@ function drawFlame() {
       : "rgb(" + color[0] + "," + color[1] + "," + color[2] + ")";
     ctx.fillRect(rect.x * width + 0.5, rect.y + 0.5, Math.max(0, pixel - 1), barH);
     if (pixel > 36) {
-      ctx.fillStyle = selected ? "#fff" : text;
+      ctx.fillStyle = selected ? "#fff" : "#1d1d1f";
       ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
       ctx.save();
       ctx.beginPath();
@@ -957,7 +1045,9 @@ function renderInspector() {
 
 function addDetail(detail, name, value) {
   detail.append(el("dt", null, name));
-  detail.append(el("dd", null, value));
+  const cell = el("dd", null, value);
+  cell.title = value;
+  detail.append(cell);
 }
 
 function setPane(name) {
@@ -1026,6 +1116,40 @@ function onKey(event) {
   }
 }
 
+function bindSplitter(splitter, axis) {
+  if (!splitter) return;
+  splitter.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const overview = $("overview");
+    const inspector = document.querySelector(".inspector");
+    const start = axis === "y" ? event.clientY : event.clientX;
+    const startSize = axis === "y"
+      ? overview.getBoundingClientRect().height
+      : inspector.getBoundingClientRect().width;
+    const move = (ev) => {
+      const delta = (axis === "y" ? ev.clientY : ev.clientX) - start;
+      if (axis === "y") {
+        const next = Math.max(32, Math.min(window.innerHeight * 0.55, startSize + delta));
+        overview.style.flex = "0 0 " + next + "px";
+        overview.style.height = next + "px";
+        overview.style.maxHeight = next + "px";
+      } else {
+        const next = Math.max(200, Math.min(window.innerWidth * 0.5, startSize - delta));
+        inspector.style.width = next + "px";
+      }
+      if (state.pane === "flame") drawFlame();
+      if (state.session && state.session.timeline) drawTimeline();
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  });
+}
+
 async function main() {
   initTheme();
   document.addEventListener("keydown", onKey);
@@ -1053,6 +1177,8 @@ async function main() {
     if (state.pane === "flame") drawFlame();
     if (state.session && state.session.timeline) drawTimeline();
   });
+  bindSplitter($("split-overview"), "y");
+  bindSplitter($("split-inspector"), "x");
   let session;
   try {
     const response = await fetch("session");

@@ -93,7 +93,7 @@ trait Session {
 
 Stacks are leaf-first: `frames[0]` is the leaf (the frame that was on-CPU) and the last frame is the root. That matches pprof. Collapsed stacks and speedscope are root-first, and the exporters reverse the order.
 
-A frame from a non-native runtime is written as `[runtime] name`, for example `[node] work`, in collapsed stacks, speedscope, and pprof, so mixed stacks keep their origin. A `.cpuprofile` recorded from Node or a browser tab is the original V8 document from `Profiler.stop`, not a rebuilt tree. `convert` rebuilds a `.cpuprofile` Chrome DevTools can open: a `(root)` node, `scriptId` on every call frame, and `timeDeltas` the same length as `samples`.
+A frame from a non-native runtime is written as `[runtime] name`, for example `[node] work`, in collapsed stacks, speedscope, pprof, and a `.cpuprofile` rebuilt by `convert`, so mixed stacks keep their origin. A `.cpuprofile` recorded from Node or a browser tab is the original V8 document from `Profiler.stop`, not a rebuilt tree. `convert` rebuilds a `.cpuprofile` Chrome DevTools can open: a `(root)` node, `scriptId` `"0"` on every call frame, `startTime` 0, and `timeDeltas` the same length as `samples`. Native names stay bare. Kernel, Rust, Go, Python, Java, and the other runtimes keep the prefix.
 
 ## Install
 
@@ -217,7 +217,7 @@ Default format when `-f` is omitted and `-o` is not a recognized file name:
 
 `-o cpu.collapsed` still writes collapsed stacks for Node. `--format pprof -o cpu.cpuprofile` still writes pprof. A directory named `profiles.cpuprofile` does not select the format; the backend default does.
 
-`convert` (`conv`) reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `-f` / `--from` is inferred from the file name (`.collapsed`, `.folded`, `.txt`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. `-t` / `--to` is the output format. `-i` / `--input` and `-o` / `--output` are the files. A `.cpuprofile` that carries no `[runtime]` prefix is imported as Node. A `.cpuprofile` written by `convert` is rebuilt from the unified stacks and is still a tree Chrome DevTools accepts.
+`convert` (`conv`) reads collapsed stacks, speedscope JSON, pprof (gzip-compressed or raw protobuf), and V8 `.cpuprofile`, and writes any of the four. `-f` / `--from` is inferred from the file name (`.collapsed`, `.folded`, `.txt`, `.json`, `.speedscope.json`, `.pb.gz`, `.pprof`, `.cpuprofile`) when you omit it. `-t` / `--to` is the output format. `-i` / `--input` and `-o` / `--output` are the files. A V8 `.cpuprofile` that is not the rebuilt shape is imported as Node, or as browser when the capture used the browser backend. A rebuilt `.cpuprofile` (`scriptId` `"0"` and `startTime` 0) keeps a `[runtime] name` prefix, and a bare name in that shape is native rather than Node. The rebuilt tree is still one Chrome DevTools can open.
 
 Collapsed stacks keep the runtime label and function name. Speedscope also keeps file, line, and column. pprof also keeps the instruction address, duration, and sampling period. A frame's module is not written yet.
 
@@ -243,8 +243,10 @@ anyprof rec -p 1234 -d 10s -w --web-timeout 10m
 The timeline is drawn only when the file is a time series:
 
 - A V8 `.cpuprofile` from Node or a browser (`Profiler.stop`, with `samples` and `timeDeltas` and a stack that was observed more than once) is sampled time. It is one track. The file does not record a thread id, and the chart is sample activity, not CPU utilization.
-- Speedscope `evented` profiles use each event's `at` timestamp. Speedscope `sampled` profiles use the file order as a clock only when the unit is a time unit and a stack is stored more than once.
+- Speedscope `evented` profiles use each event's `at` timestamp as a clock only when the unit is a time unit. `unit` `none`, `bytes`, or any other non-time unit stays an aggregate: the open and close intervals are weights, and there is no timeline. Speedscope `sampled` profiles use the file order as a clock only when the unit is a time unit and a stack is stored more than once.
 - Everything else is an aggregate. The page says **No timeline** and still shows the weighted call tree and flame graph. That includes collapsed stacks, pprof, anyprof's speedscope files (`unit` is `none`), and a `.cpuprofile` rebuilt by `convert` or by `record --format cpuprofile` for a native, Rust, Go, Python, or Java process. Those files use `scriptId` 0 and `startTime` 0, and their `timeDeltas` are folded sample counts, not a clock, even when the same stack is listed more than once.
+
+A stack deeper than 8,192 frames is refused, with the limit in the error. The page walks the call tree and the flame graph without recursion. The flame graph draws the first 40 levels and says when the tree is deeper; the call tree still lists every kept frame, and the weights are the weights from the file.
 
 Native, Rust, Go, Python, and Java recordings fold each distinct stack into one weight before the file is written. The samplers see a thread id (and, on Linux, a perf timestamp) while they are sampling, and `Profile` does not keep either. A timeline for those recordings would mean keeping the sample series in the profile and in the exporters. That is not part of this viewer, and neither is a system-wide capture mode. Sample order, a weight copied into `timeDeltas`, and `period * count / wall` are not used as a clock, a thread list, or a CPU curve. CPU time is shown as text only when a pprof profile has a real `cpu` column and a wall duration. anyprof's own pprof files are `samples/count` plus a wall duration and a sampling period, so they do not show CPU time.
 
@@ -283,7 +285,7 @@ The URL looks like `http://127.0.0.1:53211/t/<token>/`. It has no `#fragment`, b
 
 ### Binary size
 
-The viewer is the three static files above, gzip-compressed into the binary by the crate's build script, plus `tiny_http` and `webbrowser`. There is no Node runtime and no embedded speedscope build. The files are 2,595, 7,670, and 35,883 bytes before compression, and the build script's gzip output is 891, 2,112, and 9,100 bytes (12,103 bytes together). On one Linux x86_64 machine, `cargo build -p anyprof-cli --profile dist` wrote a 12,705,320 byte binary, and `strip` reduced that file to 10,126,408 bytes. Those sizes are that build, not a size for every target.
+The viewer is the three static files above, gzip-compressed into the binary by the crate's build script, plus `tiny_http` and `webbrowser`. There is no Node runtime and no embedded speedscope build. The files are 3,034, 11,117, and 40,249 bytes before compression, and the build script's gzip output is 996, 2,657, and 10,115 bytes (13,768 bytes together). On one Linux x86_64 machine, `cargo build -p anyprof-cli --profile dist` wrote a 12,705,000 byte binary, and `strip` reduced that file to 10,127,368 bytes. Those sizes are that build, not a size for every target.
 
 ## Permissions
 

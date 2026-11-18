@@ -20,7 +20,7 @@ use crate::symbol::split_runtime_prefix;
 
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SAMPLES: usize = 5_000_000;
-const MAX_DEPTH: usize = 8_192;
+pub(crate) const MAX_DEPTH: usize = 8_192;
 
 /// What a weight means. The viewer uses this instead of guessing CPU usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +353,12 @@ impl Trace {
         if weight == 0 || frames.is_empty() {
             return Ok(());
         }
+        if frames.len() > MAX_DEPTH {
+            return Err(Error::invalid(
+                "profile",
+                format!("a stack is deeper than {MAX_DEPTH} frames"),
+            ));
+        }
         if self.samples.len() >= MAX_SAMPLES {
             return Err(Error::invalid(
                 "profile",
@@ -675,20 +681,23 @@ fn sort_ids(ids: &mut [u32], nodes: &[BuildNode]) {
     });
 }
 
-fn sort_children(id: u32, nodes: &mut [BuildNode]) {
-    let mut children = std::mem::take(&mut nodes[id as usize].children);
-    sort_ids(&mut children, nodes);
-    nodes[id as usize].children = children;
-    let children = nodes[id as usize].children.clone();
-    for child in children {
-        sort_children(child, nodes);
+fn sort_children(root: u32, nodes: &mut [BuildNode]) {
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        let mut children = std::mem::take(&mut nodes[id as usize].children);
+        sort_ids(&mut children, nodes);
+        nodes[id as usize].children = children;
+        pending.extend(nodes[id as usize].children.iter().copied());
     }
 }
 
-fn push_preorder(id: u32, nodes: &[BuildNode], out: &mut Vec<u32>) {
-    out.push(id);
-    for child in &nodes[id as usize].children {
-        push_preorder(*child, nodes, out);
+fn push_preorder(root: u32, nodes: &[BuildNode], out: &mut Vec<u32>) {
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        out.push(id);
+        for child in nodes[id as usize].children.iter().rev() {
+            pending.push(*child);
+        }
     }
 }
 
@@ -946,6 +955,7 @@ fn from_cpuprofile(value: &Value) -> Result<Trace, Error> {
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::invalid("cpuprofile", "nodes is not an array"))?;
+    let rebuilt = crate::cpuprofile::is_rebuilt_cpuprofile(root);
     let mut parsed: HashMap<u64, CpuNode> = HashMap::new();
     let mut children = Vec::new();
     for node in nodes {
@@ -954,7 +964,7 @@ fn from_cpuprofile(value: &Value) -> Result<Trace, Error> {
         let call = node.get("callFrame").ok_or_else(|| {
             Error::invalid("cpuprofile", format!("node {id} is missing callFrame"))
         })?;
-        let (runtime, name) = call_name(call);
+        let (runtime, name) = call_name(call, rebuilt);
         let url = call.get("url").and_then(Value::as_str).unwrap_or("");
         let file = if url.is_empty() {
             None
@@ -1012,7 +1022,7 @@ fn from_cpuprofile(value: &Value) -> Result<Trace, Error> {
         // scriptId 0 and startTime 0 is the shape `convert` and non-V8
         // `--format cpuprofile` write. A repeated sample id in that shape is
         // the same folded stack stored twice, not a clock.
-        let folded = aligned && anyprof_folded_cpuprofile(root);
+        let folded = aligned && rebuilt;
         if aligned && repeats && !folded {
             // V8's timeDeltas are microseconds between observations. A repeated
             // node id is a stack seen at more than one time, which folded
@@ -1193,33 +1203,17 @@ fn sample_ids_repeat(samples: &[Value]) -> bool {
     false
 }
 
-/// `anyprof convert` and non-V8 `--format cpuprofile` write this shape:
-/// `scriptId` `"0"` on every frame and `startTime` 0. Sample ids may repeat
-/// when the same folded stack was stored more than once. That is not a clock.
-fn anyprof_folded_cpuprofile(root: &Value) -> bool {
-    if json_i64(root.get("startTime")).unwrap_or(0) != 0 {
-        return false;
-    }
-    let Some(nodes) = root.get("nodes").and_then(Value::as_array) else {
-        return false;
-    };
-    !nodes.is_empty()
-        && nodes
-            .iter()
-            .all(|node| match node.pointer("/callFrame/scriptId") {
-                Some(Value::String(text)) => text == "0",
-                Some(Value::Number(number)) => number.as_u64() == Some(0),
-                _ => false,
-            })
-}
-
-fn call_name(call: &Value) -> (Runtime, String) {
+fn call_name(call: &Value, rebuilt: bool) -> (Runtime, String) {
     let raw = call
         .get("functionName")
         .and_then(Value::as_str)
         .unwrap_or("");
     let (runtime, name) = match split_runtime_prefix(raw) {
         Some((runtime, name)) => (runtime, name),
+        // A V8 profile's functions are JavaScript. A rebuilt file's bare names
+        // are not: convert used to drop the runtime, and inventing Node labeled
+        // native, Rust, Go, Python, Java, and kernel frames as Node.
+        None if rebuilt => (Runtime::Native, raw),
         None => (Runtime::Node, raw),
     };
     let name = if name.is_empty() {
@@ -1423,7 +1417,15 @@ fn from_speedscope(value: &Value) -> Result<Trace, Error> {
                     cursor = at;
                     let frame = speed_frame(&mut trace, shared, frame_index)?;
                     match kind.as_str() {
-                        "O" | "o" => open.push(frame),
+                        "O" | "o" => {
+                            if open.len() >= MAX_DEPTH {
+                                return Err(Error::invalid(
+                                    "speedscope",
+                                    format!("an evented stack is deeper than {MAX_DEPTH} frames"),
+                                ));
+                            }
+                            open.push(frame);
+                        }
                         "C" | "c" => {
                             if open.last().copied() != Some(frame) {
                                 let open_name = open
@@ -1595,6 +1597,7 @@ mod tests {
     use super::{Query, WeightKind, activity, aggregate, load_trace};
     use crate::proto::Writer;
     use crate::{Format, export};
+    use anyprof_core::{Frame, Profile, Runtime, Stack};
 
     fn names<'a>(trace: &'a super::Trace, frames: &[u32]) -> Vec<&'a str> {
         frames
@@ -1705,6 +1708,7 @@ mod tests {
         assert_eq!(trace.threads.len(), 1);
         assert_eq!(trace.threads[0].kind, super::TrackKind::Profile);
         let hot = frame_named(&trace, "hot");
+        assert_eq!(hot.runtime, Runtime::Node);
         assert_eq!(hot.file.as_deref(), Some("app.js"));
         assert_eq!(hot.line, Some(10));
         assert_eq!(hot.column, Some(1));
@@ -2020,6 +2024,257 @@ mod tests {
             loaded.as_secs() < 15 && aggregated.as_secs() < 5,
             "load {loaded:?} aggregate {aggregated:?}"
         );
+    }
+
+    #[test]
+    fn converted_cpuprofile_keeps_each_runtime_and_hides_kernel() {
+        let profile = Profile {
+            stacks: vec![
+                Stack {
+                    frames: vec![
+                        Frame::new(Runtime::Java, "App.spin"),
+                        Frame::new(Runtime::Kernel, "schedule"),
+                    ],
+                    weight: 3,
+                },
+                Stack {
+                    frames: vec![
+                        Frame::new(Runtime::Python, "spin"),
+                        Frame::new(Runtime::Native, "main"),
+                    ],
+                    weight: 5,
+                },
+                Stack {
+                    frames: vec![
+                        Frame::new(Runtime::Rust, "crate::spin"),
+                        Frame::new(Runtime::Go, "runtime.main"),
+                    ],
+                    weight: 7,
+                },
+                Stack {
+                    frames: vec![Frame::new(Runtime::Node, "work")],
+                    weight: 11,
+                },
+            ],
+            ..Profile::default()
+        };
+        let bytes = export(&profile, Format::Cpuprofile).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let names: Vec<_> = value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["callFrame"]["functionName"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"[java] App.spin"));
+        assert!(names.contains(&"[kernel] schedule"));
+        assert!(names.contains(&"[python] spin"));
+        assert!(names.contains(&"main"));
+        assert!(names.contains(&"[rust] crate::spin"));
+        assert!(names.contains(&"[go] runtime.main"));
+        assert!(names.contains(&"[node] work"));
+
+        let trace = load_trace(&bytes).unwrap();
+        assert!(trace.timeline.is_none());
+        assert_eq!(trace.total_weight(), 26);
+        assert_eq!(frame_named(&trace, "App.spin").runtime, Runtime::Java);
+        assert_eq!(frame_named(&trace, "schedule").runtime, Runtime::Kernel);
+        assert!(frame_named(&trace, "schedule").system);
+        assert_eq!(frame_named(&trace, "spin").runtime, Runtime::Python);
+        assert_eq!(frame_named(&trace, "main").runtime, Runtime::Native);
+        assert_eq!(frame_named(&trace, "crate::spin").runtime, Runtime::Rust);
+        assert_eq!(frame_named(&trace, "runtime.main").runtime, Runtime::Go);
+        assert_eq!(frame_named(&trace, "work").runtime, Runtime::Node);
+        let hidden = aggregate(
+            &trace,
+            &Query {
+                hide_system: true,
+                ..Query::default()
+            },
+        );
+        assert_eq!(hidden.total, 26);
+        assert!(
+            hidden
+                .nodes
+                .iter()
+                .all(|node| trace.frames[node.frame as usize].name != "schedule")
+        );
+        assert!(
+            hidden
+                .nodes
+                .iter()
+                .any(|node| trace.frames[node.frame as usize].name == "App.spin")
+        );
+
+        let legacy = r#"{
+          "nodes": [
+            {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": [2, 3]},
+            {"id": 2, "callFrame": {"functionName": "work", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": []},
+            {"id": 3, "callFrame": {"functionName": "[kernel] schedule", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": []}
+          ],
+          "startTime": 0,
+          "samples": [2, 3],
+          "timeDeltas": [4, 1]
+        }"#;
+        let trace = load_trace(legacy.as_bytes()).unwrap();
+        assert_eq!(frame_named(&trace, "work").runtime, Runtime::Native);
+        assert_ne!(frame_named(&trace, "work").runtime, Runtime::Node);
+        assert!(frame_named(&trace, "schedule").system);
+        let hidden = aggregate(
+            &trace,
+            &Query {
+                hide_system: true,
+                ..Query::default()
+            },
+        );
+        assert_eq!(hidden.total, 4);
+        assert!(
+            hidden
+                .nodes
+                .iter()
+                .all(|node| trace.frames[node.frame as usize].name != "schedule")
+        );
+    }
+
+    #[test]
+    fn evented_speedscope_without_a_time_unit_has_no_timeline() {
+        for unit in ["none", "bytes"] {
+            let body = format!(
+                r#"{{
+                  "shared": {{"frames": [{{"name": "main"}}, {{"name": "hot"}}]}},
+                  "profiles": [{{
+                    "type": "evented",
+                    "name": "worker",
+                    "unit": "{unit}",
+                    "startValue": 0,
+                    "endValue": 100,
+                    "events": [
+                      {{"type": "O", "frame": 0, "at": 0}},
+                      {{"type": "O", "frame": 1, "at": 10}},
+                      {{"type": "C", "frame": 1, "at": 40}},
+                      {{"type": "C", "frame": 0, "at": 100}}
+                    ]
+                  }}]
+                }}"#
+            );
+            let trace = load_trace(body.as_bytes()).unwrap();
+            assert!(trace.timeline.is_none(), "{unit}");
+            assert!(activity(&trace, 0, 1, 4).is_err(), "{unit}");
+            assert_eq!(trace.total_weight(), 100, "{unit}");
+            assert_eq!(trace.cpu_ns, None, "{unit}");
+            let disabled = trace.timeline_disabled.as_deref().unwrap();
+            assert!(disabled.contains("not a clock"), "{unit}: {disabled}");
+            let kind = if unit == "bytes" {
+                WeightKind::Bytes
+            } else {
+                WeightKind::Count
+            };
+            assert_eq!(trace.weight_kind, kind, "{unit}");
+            let tree = aggregate(&trace, &Query::default());
+            assert_eq!(tree.total, 100, "{unit}");
+        }
+    }
+
+    #[test]
+    fn wall_time_and_a_non_time_cpu_column_are_not_cpu_time() {
+        let wall = pprof_message(
+            &["", "wall", "nanoseconds", "main"],
+            &[(1, 2)],
+            &[sample_values(&[1], &[2_500_000])],
+            &[(1, 3, 0)],
+        );
+        let trace = load_trace(&wall).unwrap();
+        assert!(trace.timeline.is_none());
+        assert_eq!(trace.weight_kind, WeightKind::Duration);
+        assert_eq!(trace.cpu_ns, None);
+        assert_eq!(trace.total_weight(), 2_500_000);
+        assert_eq!(frame_named(&trace, "main").name, "main");
+
+        let counts = pprof_message(
+            &["", "samples", "count", "cpu", "count", "hot"],
+            &[(1, 2), (3, 4)],
+            &[sample_values(&[1], &[4, 9])],
+            &[(1, 5, 0)],
+        );
+        let trace = load_trace(&counts).unwrap();
+        assert!(trace.timeline.is_none());
+        assert_eq!(trace.weight_kind, WeightKind::Count);
+        assert_eq!(trace.cpu_ns, None);
+        assert_eq!(trace.total_weight(), 4);
+        let tree = aggregate(&trace, &Query::default());
+        assert_eq!(tree.total, 4);
+    }
+
+    #[test]
+    fn a_deep_stack_keeps_its_weight_until_the_depth_limit() {
+        let depth = super::MAX_DEPTH;
+        let mut line = String::new();
+        for index in 0..depth {
+            if index > 0 {
+                line.push(';');
+            }
+            line.push_str(&format!("f{index}"));
+        }
+        line.push_str(" 9\n");
+        let trace = load_trace(line.as_bytes()).unwrap();
+        assert_eq!(trace.total_weight(), 9);
+        assert_eq!(trace.samples.len(), 1);
+        assert_eq!(trace.stack(trace.samples[0].stack).len(), depth);
+        let tree = aggregate(&trace, &Query::default());
+        assert_eq!(tree.total, 9);
+        assert_eq!(tree.nodes.len(), depth);
+        assert_eq!(tree.nodes[0].weight, 9);
+        assert_eq!(tree.nodes[0].self_weight, 0);
+        assert_eq!(tree.nodes.last().unwrap().self_weight, 9);
+        assert_eq!(
+            trace.frames[tree.nodes.last().unwrap().frame as usize].name,
+            format!("f{}", depth - 1)
+        );
+
+        let mut too_deep = String::new();
+        for index in 0..=depth {
+            if index > 0 {
+                too_deep.push(';');
+            }
+            too_deep.push_str(&format!("g{index}"));
+        }
+        too_deep.push_str(" 4\n");
+        let err = load_trace(too_deep.as_bytes()).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("8192"),
+            "the depth limit was not named: {text}"
+        );
+    }
+
+    fn pprof_message(
+        strings: &[&str],
+        types: &[(u64, u64)],
+        samples: &[Writer],
+        functions: &[(u64, u64, u64)],
+    ) -> Vec<u8> {
+        let mut message = Writer::new();
+        for (type_index, unit_index) in types {
+            message.field_message(1, &value_type(*type_index, *unit_index));
+        }
+        for sample in samples {
+            message.field_message(2, sample);
+        }
+        for (id, name, file) in functions {
+            message.field_message(4, &location(*id, 0, *id, 1));
+            message.field_message(5, &function(*id, *name, *file));
+        }
+        for text in strings {
+            message.field_string(6, text);
+        }
+        message.into_vec()
+    }
+
+    fn sample_values(locations: &[u64], values: &[u64]) -> Writer {
+        let mut writer = Writer::new();
+        writer.field_packed_varints(1, locations);
+        writer.field_packed_varints(2, values);
+        writer
     }
 
     fn labeled_pprof() -> Vec<u8> {
