@@ -3,7 +3,8 @@ use std::io::Read;
 use std::path::Path;
 
 /// Magic that the Go linker plants in binaries built with the standard toolchain.
-const GO_BUILD_INFO_MAGIC: &[u8] = b"\xffGo buildinf:";
+/// Go's linker header is 0xFF, a space, then `Go buildinf:` (`debug/buildinfo`).
+const GO_BUILD_INFO_MAGIC: &[u8] = b"\xff Go buildinf:";
 
 /// Read buffer. The overlap of `MAGIC.len() - 1` bytes catches a magic that
 /// straddles two reads.
@@ -51,7 +52,8 @@ mod tests {
 
     #[test]
     fn magic_must_include_the_leading_marker_byte() {
-        assert!(contains_magic(b"xx\xffGo buildinf:yy"));
+        assert!(contains_magic(b"xx\xff Go buildinf:yy"));
+        assert!(!contains_magic(b"\xffGo buildinf:"));
         assert!(!contains_magic(b"Go buildinf:"));
         assert!(!contains_magic(b""));
         assert!(!contains_magic(

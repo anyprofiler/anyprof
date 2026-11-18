@@ -100,7 +100,11 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         {
             break;
         }
-        match task.sample_addresses() {
+        let go_images: Vec<_> = symbols
+            .iter()
+            .filter_map(|image| image.go.clone())
+            .collect();
+        match task.sample_addresses(&go_images) {
             Ok(stacks) => {
                 for stack in stacks {
                     if !stack.is_empty() {
@@ -197,6 +201,14 @@ fn finish_profile(
 
 fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
+    if let Some(frame) = go_frame(symbols, lookup, addr) {
+        return frame;
+    }
+    if lookup != addr
+        && let Some(frame) = go_frame(symbols, addr, addr)
+    {
+        return frame;
+    }
     let image = symbols
         .iter()
         .find(|image| image.contains(lookup))
@@ -219,6 +231,24 @@ fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
     frame
 }
 
+fn go_frame(symbols: &[ImageSymbols], lookup: u64, addr: u64) -> Option<Frame> {
+    for image in symbols {
+        let Some(go) = &image.go else {
+            continue;
+        };
+        let Some(symbol) = go.symbol(lookup) else {
+            continue;
+        };
+        let mut frame = Frame::new(Runtime::Go, symbol.name);
+        frame.file = symbol.file;
+        frame.line = symbol.line;
+        frame.address = Some(addr);
+        frame.module = Some(image.module.clone());
+        return Some(frame);
+    }
+    None
+}
+
 struct Task {
     port: mach_port_t,
 }
@@ -239,7 +269,10 @@ impl Task {
         Ok(Self { port })
     }
 
-    fn sample_addresses(&self) -> Result<Vec<Vec<u64>>, SampleFault> {
+    fn sample_addresses(
+        &self,
+        go_images: &[crate::go_sym::GoImage],
+    ) -> Result<Vec<Vec<u64>>, SampleFault> {
         let threads = self.threads()?;
         let running: Vec<thread_act_t> = threads
             .ports
@@ -255,7 +288,7 @@ impl Task {
             // `threads` stays alive until this function returns, so each
             // resume in `unwind_thread` happens before `ThreadList` drops the
             // send rights.
-            match unwind_thread(self.port, *thread) {
+            match unwind_thread(self.port, *thread, go_images) {
                 Ok(Some(frames)) => stacks.push(frames),
                 Ok(None) => {}
                 Err(err) => return Err(err),
@@ -444,7 +477,11 @@ impl Drop for Suspended<'_> {
     }
 }
 
-fn unwind_thread(task: task_t, thread: thread_act_t) -> Result<Option<Vec<u64>>, SampleFault> {
+fn unwind_thread(
+    task: task_t,
+    thread: thread_act_t,
+    go_images: &[crate::go_sym::GoImage],
+) -> Result<Option<Vec<u64>>, SampleFault> {
     let mut resume_failure = None;
     let Some(suspended) = Suspended::new(thread, &mut resume_failure) else {
         return Ok(None);
@@ -462,8 +499,8 @@ fn unwind_thread(task: task_t, thread: thread_act_t) -> Result<Option<Vec<u64>>,
         )
     };
     let frames = if kr == KERN_SUCCESS {
-        let (pc, fp, lr) = registers(&state);
-        let frames = walk_frames(task, pc, fp, lr);
+        let (pc, sp, fp, lr) = registers(&state);
+        let frames = walk_frames(task, pc, sp, fp, lr, go_images);
         if frames.is_empty() {
             None
         } else {
@@ -482,22 +519,46 @@ fn unwind_thread(task: task_t, thread: thread_act_t) -> Result<Option<Vec<u64>>,
 }
 
 #[cfg(target_arch = "aarch64")]
-fn registers(state: &ThreadState) -> (u64, u64, u64) {
+fn registers(state: &ThreadState) -> (u64, u64, u64, u64) {
     let flags = state.__flags;
     (
         apply_strip(state.__pc, flags, StripKind::Code, false),
+        apply_strip(state.__sp, flags, StripKind::Data, false),
         apply_strip(state.__fp, flags, StripKind::Data, false),
         apply_strip(state.__lr, flags, StripKind::Code, true),
     )
 }
 
 #[cfg(target_arch = "x86_64")]
-fn registers(state: &ThreadState) -> (u64, u64, u64) {
+fn registers(state: &ThreadState) -> (u64, u64, u64, u64) {
     // x86_64 pointers are not authenticated.
-    (state.__rip, state.__rbp, 0)
+    (state.__rip, state.__rsp, state.__rbp, 0)
 }
 
-fn walk_frames(task: task_t, pc: u64, fp: u64, lr: u64) -> Vec<u64> {
+fn walk_frames(
+    task: task_t,
+    pc: u64,
+    sp: u64,
+    fp: u64,
+    lr: u64,
+    go_images: &[crate::go_sym::GoImage],
+) -> Vec<u64> {
+    let machine = if cfg!(target_arch = "aarch64") {
+        crate::go_sym::GoMachine::Arm64
+    } else {
+        crate::go_sym::GoMachine::X86_64
+    };
+    if let Some(frames) = crate::go_sym::unwind(
+        go_images,
+        pc,
+        sp,
+        lr,
+        machine,
+        |addr, buf| read_task(task, addr, buf),
+        |addr| apply_strip(addr, policy::stack_strip_flags(), StripKind::Code, false),
+    ) {
+        return frames;
+    }
     let mut frames = Vec::new();
     if plausible_code(pc) {
         frames.push(pc);
@@ -638,14 +699,17 @@ fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {
         let file_symbols =
             ImageSymbols::parse_file(Path::new(&remote.path), remote.load, &module, cpu);
         let rust_image = crate::rust_image::file_is_rust(Path::new(&remote.path));
+        let go = attach_go(&remote.path, remote.load);
         if let Some(mut parsed) = file_symbols {
             parsed.rust_image = rust_image;
+            parsed.go = go;
             images.push(parsed);
             continue;
         }
         if remote.end > remote.load {
             let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
             image.rust_image = rust_image;
+            image.go = go;
             images.push(image);
         }
     }
@@ -662,6 +726,11 @@ fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {
         images.push(parsed);
     }
     images
+}
+
+fn attach_go(path: &str, load_addr: u64) -> Option<crate::go_sym::GoImage> {
+    let bias = crate::go_sym::macho_bias(Path::new(path), load_addr)?;
+    crate::go_sym::open_image_at(Path::new(path), bias)
 }
 
 struct RemoteImage {

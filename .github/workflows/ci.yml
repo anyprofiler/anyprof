@@ -13,15 +13,17 @@ env:
 
 jobs:
   test:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.os }} (Go ${{ matrix.go }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # macOS arm64, then macOS Intel, then Windows, then Linux.
         # macos-latest is arm64. macos-15-intel is x86_64. A green arm64
-        # job is not Intel coverage.
+        # job is not Intel coverage. Go 1.22 keeps the header textStart.
+        # Go 1.26 writes that word as zero; both are live-sampled.
         os: [macos-latest, macos-15-intel, windows-latest, ubuntu-latest]
+        go: ["1.22.x", "1.26.x"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,6 +39,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -68,16 +73,17 @@ jobs:
           # The runner images ship Chrome; the viewer smoke test must not skip.
           ANYPROF_REQUIRE_CHROME: "1"
           ANYPROF_SMOKE_ARTIFACTS: ${{ runner.temp }}/web-smoke
-          # macOS samples C++ and Rust under sudo. Ubuntu samples both after
-          # the sysctl step. Windows samples both as the same user. A skip
-          # is a failure. The MSRV job does not set this and does not
-          # change sysctls. musl is cargo check only, above.
+          # macOS samples C++, Rust, and Go under sudo. Ubuntu samples them
+          # after the sysctl step. Windows samples them as the same user. A
+          # skip is a failure. The MSRV job does not set this and does not
+          # change sysctls. musl is cargo check only, above. Go fixtures use
+          # the toolchain from setup-go.
           ANYPROF_REQUIRE_NATIVE: "1"
       - name: Upload viewer screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: web-smoke-${{ matrix.os }}
+          name: web-smoke-${{ matrix.os }}-go-${{ matrix.go }}
           path: ${{ runner.temp }}/web-smoke
           if-no-files-found: ignore
       - name: Build

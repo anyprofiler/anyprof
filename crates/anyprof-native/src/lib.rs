@@ -12,10 +12,16 @@
 //! [`anyprof_core::Runtime::Rust`] frames. The `anyprof-rust` backend selects
 //! that path; this backend remains the fallback for every other live pid.
 //!
+//! Go sampling reuses the same on-CPU events. When the executable has a Go
+//! pclntab, stacks are unwound from that table’s pcsp values instead of from
+//! frame pointers, and the frames are [`anyprof_core::Runtime::Go`]. A leaf
+//! that is not a Go function still uses the frame-pointer or `StackWalk64` walk.
+//!
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
 mod elf;
+mod go_sym;
 mod kallsyms;
 mod macho;
 mod maps;
