@@ -472,10 +472,11 @@ struct TextSpan {
 ///
 /// A header or module value already inside the text section is that address.
 /// Go 1.26’s header is zero, so the module record supplies it. An externally
-/// linked Mach-O stores the Go 1.22 header as the addend from `__TEXT`’s
-/// vmaddr (`segment`); the sum is accepted only when it lands in the section.
-/// The section’s own start is not a stand-in. cgo’s `runtime.text` is not
-/// the first byte there.
+/// linked Mach-O stores the Go 1.22 header as an addend from `__TEXT`’s
+/// vmaddr (`segment`), either plain or as the low bits of a chained fixup.
+/// The relocated address is accepted only when it lands in the section. The
+/// section’s own start is not a stand-in. cgo’s `runtime.text` is not the
+/// first byte there.
 fn place_text(
     header: u64,
     module: Option<u64>,
@@ -492,20 +493,93 @@ fn place_text(
         return Some(addr);
     }
     if segment != 0 && header != 0 {
-        let relocated = header.wrapping_add(segment);
-        if inside(relocated) {
-            return Some(relocated);
-        }
-    }
-    if segment != 0
-        && let Some(addr) = module.filter(|addr| *addr != 0)
-    {
-        let relocated = addr.wrapping_add(segment);
-        if inside(relocated) {
-            return Some(relocated);
+        for form in PtrForm::relocated() {
+            if let Some(abs) = decode_ptr(header, segment, form)
+                && inside(abs)
+            {
+                return Some(abs);
+            }
         }
     }
     None
+}
+
+/// How an externally linked Mach-O stores an `R_ADDR` pointer.
+///
+/// `Addend` is the plain offset from `__TEXT`. `Off64` / `Vm64` are
+/// `DYLD_CHAINED_PTR_64_OFFSET` and `DYLD_CHAINED_PTR_64`. `OffArm` / `VmArm`
+/// are the arm64e unauthenticated rebase layouts.
+#[derive(Clone, Copy)]
+enum PtrForm {
+    Addend,
+    Off64,
+    Vm64,
+    OffArm,
+    VmArm,
+}
+
+impl PtrForm {
+    fn relocated() -> [PtrForm; 5] {
+        [
+            PtrForm::Addend,
+            PtrForm::Off64,
+            PtrForm::Vm64,
+            PtrForm::OffArm,
+            PtrForm::VmArm,
+        ]
+    }
+}
+
+fn decode_ptr(raw: u64, segment: u64, form: PtrForm) -> Option<u64> {
+    if segment == 0 || raw == 0 {
+        return None;
+    }
+    match form {
+        PtrForm::Addend => (raw < segment).then_some(segment.wrapping_add(raw)),
+        PtrForm::Off64 | PtrForm::Vm64 => {
+            let (target, high8, next) = split_ptr64(raw)?;
+            if next == 0 && high8 == 0 {
+                return None;
+            }
+            let vm = target | (high8 << 56);
+            match form {
+                PtrForm::Vm64 => Some(vm),
+                PtrForm::Off64 => Some(segment.wrapping_add(vm)),
+                PtrForm::Addend | PtrForm::OffArm | PtrForm::VmArm => None,
+            }
+        }
+        PtrForm::OffArm | PtrForm::VmArm => {
+            let target = split_arm64e(raw)?;
+            match form {
+                PtrForm::VmArm => Some(target),
+                PtrForm::OffArm => Some(segment.wrapping_add(target)),
+                PtrForm::Addend | PtrForm::Off64 | PtrForm::Vm64 => None,
+            }
+        }
+    }
+}
+
+/// `DYLD_CHAINED_PTR_64`: target 36, high8 8, reserved 7, next 12, bind 1.
+fn split_ptr64(raw: u64) -> Option<(u64, u64, u64)> {
+    if raw >> 63 != 0 || (raw >> 44) & 0x7f != 0 {
+        return None;
+    }
+    let next = (raw >> 51) & 0xfff;
+    let high8 = (raw >> 36) & 0xff;
+    let target = raw & ((1 << 36) - 1);
+    Some((target, high8, next))
+}
+
+/// arm64e unauthenticated rebase: target 43, next 11, bind and auth clear.
+fn split_arm64e(raw: u64) -> Option<u64> {
+    if raw >> 62 != 0 {
+        return None;
+    }
+    let next = (raw >> 51) & 0x7ff;
+    if next == 0 {
+        return None;
+    }
+    Some(raw & ((1 << 43) - 1))
 }
 
 fn adopt(
@@ -524,9 +598,9 @@ fn adopt(
 /// The 64-bit struct in `runtime/symtab.go` starts with `pcHeader`. `text`
 /// is 176 bytes later and `etext` 8 bytes after that. An internal link, ELF,
 /// and PE store those pointers as link addresses. An externally linked Mach-O
-/// stores the same `R_ADDR` fields as addends from the `__TEXT` vmaddr, the
-/// same encoding as the Go 1.22 pclntab header. `segment` is that vmaddr, or
-/// zero when the file already holds link addresses.
+/// stores them as addends from the `__TEXT` vmaddr, plain or in a chained
+/// fixup. `segment` is that vmaddr, or zero when the file already holds link
+/// addresses. `pcHeader`, `text`, and `etext` have to use the same encoding.
 fn module_runtime_text(
     blob: &[u8],
     pclntab_addr: u64,
@@ -536,54 +610,59 @@ fn module_runtime_text(
     if pclntab_addr == 0 || text_span.start == 0 || text_span.end <= text_span.start {
         return None;
     }
-    if let Some(text) = module_text_hit(blob, pclntab_addr, text_span, 0) {
-        return Some(text);
-    }
-    if segment == 0 {
-        return None;
-    }
-    if let Some(text) = module_text_hit(blob, pclntab_addr, text_span, segment) {
-        return Some(text);
-    }
-    if pclntab_addr > segment {
-        return module_text_hit(blob, pclntab_addr - segment, text_span, segment);
+    let forms = [
+        None,
+        Some(PtrForm::Addend),
+        Some(PtrForm::Off64),
+        Some(PtrForm::Vm64),
+        Some(PtrForm::OffArm),
+        Some(PtrForm::VmArm),
+    ];
+    for form in forms {
+        if form.is_some() && segment == 0 {
+            continue;
+        }
+        if let Some(text) = module_text_hit(blob, pclntab_addr, text_span, segment, form) {
+            return Some(text);
+        }
     }
     None
 }
 
-/// First moduledata whose `pcHeader` is `needle_addr` and whose `text` lands
-/// in the text section. `segment` is added to `text` and `etext` when it is
-/// non-zero; those words are then the unrelocated addends.
 fn module_text_hit(
     blob: &[u8],
-    needle_addr: u64,
+    pclntab_addr: u64,
     text_span: TextSpan,
     segment: u64,
+    form: Option<PtrForm>,
 ) -> Option<u64> {
-    if needle_addr == 0 {
-        return None;
-    }
-    let needle = needle_addr.to_le_bytes();
     let mut from = 0usize;
     while from + 192 <= blob.len() {
-        let rel = blob[from..]
-            .windows(8)
-            .position(|window| window == needle)?;
-        let at = from + rel;
-        if at.is_multiple_of(8) && at + 192 <= blob.len() {
-            let text = u64::from_le_bytes(blob[at + 176..at + 184].try_into().ok()?);
-            let etext = u64::from_le_bytes(blob[at + 184..at + 192].try_into().ok()?);
-            let addend = segment != 0 && text < text_span.start;
-            if segment == 0 || addend {
-                let shift = if addend { segment } else { 0 };
-                let abs = text.wrapping_add(shift);
-                let end = etext.wrapping_add(shift);
-                if text != 0 && end > abs && abs >= text_span.start && abs < text_span.end {
-                    return Some(abs);
-                }
+        let raw = u64::from_le_bytes(blob.get(from..from + 8)?.try_into().ok()?);
+        let pc = match form {
+            None => Some(raw),
+            Some(form) => decode_ptr(raw, segment, form),
+        };
+        if pc == Some(pclntab_addr) {
+            let text_raw = u64::from_le_bytes(blob.get(from + 176..from + 184)?.try_into().ok()?);
+            let etext_raw = u64::from_le_bytes(blob.get(from + 184..from + 192)?.try_into().ok()?);
+            let text = match form {
+                None => Some(text_raw),
+                Some(form) => decode_ptr(text_raw, segment, form),
+            };
+            let etext = match form {
+                None => Some(etext_raw),
+                Some(form) => decode_ptr(etext_raw, segment, form),
+            };
+            if let (Some(text), Some(etext)) = (text, etext)
+                && text >= text_span.start
+                && text < text_span.end
+                && etext > text
+            {
+                return Some(text);
             }
         }
-        from = at + 8;
+        from += 8;
     }
     None
 }
@@ -1660,20 +1739,6 @@ func spin() {
 
         let image = open_macho(
             &dir,
-            "module-addend",
-            &macho_image(
-                TEXT_VM,
-                TEXT_ADDR,
-                TEXT_SIZE,
-                PCLN_ADDR,
-                &zero,
-                Some(module_record(PCLN_ADDR, module_text - TEXT_VM)),
-            ),
-        );
-        assert_eq!(image.runtime_text, module_text);
-
-        let image = open_macho(
-            &dir,
             "module-both-addends",
             &macho_image(
                 TEXT_VM,
@@ -1682,6 +1747,42 @@ func spin() {
                 PCLN_ADDR,
                 &zero,
                 Some(module_record(PCLN_ADDR - TEXT_VM, module_text - TEXT_VM)),
+            ),
+        );
+        assert_eq!(image.runtime_text, module_text);
+
+        let chained = |offset: u64, next: u64| offset | (next << 51);
+        let mut chain_header = synthetic();
+        put_u64(&mut chain_header, 24, chained(0x1AA0, 4));
+        let image = open_macho(
+            &dir,
+            "chained-header",
+            &macho_image(
+                TEXT_VM,
+                TEXT_ADDR,
+                TEXT_SIZE,
+                PCLN_ADDR,
+                &chain_header,
+                None,
+            ),
+        );
+        assert_eq!(image.runtime_text, TEXT_VM + 0x1AA0);
+
+        let mut chained_module = module_record(0, 0);
+        chained_module[..8].copy_from_slice(&chained(PCLN_ADDR - TEXT_VM, 2).to_le_bytes());
+        chained_module[176..184].copy_from_slice(&chained(module_text - TEXT_VM, 2).to_le_bytes());
+        chained_module[184..192]
+            .copy_from_slice(&chained(module_text - TEXT_VM + 0x100, 1).to_le_bytes());
+        let image = open_macho(
+            &dir,
+            "chained-module",
+            &macho_image(
+                TEXT_VM,
+                TEXT_ADDR,
+                TEXT_SIZE,
+                PCLN_ADDR,
+                &zero,
+                Some(chained_module),
             ),
         );
         assert_eq!(image.runtime_text, module_text);
