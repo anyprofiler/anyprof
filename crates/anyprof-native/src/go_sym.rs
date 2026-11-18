@@ -521,19 +521,50 @@ fn adopt(
 
 /// `moduledata.text` for a Go 1.26 binary.
 ///
-/// The 64-bit struct in `runtime/symtab.go` starts with `pcHeader`. That
-/// pointer is the pclntab’s link address when the external linker has written
-/// the unslid address, which is what `go tool nm` prints. `text` is 176 bytes
-/// later and `etext` 8 bytes after that. An address already inside the text
-/// section is returned as-is. A smaller word is returned too, so the Mach-O
-/// path can add the `__TEXT` vmaddr when that sum lands in the section.
-fn module_runtime_text(blob: &[u8], pclntab_addr: u64, text_span: TextSpan) -> Option<u64> {
+/// The 64-bit struct in `runtime/symtab.go` starts with `pcHeader`. `text`
+/// is 176 bytes later and `etext` 8 bytes after that. An internal link, ELF,
+/// and PE store those pointers as link addresses. An externally linked Mach-O
+/// stores the same `R_ADDR` fields as addends from the `__TEXT` vmaddr, the
+/// same encoding as the Go 1.22 pclntab header. `segment` is that vmaddr, or
+/// zero when the file already holds link addresses.
+fn module_runtime_text(
+    blob: &[u8],
+    pclntab_addr: u64,
+    text_span: TextSpan,
+    segment: u64,
+) -> Option<u64> {
     if pclntab_addr == 0 || text_span.start == 0 || text_span.end <= text_span.start {
         return None;
     }
-    let needle = pclntab_addr.to_le_bytes();
+    if let Some(text) = module_text_hit(blob, pclntab_addr, text_span, 0) {
+        return Some(text);
+    }
+    if segment == 0 {
+        return None;
+    }
+    if let Some(text) = module_text_hit(blob, pclntab_addr, text_span, segment) {
+        return Some(text);
+    }
+    if pclntab_addr > segment {
+        return module_text_hit(blob, pclntab_addr - segment, text_span, segment);
+    }
+    None
+}
+
+/// First moduledata whose `pcHeader` is `needle_addr` and whose `text` lands
+/// in the text section. `segment` is added to `text` and `etext` when it is
+/// non-zero; those words are then the unrelocated addends.
+fn module_text_hit(
+    blob: &[u8],
+    needle_addr: u64,
+    text_span: TextSpan,
+    segment: u64,
+) -> Option<u64> {
+    if needle_addr == 0 {
+        return None;
+    }
+    let needle = needle_addr.to_le_bytes();
     let mut from = 0usize;
-    let mut addend = None;
     while from + 192 <= blob.len() {
         let rel = blob[from..]
             .windows(8)
@@ -542,18 +573,19 @@ fn module_runtime_text(blob: &[u8], pclntab_addr: u64, text_span: TextSpan) -> O
         if at.is_multiple_of(8) && at + 192 <= blob.len() {
             let text = u64::from_le_bytes(blob[at + 176..at + 184].try_into().ok()?);
             let etext = u64::from_le_bytes(blob[at + 184..at + 192].try_into().ok()?);
-            if text != 0 && etext > text {
-                if text >= text_span.start && text < text_span.end {
-                    return Some(text);
-                }
-                if addend.is_none() {
-                    addend = Some(text);
+            let addend = segment != 0 && text < text_span.start;
+            if segment == 0 || addend {
+                let shift = if addend { segment } else { 0 };
+                let abs = text.wrapping_add(shift);
+                let end = etext.wrapping_add(shift);
+                if text != 0 && end > abs && abs >= text_span.start && abs < text_span.end {
+                    return Some(abs);
                 }
             }
         }
         from = at + 8;
     }
-    addend
+    None
 }
 
 fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
@@ -617,7 +649,7 @@ fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
     let pcln_addr = paddr.checked_add(magic_at as u64)?;
     let module_text = module.and_then(|(off, size)| {
         let blob = read_span(reader, off, size.min(MAX_TABLE), len)?;
-        module_runtime_text(&blob, pcln_addr, text_span?)
+        module_runtime_text(&blob, pcln_addr, text_span?, 0)
     });
     adopt(&bytes[magic_at..], module_text, text_span, 0)
 }
@@ -631,7 +663,7 @@ fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
     let pcln_addr = pcln.addr.checked_add(magic_at as u64)?;
     let module_text = layout.module.and_then(|module| {
         let blob = read_span(reader, module.file_off, module.size.min(MAX_TABLE), len)?;
-        module_runtime_text(&blob, pcln_addr, layout.text?)
+        module_runtime_text(&blob, pcln_addr, layout.text?, layout.text_segment)
     });
     adopt(
         &bytes[magic_at..],
@@ -849,7 +881,7 @@ fn pe_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
                 candidate.raw_size.min(MAX_TABLE),
                 len,
             )?;
-            module_runtime_text(&blob, pcln_addr, text?)
+            module_runtime_text(&blob, pcln_addr, text?, 0)
         });
         if let Some(tables) = adopt(&bytes[magic_at..], module_text, text, 0) {
             return Some(tables);
@@ -1636,6 +1668,20 @@ func spin() {
                 PCLN_ADDR,
                 &zero,
                 Some(module_record(PCLN_ADDR, module_text - TEXT_VM)),
+            ),
+        );
+        assert_eq!(image.runtime_text, module_text);
+
+        let image = open_macho(
+            &dir,
+            "module-both-addends",
+            &macho_image(
+                TEXT_VM,
+                TEXT_ADDR,
+                TEXT_SIZE,
+                PCLN_ADDR,
+                &zero,
+                Some(module_record(PCLN_ADDR - TEXT_VM, module_text - TEXT_VM)),
             ),
         );
         assert_eq!(image.runtime_text, module_text);
