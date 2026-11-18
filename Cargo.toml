@@ -9,6 +9,7 @@ members = [
     "crates/anyprof-native",
     "crates/anyprof-rust",
     "crates/anyprof-go",
+    "crates/anyprof-python",
     "crates/anyprof-web",
     "crates/anyprof-cli",
 ]
@@ -31,6 +32,7 @@ anyprof-rust = { path = "crates/anyprof-rust" }
 anyprof-node = { path = "crates/anyprof-node" }
 anyprof-browser = { path = "crates/anyprof-browser" }
 anyprof-go = { path = "crates/anyprof-go" }
+anyprof-python = { path = "crates/anyprof-python" }
 anyprof-export = { path = "crates/anyprof-export" }
 anyprof-web = { path = "crates/anyprof-web" }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

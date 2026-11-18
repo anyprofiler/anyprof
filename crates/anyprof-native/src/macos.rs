@@ -34,6 +34,7 @@ use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 
 use crate::macho::{ImageSymbols, MachCpu, segment_bounds};
 use crate::policy::{self, StripKind};
+use crate::python::{self, CountedStack, PythonVm};
 
 const MAX_FRAMES: usize = 64;
 const THREAD_BASIC_INFO: u32 = 3;
@@ -81,6 +82,12 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
 
     let task = Task::attach(target.pid)?;
     let symbols = load_symbols(task.port, target.pid);
+    let python = python::attach_mach(
+        &remote_images(task.port)
+            .into_iter()
+            .map(|image| (image.path, image.load, image.end))
+            .collect::<Vec<_>>(),
+    );
     tracing::debug!(
         pid = target.pid,
         images = symbols.len(),
@@ -89,7 +96,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
 
     let started = Instant::now();
     let mut next = started;
-    let mut counts: HashMap<Vec<u64>, u64> = HashMap::new();
+    let mut counts: HashMap<CountedStack, u64> = HashMap::new();
     loop {
         if opts.stop.stop_requested() {
             break;
@@ -104,10 +111,10 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             .iter()
             .filter_map(|image| image.go.clone())
             .collect();
-        match task.sample_addresses(&go_images) {
+        match task.sample_addresses(&go_images, python.as_ref()) {
             Ok(stacks) => {
                 for stack in stacks {
-                    if !stack.is_empty() {
+                    if stack.recordable() {
                         *counts.entry(stack).or_default() += 1;
                     }
                 }
@@ -174,18 +181,21 @@ fn wait_until(deadline: Instant, opts: &RecordOptions) {
 fn finish_profile(
     pid: u32,
     comm: Option<String>,
-    counts: HashMap<Vec<u64>, u64>,
+    counts: HashMap<CountedStack, u64>,
     symbols: &[ImageSymbols],
     elapsed: Duration,
     interval: Duration,
 ) -> Profile {
     let mut stacks = Vec::with_capacity(counts.len());
-    for (addresses, weight) in counts {
-        let frames = addresses
-            .into_iter()
-            .enumerate()
-            .map(|(index, addr)| frame_for(addr, symbols, index == 0))
-            .collect();
+    for (stack, weight) in counts {
+        let frames = match stack {
+            CountedStack::Addresses { frames, .. } => frames
+                .into_iter()
+                .enumerate()
+                .map(|(index, addr)| frame_for(addr, symbols, index == 0))
+                .collect(),
+            CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
+        };
         stacks.push(Stack { frames, weight });
     }
     stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));
@@ -272,7 +282,8 @@ impl Task {
     fn sample_addresses(
         &self,
         go_images: &[crate::go_sym::GoImage],
-    ) -> Result<Vec<Vec<u64>>, SampleFault> {
+        python: Option<&PythonVm>,
+    ) -> Result<Vec<CountedStack>, SampleFault> {
         let threads = self.threads()?;
         let running: Vec<thread_act_t> = threads
             .ports
@@ -288,7 +299,7 @@ impl Task {
             // `threads` stays alive until this function returns, so each
             // resume in `unwind_thread` happens before `ThreadList` drops the
             // send rights.
-            match unwind_thread(self.port, *thread, go_images) {
+            match unwind_thread(self.port, *thread, go_images, python) {
                 Ok(Some(frames)) => stacks.push(frames),
                 Ok(None) => {}
                 Err(err) => return Err(err),
@@ -481,7 +492,8 @@ fn unwind_thread(
     task: task_t,
     thread: thread_act_t,
     go_images: &[crate::go_sym::GoImage],
-) -> Result<Option<Vec<u64>>, SampleFault> {
+    python: Option<&PythonVm>,
+) -> Result<Option<CountedStack>, SampleFault> {
     let mut resume_failure = None;
     let Some(suspended) = Suspended::new(thread, &mut resume_failure) else {
         return Ok(None);
@@ -500,11 +512,24 @@ fn unwind_thread(
     };
     let frames = if kr == KERN_SUCCESS {
         let (pc, sp, fp, lr) = registers(&state);
-        let frames = walk_frames(task, pc, sp, fp, lr, go_images);
-        if frames.is_empty() {
-            None
+        let tid = thread_identifier(thread).unwrap_or(0);
+        if let Some(vm) = python
+            && let Some(py_frames) = vm.frames(tid, pc, &mut |addr, buf| read_task(task, addr, buf))
+        {
+            Some(CountedStack::Python {
+                kernel: Vec::new(),
+                frames: py_frames,
+            })
         } else {
-            Some(frames)
+            let frames = walk_frames(task, pc, sp, fp, lr, go_images);
+            if frames.is_empty() {
+                None
+            } else {
+                Some(CountedStack::Addresses {
+                    frames,
+                    kernel_len: 0,
+                })
+            }
         }
     } else {
         None
@@ -516,6 +541,25 @@ fn unwind_thread(
         )));
     }
     Ok(frames)
+}
+
+/// `thread_identifier_info.thread_id`, which CPython stores from `pthread_threadid_np`.
+fn thread_identifier(thread: thread_act_t) -> Option<u64> {
+    const THREAD_IDENTIFIER_INFO: u32 = 4;
+    let mut info = [0i32; 6];
+    let mut count: mach_msg_type_number_t = 6;
+    let kr = unsafe {
+        thread_info(
+            thread,
+            THREAD_IDENTIFIER_INFO,
+            info.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if kr != KERN_SUCCESS || count < 2 {
+        return None;
+    }
+    Some(u64::from(info[0] as u32) | (u64::from(info[1] as u32) << 32))
 }
 
 #[cfg(target_arch = "aarch64")]

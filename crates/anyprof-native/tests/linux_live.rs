@@ -379,10 +379,11 @@ fn an_unrelated_same_user_process_follows_perf_not_ptrace_scope() {
         Some(std::process::id()),
         "the double-fork was reparented to this test, so it is not an unrelated process"
     );
-    // `perf_event_open` uses PTRACE_MODE_READ_REALCREDS. Yama applies that
-    // sysctl to PTRACE_MODE_ATTACH, which this sampler does not request.
-    // ubuntu-latest keeps ptrace_scope at 1 and still allows this sample
-    // once perf_event_paranoid is low enough.
+    // `perf_event_open` uses PTRACE_MODE_READ_REALCREDS. Yama applies
+    // ptrace_scope to PTRACE_MODE_ATTACH, which this sampler does not
+    // request, so the sample is allowed at scope 0 and at scope 1 once
+    // perf_event_paranoid is low enough. The Python frame read is the
+    // attach check; this native sample is not.
     let started = anyprof_native::NativeBackend.start(
         &anyprof_core::Target { pid },
         &anyprof_core::RecordOptions {

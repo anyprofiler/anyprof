@@ -106,6 +106,7 @@ dependencies = [
  "anyprof-go",
  "anyprof-native",
  "anyprof-node",
+ "anyprof-python",
  "anyprof-rust",
  "anyprof-web",
  "axoupdater",
@@ -174,6 +175,16 @@ dependencies = [
  "anyprof-core",
  "anyprof-export",
  "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "anyprof-python"
+version = "0.1.7"
+dependencies = [
+ "anyprof-core",
+ "anyprof-export",
+ "anyprof-native",
  "tracing",
 ]
 

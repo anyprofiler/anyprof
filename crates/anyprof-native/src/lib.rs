@@ -17,6 +17,11 @@
 //! frame pointers, and the frames are [`anyprof_core::Runtime::Go`]. A leaf
 //! that is not a Go function still uses the frame-pointer or `StackWalk64` walk.
 //!
+//! Python sampling reuses the same on-CPU events. When the leaf is inside
+//! the CPython image, the user stack is the interpreter frame chain and the
+//! frames are [`anyprof_core::Runtime::Python`]. A leaf in another image
+//! keeps the native walk.
+//!
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
@@ -28,11 +33,14 @@ mod maps;
 mod pdb_syms;
 mod perf_parse;
 mod policy;
+mod python;
+mod python_sym;
 mod rust_image;
 mod snapshot;
 mod symbol;
 mod walk;
 
+pub use python::{pid_is_cpython, prepare_python};
 pub use rust_image::file_is_rust;
 
 #[cfg(target_os = "macos")]
