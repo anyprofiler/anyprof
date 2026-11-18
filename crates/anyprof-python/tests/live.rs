@@ -49,21 +49,27 @@ def parked():
 parked()
 "#;
 
+    /// The main thread waits off CPU. A third spinning loop was starving
+    /// one of the workers on a busy 3.13 host: the GIL samples were
+    /// `<module>` and `spin_a`, and `spin_b` never appeared.
     const TWO: &str = r#"
-import threading
+import sys, threading
+path_a, path_b = sys.argv[1], sys.argv[2]
 def spin_a():
+    with open(path_a, "wb") as handle:
+        handle.write((1).to_bytes(8, "little"))
     x = 0
     while True:
         x += 1
 def spin_b():
+    with open(path_b, "wb") as handle:
+        handle.write((1).to_bytes(8, "little"))
     x = 0
     while True:
         x += 1
 threading.Thread(target=spin_a, daemon=True).start()
 threading.Thread(target=spin_b, daemon=True).start()
-x = 0
-while True:
-    x += 1
+threading.Event().wait()
 "#;
 
     #[cfg(target_os = "macos")]
@@ -381,19 +387,30 @@ os.execv(sys.executable, [sys.executable, script, counter])
             let dir = fixture_dir("threads");
             let script = dir.join("two.py");
             std::fs::write(&script, TWO).unwrap();
+            let mark_a = dir.join("a");
+            let mark_b = dir.join("b");
+            std::fs::write(&mark_a, [0u8; 8]).unwrap();
+            std::fs::write(&mark_b, [0u8; 8]).unwrap();
             let mut child = Command::new(&python)
                 .arg(&script)
+                .arg(&mark_a)
+                .arg(&mark_b)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap_or_else(|err| panic!("spawn {}: {err}", python.display()));
             let pid = child.id();
-            std::thread::sleep(Duration::from_millis(100));
+            if !wait_for_counter(&mark_a) || !wait_for_counter(&mark_b) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
             let started = PythonBackend.start(
                 &anyprof_core::Target { pid },
                 &anyprof_core::RecordOptions {
-                    duration: Some(Duration::from_secs(1)),
+                    duration: Some(Duration::from_secs(2)),
                     sampling_interval: Some(Duration::from_millis(10)),
                     ..anyprof_core::RecordOptions::default()
                 },
