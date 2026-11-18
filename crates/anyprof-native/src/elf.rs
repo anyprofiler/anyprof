@@ -88,6 +88,9 @@ pub(crate) struct UserImage {
     /// The file contains a Rust image marker. Demangled `::` paths in it are
     /// Rust frames when the mangled name is no longer available.
     pub(crate) rust_image: bool,
+    /// Go pclntab for this file, relocated to the mapped address. `None` when
+    /// the file is not a Go executable.
+    pub(crate) go: Option<crate::go_sym::GoImage>,
     /// `(runtime address, size, name, symbol runtime)`, sorted by address.
     symbols: Vec<(u64, u64, String, Runtime)>,
 }
@@ -100,6 +103,7 @@ impl UserImage {
             end,
             module,
             rust_image: false,
+            go: None,
             symbols: Vec::new(),
         }
     }
@@ -125,6 +129,7 @@ impl UserImage {
             end,
             module,
             rust_image: false,
+            go: None,
             symbols,
         }
     }

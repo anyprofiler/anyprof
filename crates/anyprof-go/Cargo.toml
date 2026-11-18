@@ -7,8 +7,18 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Go CPU sampling backend for anyprof."
+description = "Go CPU sampling backend for anyprof. pclntab stacks on the native sampler."
 
 [dependencies]
 anyprof-core.workspace = true
+anyprof-native.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+anyprof-export.workspace = true

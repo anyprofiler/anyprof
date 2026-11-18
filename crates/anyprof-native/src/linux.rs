@@ -26,6 +26,7 @@ use anyprof_core::{
 };
 
 use crate::elf::{self, UserImage};
+use crate::go_sym::{self, GoImage, GoMachine};
 use crate::kallsyms::{self, Kallsym};
 use crate::maps::{self, MapSpan};
 use crate::perf_parse::{self, ParsedSample, X86_USER_REGS};
@@ -152,6 +153,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let (sampler, _attr) = open_events(target.pid, period, opts.include_kernel)?;
     let mut sampler = sampler;
     let images = load_images(target.pid);
+    let go_images: Vec<GoImage> = images.iter().filter_map(|image| image.go.clone()).collect();
     let kernel_symbols = if opts.include_kernel {
         load_kallsyms()
     } else {
@@ -182,12 +184,14 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             &mut sampler,
             target.pid,
             opts.include_kernel,
+            &go_images,
             &mut counts,
         ));
         lost = lost.saturating_add(take_samples(
             &sampler,
             target.pid,
             opts.include_kernel,
+            &go_images,
             &mut counts,
         ));
         next += interval;
@@ -208,6 +212,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         &sampler,
         target.pid,
         opts.include_kernel,
+        &go_images,
         &mut counts,
     ));
     if lost > 0 {
@@ -462,6 +467,7 @@ fn refresh(
     sampler: &mut Sampler,
     pid: u32,
     include_kernel: bool,
+    go_images: &[GoImage],
     counts: &mut HashMap<SampleKey, u64>,
 ) -> u64 {
     let Ok(live) = list_threads(pid) else {
@@ -475,7 +481,13 @@ fn refresh(
             continue;
         }
         let _ = ioctl_req(event.fd, IOC_DISABLE);
-        lost = lost.saturating_add(ingest_mapped(&event, pid, include_kernel, counts));
+        lost = lost.saturating_add(ingest_mapped(
+            &event,
+            pid,
+            include_kernel,
+            go_images,
+            counts,
+        ));
     }
     sampler.events = retained;
     let attr = event_attr(sampler.period, sampler.stack, sampler.include_kernel);
@@ -637,10 +649,11 @@ fn take_samples(
     sampler: &Sampler,
     pid: u32,
     include_kernel: bool,
+    go_images: &[GoImage],
     counts: &mut HashMap<SampleKey, u64>,
 ) -> u64 {
     let (samples, lost) = sampler.drain();
-    record_samples(samples, pid, include_kernel, counts);
+    record_samples(samples, pid, include_kernel, go_images, counts);
     lost
 }
 
@@ -648,10 +661,11 @@ fn ingest_mapped(
     mapped: &Mapped,
     pid: u32,
     include_kernel: bool,
+    go_images: &[GoImage],
     counts: &mut HashMap<SampleKey, u64>,
 ) -> u64 {
     let (samples, lost) = drain_mapped(mapped);
-    record_samples(samples, pid, include_kernel, counts);
+    record_samples(samples, pid, include_kernel, go_images, counts);
     lost
 }
 
@@ -659,13 +673,14 @@ fn record_samples(
     samples: Vec<ParsedSample>,
     pid: u32,
     include_kernel: bool,
+    go_images: &[GoImage],
     counts: &mut HashMap<SampleKey, u64>,
 ) {
     for sample in samples {
         if sample.pid != pid && sample.pid != 0 {
             continue;
         }
-        let Some(key) = assemble_addresses(&sample, include_kernel) else {
+        let Some(key) = assemble_addresses(&sample, include_kernel, go_images) else {
             continue;
         };
         *counts.entry(key).or_default() += 1;
@@ -676,7 +691,11 @@ fn record_samples(
 ///
 /// The kernel section and the user section each have their own leaf, so
 /// symbol lookup subtracts one byte only from the saved frames of that section.
-fn assemble_addresses(sample: &ParsedSample, include_kernel: bool) -> Option<SampleKey> {
+fn assemble_addresses(
+    sample: &ParsedSample,
+    include_kernel: bool,
+    go_images: &[GoImage],
+) -> Option<SampleKey> {
     let (kernel_chain, user_chain) = perf_parse::split_callchain(&sample.callchain);
     let mut kernel = if include_kernel {
         kernel_chain
@@ -696,10 +715,25 @@ fn assemble_addresses(sample: &ParsedSample, include_kernel: bool) -> Option<Sam
     let fp = sample.user_fp.unwrap_or(0);
     let sp = sample.user_sp.unwrap_or(0);
     let stack = sample.stack.as_slice();
-    let walked = walk_frame_pointer(pc, fp, 0, |addr, buf| {
-        read_copied_stack(stack, sp, addr, buf)
-    });
-    let mut user = perf_parse::choose_user_frames(walked, user_chain);
+    // Go's pcsp walk uses the copied user stack. A leaf that is not a Go
+    // function keeps the frame-pointer walk below.
+    let go_walk = go_sym::unwind(
+        go_images,
+        pc,
+        sp,
+        0,
+        GoMachine::X86_64,
+        |addr, buf| read_copied_stack(stack, sp, addr, buf),
+        |addr| addr,
+    );
+    let mut user = if let Some(frames) = go_walk {
+        frames
+    } else {
+        let walked = walk_frame_pointer(pc, fp, 0, |addr, buf| {
+            read_copied_stack(stack, sp, addr, buf)
+        });
+        perf_parse::choose_user_frames(walked, user_chain)
+    };
     if user.is_empty() && walk::plausible_user_address(sample.ip) {
         user.push(sample.ip);
     }
@@ -770,6 +804,14 @@ fn finish_profile(
 
 fn user_frame(images: &[UserImage], addr: u64, leaf: bool) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
+    if let Some(frame) = go_user_frame(images, lookup, addr) {
+        return frame;
+    }
+    if lookup != addr
+        && let Some(frame) = go_user_frame(images, addr, addr)
+    {
+        return frame;
+    }
     let named = elf::name_for(images, addr, leaf);
     let module = named.map(|(_, module, _)| module.to_string()).or_else(|| {
         images
@@ -784,6 +826,24 @@ fn user_frame(images: &[UserImage], addr: u64, leaf: bool) -> Frame {
     frame.address = Some(addr);
     frame.module = module;
     frame
+}
+
+fn go_user_frame(images: &[UserImage], lookup: u64, addr: u64) -> Option<Frame> {
+    for image in images {
+        let Some(go) = &image.go else {
+            continue;
+        };
+        let Some(symbol) = go.symbol(lookup) else {
+            continue;
+        };
+        let mut frame = Frame::new(Runtime::Go, symbol.name);
+        frame.file = symbol.file;
+        frame.line = symbol.line;
+        frame.address = Some(addr);
+        frame.module = Some(image.module.clone());
+        return Some(frame);
+    }
+    None
 }
 
 fn kernel_frame(symbols: &[Kallsym], addr: u64, leaf: bool) -> Frame {
@@ -852,7 +912,9 @@ fn image_from_elf(path: &str, group: &[MapSpan]) -> UserImage {
     let Some(bias) = elf::load_bias(anchor.start, anchor.offset, &elf.loads) else {
         return UserImage::range_only(start, end, module);
     };
-    UserImage::from_elf(start, end, module, &elf, bias)
+    let mut image = UserImage::from_elf(start, end, module, &elf, bias);
+    image.go = go_sym::open_image_at(Path::new(path), bias);
+    image
 }
 
 fn load_kallsyms() -> Vec<Kallsym> {
@@ -1033,7 +1095,7 @@ mod tests {
             user_fp: Some(sp),
             stack,
         };
-        let key = assemble_addresses(&sample, false).expect("frames");
+        let key = assemble_addresses(&sample, false, &[]).expect("frames");
         assert_eq!(key.kernel_len, 0);
         assert_eq!(key.frames, vec![0x5555_0000_1100, ret]);
     }
@@ -1056,13 +1118,13 @@ mod tests {
             user_fp: None,
             stack: Vec::new(),
         };
-        let with_kernel = assemble_addresses(&sample, true).expect("frames");
+        let with_kernel = assemble_addresses(&sample, true, &[]).expect("frames");
         assert_eq!(with_kernel.kernel_len, 1);
         assert_eq!(
             with_kernel.frames,
             vec![0xffff_ffff_8100_0100, 0x5555_0000_1100, 0x5555_0000_1000]
         );
-        let user_only = assemble_addresses(&sample, false).expect("user frames");
+        let user_only = assemble_addresses(&sample, false, &[]).expect("user frames");
         assert_eq!(user_only.kernel_len, 0);
         assert_eq!(user_only.frames, vec![0x5555_0000_1100, 0x5555_0000_1000]);
     }

@@ -32,10 +32,11 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ADDRESS64, AddrModeFlat, CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, IMAGEHLP_MODULE64,
-    STACKFRAME64, SYMBOL_INFO, SYMOPT_DEFERRED_LOADS, SYMOPT_DISABLE_SYMSRV_AUTODETECT,
-    SYMOPT_FAIL_CRITICAL_ERRORS, SYMOPT_IGNORE_NT_SYMPATH, SYMOPT_NO_PROMPTS, SYMOPT_UNDNAME,
-    StackWalk64, SymCleanup, SymFromAddr, SymFunctionTableAccess64, SymGetModuleBase64,
-    SymGetModuleInfo64, SymGetOptions, SymInitializeW, SymSetOptions,
+    ReadProcessMemory, STACKFRAME64, SYMBOL_INFO, SYMOPT_DEFERRED_LOADS,
+    SYMOPT_DISABLE_SYMSRV_AUTODETECT, SYMOPT_FAIL_CRITICAL_ERRORS, SYMOPT_IGNORE_NT_SYMPATH,
+    SYMOPT_NO_PROMPTS, SYMOPT_UNDNAME, StackWalk64, SymCleanup, SymFromAddr,
+    SymFunctionTableAccess64, SymGetModuleBase64, SymGetModuleInfo64, SymGetOptions,
+    SymInitializeW, SymSetOptions,
 };
 use windows_sys::Win32::System::ProcessStatus::GetModuleFileNameExW;
 use windows_sys::Win32::System::Threading::{
@@ -87,6 +88,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let process = Process::open(target.pid)?;
     ensure_x64(process.handle, target.pid)?;
     let symbols = Symbols::load(process.handle)?;
+    let mut go = load_go(process.handle);
 
     let started = Instant::now();
     let mut next = started;
@@ -101,7 +103,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         {
             break;
         }
-        match sample_addresses(process.handle, target.pid) {
+        match sample_addresses(process.handle, target.pid, go.as_mut()) {
             Ok(stacks) => {
                 for stack in stacks {
                     if !stack.is_empty() {
@@ -141,6 +143,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         comm,
         counts,
         process.handle,
+        go.as_ref(),
         started.elapsed(),
         interval,
     );
@@ -240,11 +243,107 @@ impl Drop for Symbols {
     }
 }
 
-fn sample_addresses(process: HANDLE, pid: u32) -> Result<Vec<Vec<u64>>, SampleFault> {
+struct GoProc {
+    image: crate::go_sym::GoImage,
+    preferred: u64,
+    module: String,
+}
+
+impl GoProc {
+    fn image_for(&self, process: HANDLE, pc: u64) -> Option<crate::go_sym::GoImage> {
+        let actual = unsafe { SymGetModuleBase64(process, pc) };
+        if actual == 0 {
+            return None;
+        }
+        let relocated = self.image.at_base(self.preferred, actual);
+        relocated.contains_pc(pc).then_some(relocated)
+    }
+}
+
+fn load_go(process: HANDLE) -> Option<GoProc> {
+    let path = process_exe(process)?;
+    let image = crate::go_sym::open_image(&path)?;
+    let preferred = crate::go_sym::pe_image_base(&path).unwrap_or(0);
+    let module = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("go")
+        .to_string();
+    Some(GoProc {
+        image,
+        preferred,
+        module,
+    })
+}
+
+fn process_exe(process: HANDLE) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut buf = vec![0u16; 32 * 1024];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 || len == 0 {
+        return None;
+    }
+    let os = std::ffi::OsString::from_wide(&buf[..len as usize]);
+    if os.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(os))
+    }
+}
+
+fn go_frames(process: HANDLE, pc: u64, sp: u64, go: Option<&mut GoProc>) -> Option<Vec<u64>> {
+    let go = go?;
+    let image = go.image_for(process, pc)?;
+    crate::go_sym::unwind(
+        std::slice::from_ref(&image),
+        pc,
+        sp,
+        0,
+        crate::go_sym::GoMachine::X86_64,
+        |addr, buf| read_process(process, addr, buf),
+        |addr| addr,
+    )
+}
+
+fn go_named(process: HANDLE, go: &GoProc, lookup: u64, addr: u64) -> Option<Frame> {
+    let image = go.image_for(process, lookup)?;
+    let symbol = image.symbol(lookup)?;
+    let mut frame = Frame::new(Runtime::Go, symbol.name);
+    frame.file = symbol.file;
+    frame.line = symbol.line;
+    frame.address = Some(addr);
+    frame.module = Some(go.module.clone());
+    Some(frame)
+}
+
+fn read_process(process: HANDLE, addr: u64, buf: &mut [u8]) -> bool {
+    if addr == 0 || buf.is_empty() {
+        return false;
+    }
+    let mut read = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            process,
+            addr as *const core::ffi::c_void,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut read,
+        )
+    };
+    ok != FALSE && read == buf.len()
+}
+
+fn sample_addresses(
+    process: HANDLE,
+    pid: u32,
+    mut go: Option<&mut GoProc>,
+) -> Result<Vec<Vec<u64>>, SampleFault> {
     let running = running_threads(pid)?;
     let mut stacks = Vec::with_capacity(running.len());
     for tid in running {
-        match unwind_thread(process, tid) {
+        match unwind_thread(process, tid, go.as_deref_mut()) {
             Ok(Some(frames)) => stacks.push(frames),
             Ok(None) => {}
             Err(err) => return Err(err),
@@ -299,7 +398,11 @@ fn snapshot_fault(err: SnapshotError) -> SampleFault {
     }
 }
 
-fn unwind_thread(process: HANDLE, tid: u32) -> Result<Option<Vec<u64>>, SampleFault> {
+fn unwind_thread(
+    process: HANDLE,
+    tid: u32,
+    go: Option<&mut GoProc>,
+) -> Result<Option<Vec<u64>>, SampleFault> {
     let access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION;
     let thread = unsafe { OpenThread(access, FALSE, tid) };
     if thread.is_null() || thread == INVALID_HANDLE_VALUE {
@@ -310,7 +413,7 @@ fn unwind_thread(process: HANDLE, tid: u32) -> Result<Option<Vec<u64>>, SampleFa
     let Some(suspended) = Suspended::new(thread.0, &mut resume_failure) else {
         return Ok(None);
     };
-    let frames = walk_suspended(process, thread.0);
+    let frames = walk_suspended(process, thread.0, go);
     drop(suspended);
     if let Some(code) = resume_failure {
         return Err(SampleFault::Fatal(format!(
@@ -396,7 +499,7 @@ struct AlignedContext {
     context: CONTEXT,
 }
 
-fn walk_suspended(process: HANDLE, thread: HANDLE) -> Option<Vec<u64>> {
+fn walk_suspended(process: HANDLE, thread: HANDLE, go: Option<&mut GoProc>) -> Option<Vec<u64>> {
     let mut aligned = AlignedContext {
         context: unsafe { std::mem::zeroed() },
     };
@@ -406,6 +509,9 @@ fn walk_suspended(process: HANDLE, thread: HANDLE) -> Option<Vec<u64>> {
     let ok = unsafe { GetThreadContext(thread, &mut aligned.context) };
     if ok == FALSE {
         return None;
+    }
+    if let Some(frames) = go_frames(process, aligned.context.Rip, aligned.context.Rsp, go) {
+        return Some(frames);
     }
     let mut frame: STACKFRAME64 = unsafe { std::mem::zeroed() };
     frame.AddrPC = flat(aligned.context.Rip);
@@ -463,6 +569,7 @@ fn finish_profile(
     comm: Option<String>,
     counts: HashMap<Vec<u64>, u64>,
     process: HANDLE,
+    go: Option<&GoProc>,
     elapsed: Duration,
     interval: Duration,
 ) -> Profile {
@@ -473,7 +580,9 @@ fn finish_profile(
         let frames = addresses
             .iter()
             .enumerate()
-            .map(|(index, addr)| frame_for(process, *addr, index == 0, &mut rust_files, &mut pdbs))
+            .map(|(index, addr)| {
+                frame_for(process, *addr, index == 0, go, &mut rust_files, &mut pdbs)
+            })
             .collect();
         stacks.push(Stack { frames, weight });
     }
@@ -492,10 +601,19 @@ fn frame_for(
     process: HANDLE,
     addr: u64,
     leaf: bool,
+    go: Option<&GoProc>,
     rust_files: &mut HashMap<String, bool>,
     pdbs: &mut HashMap<String, crate::pdb_syms::ImageSymbols>,
 ) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
+    if let Some(frame) = go.and_then(|go| go_named(process, go, lookup, addr)) {
+        return frame;
+    }
+    if lookup != addr
+        && let Some(frame) = go.and_then(|go| go_named(process, go, addr, addr))
+    {
+        return frame;
+    }
     let hit = symbol_at(process, lookup, pdbs).or_else(|| symbol_at(process, addr, pdbs));
     let (name, module, runtime) = match hit {
         Some((name, module, path, symbol_runtime, from_cpp)) => {

@@ -94,6 +94,8 @@ pub(crate) struct ImageSymbols {
     pub module: String,
     /// The file contains a Rust image marker.
     pub(crate) rust_image: bool,
+    /// Go pclntab relocated by this image’s ASLR slide.
+    pub(crate) go: Option<crate::go_sym::GoImage>,
     /// `(runtime address, display name, symbol runtime)`, sorted by address.
     symbols: Vec<(u64, String, Runtime)>,
 }
@@ -109,6 +111,7 @@ impl ImageSymbols {
             end,
             module,
             rust_image: false,
+            go: None,
             symbols: Vec::new(),
         }
     }
@@ -224,6 +227,7 @@ fn parse_reader<R: Read + Seek>(
         end,
         module: module.to_string(),
         rust_image: false,
+        go: None,
         symbols: runtime,
     })
 }

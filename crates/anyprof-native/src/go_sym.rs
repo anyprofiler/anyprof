@@ -1,0 +1,1216 @@
+//! Go stack traces from the linker’s `pclntab`, not from frame pointers.
+//!
+//! A Go function is a goroutine frame. The leaf often has no frame pointer
+//! (`main.spin` at `-O0` is `nop; jmp`), and the return PC lives where the
+//! pcsp table says, which is the calling convention `runtime.gentraceback`
+//! uses. Walking saved `%rbp` records stops at that leaf and can invent a
+//! caller that is not the goroutine’s caller. This module reads Go 1.18+
+//! and Go 1.20+ pclntab (`0xFFFFFFF0` / `0xFFFFFFF1`) and unwinds with pcsp.
+//!
+//! The sample is still the OS thread that is on CPU. The PC and SP belong
+//! to the goroutine that thread is running. A goroutine parked on a channel
+//! or in `time.Sleep` is not on that stack, so it is not given an on-CPU
+//! sample. A thread inside the scheduler or a syscall shows those runtime
+//! frames. This is not a snapshot of `runtime.allgs`.
+//!
+//! Inlined callees stay inside the outer function. The fixtures are
+//! `//go:noinline`. cgo stops at the Go function that entered C, plus the
+//! return PC, because the C frames are not in pclntab. Frame-pointer walk
+//! remains the fallback when the leaf PC is not a Go function.
+//!
+//! Names, files, and lines come from the same table, so `-ldflags=-s -w`
+//! still symbolizes. The table is the executable’s `.gopclntab` /
+//! `__gopclntab`, or, on PE, the blob inside `.rdata` (Go does not give it
+//! its own section). Only a file that also contains `\xff Go buildinf:` is
+//! scanned on PE, so a C++ image is not parsed looking for a lucky magic.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::walk::{self, MAX_FRAMES};
+
+const GO_1_18: u32 = 0xFFFF_FFF0;
+const GO_1_20: u32 = 0xFFFF_FFF1;
+const MAX_TABLE: u64 = 32 * 1024 * 1024;
+const MAX_FUNCS: u64 = 500_000;
+const MAX_NAME: usize = 64 * 1024;
+const FUNC_HEAD: usize = 44;
+const FLAG_TOP_FRAME: u8 = 1;
+const FLAG_SP_WRITE: u8 = 2;
+const BUILD_INFO: &[u8] = b"\xff Go buildinf:";
+
+/// amd64 pushes the return PC. arm64 keeps it in LR or in the slot at SP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoMachine {
+    X86_64,
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    Arm64,
+}
+
+/// One Go function’s pcsp / file / line offsets.
+#[derive(Debug)]
+struct FuncRec {
+    entry: u32,
+    end: u32,
+    name_off: u32,
+    pcsp: u32,
+    pcfile: u32,
+    pcln: u32,
+    cu_off: u32,
+    flag: u8,
+}
+
+#[derive(Debug)]
+struct GoTables {
+    text_start: u64,
+    quantum: u32,
+    funcs: Vec<FuncRec>,
+    data: Vec<u8>,
+    funcname: usize,
+    cutab: usize,
+    filetab: usize,
+    pctab: usize,
+}
+
+/// A pclntab relocated by `bias` (`runtime - link address`).
+#[derive(Debug, Clone)]
+pub(crate) struct GoImage {
+    tables: Arc<GoTables>,
+    runtime_text: u64,
+}
+
+/// Function name, file, and line for one program counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GoSymbol {
+    pub name: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+}
+
+impl GoImage {
+    fn from_tables(tables: GoTables, bias: u64) -> Self {
+        let runtime_text = tables.text_start.wrapping_add(bias);
+        Self {
+            tables: Arc::new(tables),
+            runtime_text,
+        }
+    }
+
+    /// Same table, with `actual_base - preferred_base` as the load bias.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn at_base(&self, preferred_base: u64, actual_base: u64) -> Self {
+        let bias = actual_base.wrapping_sub(preferred_base);
+        Self {
+            tables: Arc::clone(&self.tables),
+            runtime_text: self.tables.text_start.wrapping_add(bias),
+        }
+    }
+
+    fn text_off(&self, runtime_pc: u64) -> Option<u64> {
+        let off = runtime_pc.wrapping_sub(self.runtime_text);
+        let limit = self.tables.funcs.last().map(|func| u64::from(func.end))?;
+        if off < limit { Some(off) } else { None }
+    }
+
+    fn func_at(&self, runtime_pc: u64) -> Option<&FuncRec> {
+        let off = self.text_off(runtime_pc)?;
+        let off = u32::try_from(off).ok()?;
+        let funcs = &self.tables.funcs;
+        let idx = funcs.partition_point(|func| func.entry <= off);
+        let func = funcs.get(idx.checked_sub(1)?)?;
+        if off < func.end { Some(func) } else { None }
+    }
+
+    #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn contains_pc(&self, runtime_pc: u64) -> bool {
+        self.func_at(runtime_pc).is_some()
+    }
+
+    pub(crate) fn symbol(&self, runtime_pc: u64) -> Option<GoSymbol> {
+        let func = self.func_at(runtime_pc)?;
+        let name = self.tables.name(func.name_off)?;
+        let off = self.text_off(runtime_pc)?;
+        let (file, line) = self.tables.file_line(func, off);
+        Some(GoSymbol { name, file, line })
+    }
+}
+
+impl GoTables {
+    fn name(&self, off: u32) -> Option<String> {
+        let start = self.funcname.checked_add(off as usize)?;
+        let bytes = self.data.get(start..)?;
+        let end = bytes.iter().position(|byte| *byte == 0)?;
+        if end == 0 || end > MAX_NAME {
+            return None;
+        }
+        let text = std::str::from_utf8(&bytes[..end]).ok()?;
+        Some(text.to_string())
+    }
+
+    fn file_line(&self, func: &FuncRec, pc_off: u64) -> (Option<String>, Option<u32>) {
+        let line = self
+            .pcvalue(func.pcln, u64::from(func.entry), pc_off)
+            .filter(|line| *line > 0)
+            .and_then(|line| u32::try_from(line).ok());
+        let file = self.file_name(func, pc_off);
+        (file, line)
+    }
+
+    fn file_name(&self, func: &FuncRec, pc_off: u64) -> Option<String> {
+        if func.cu_off == u32::MAX {
+            return None;
+        }
+        let index = self.pcvalue(func.pcfile, u64::from(func.entry), pc_off)?;
+        if index < 0 {
+            return None;
+        }
+        let slot = func.cu_off.checked_add(index as u32)?;
+        let at = self.cutab.checked_add(slot as usize * 4)?;
+        let bytes = self.data.get(at..at + 4)?;
+        let name_off = u32::from_le_bytes(bytes.try_into().ok()?);
+        if name_off == u32::MAX {
+            return None;
+        }
+        let start = self.filetab.checked_add(name_off as usize)?;
+        let rest = self.data.get(start..)?;
+        let end = rest.iter().position(|byte| *byte == 0)?;
+        if end == 0 || end > MAX_NAME {
+            return None;
+        }
+        std::str::from_utf8(&rest[..end]).ok().map(str::to_string)
+    }
+
+    fn pcvalue(&self, off: u32, entry: u64, target: u64) -> Option<i32> {
+        if off == 0 {
+            return None;
+        }
+        let mut index = self.pctab.checked_add(off as usize)?;
+        let mut val = -1i32;
+        let mut pc = entry;
+        let mut first = true;
+        for _ in 0..100_000 {
+            let (next, uv) = read_uvarint(&self.data, index)?;
+            if uv == 0 && !first {
+                return None;
+            }
+            index = next;
+            val = val.checked_add(zigzag(uv))?;
+            let (next, pcdelta) = read_uvarint(&self.data, index)?;
+            index = next;
+            let step = u64::from(pcdelta).checked_mul(u64::from(self.quantum))?;
+            pc = pc.checked_add(step)?;
+            first = false;
+            if target < pc {
+                return Some(val);
+            }
+        }
+        None
+    }
+}
+
+/// Open the pclntab in `path`, still at its link address (`bias` 0).
+#[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+pub(crate) fn open_image(path: &Path) -> Option<GoImage> {
+    let tables = read_tables(path)?;
+    Some(GoImage::from_tables(tables, 0))
+}
+
+/// `runtime_text = link textStart + bias`.
+///
+/// Windows relocates with [`GoImage::at_base`] instead of this bias.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn open_image_at(path: &Path, bias: u64) -> Option<GoImage> {
+    let tables = read_tables(path)?;
+    Some(GoImage::from_tables(tables, bias))
+}
+
+/// Preferred PE image base. The pclntab `textStart` is an address in that image.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn pe_image_base(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    image_base(&mut file, len)
+}
+
+/// Leaf-first PCs. `None` when `pc` is not inside one of `images`.
+///
+/// `adjust_code` strips a return address (pointer authentication on macOS).
+/// The leaf `pc` is already the register value the caller stripped.
+pub(crate) fn unwind(
+    images: &[GoImage],
+    pc: u64,
+    mut sp: u64,
+    mut lr: u64,
+    machine: GoMachine,
+    mut read: impl FnMut(u64, &mut [u8]) -> bool,
+    mut adjust_code: impl FnMut(u64) -> u64,
+) -> Option<Vec<u64>> {
+    let image = images.iter().find(|image| image.func_at(pc).is_some())?;
+    let ptr = 8u64;
+    let mut frames = Vec::new();
+    let mut pc = pc;
+    let mut innermost = true;
+    while frames.len() < MAX_FRAMES {
+        let Some(func) = image.func_at(pc) else {
+            if walk::plausible_user_address(pc) {
+                frames.push(pc);
+            }
+            break;
+        };
+        // Copy the fields before the next lookup so the func borrow ends.
+        let flag = func.flag;
+        let pcsp = func.pcsp;
+        let entry = u64::from(func.entry);
+        let top = flag & FLAG_TOP_FRAME != 0;
+        let sp_write = flag & FLAG_SP_WRITE != 0;
+        let pc_off = pc.wrapping_sub(image.runtime_text);
+        let delta = image
+            .tables
+            .pcvalue(pcsp, entry, pc_off)
+            .filter(|delta| *delta >= 0);
+        frames.push(pc);
+        if top || (!innermost && sp_write) {
+            break;
+        }
+        let Some(delta) = delta else {
+            break;
+        };
+        let delta = delta as u64;
+        let next_sp = match machine {
+            GoMachine::X86_64 => match sp.checked_add(delta).and_then(|at| at.checked_add(ptr)) {
+                Some(next) => next,
+                None => break,
+            },
+            GoMachine::Arm64 => match sp.checked_add(delta) {
+                Some(next) => next,
+                None => break,
+            },
+        };
+        if next_sp < sp {
+            break;
+        }
+        // arm64 leaves the return PC in LR until the frame stores it at SP.
+        // amd64 always stores it at `SP + pcsp` (the slot the CALL pushed).
+        let use_register_lr =
+            machine == GoMachine::Arm64 && !((innermost && sp < next_sp) || lr == 0);
+        let next_pc = if use_register_lr {
+            lr
+        } else {
+            let ret_at = match machine {
+                GoMachine::X86_64 => match sp.checked_add(delta) {
+                    Some(at) => at,
+                    None => break,
+                },
+                GoMachine::Arm64 => sp,
+            };
+            let mut buf = [0u8; 8];
+            if !read(ret_at, &mut buf) {
+                break;
+            }
+            adjust_code(u64::from_le_bytes(buf))
+        };
+        if !walk::plausible_user_address(next_pc) || (next_pc == pc && next_sp == sp) {
+            break;
+        }
+        pc = next_pc;
+        sp = next_sp;
+        lr = 0;
+        innermost = false;
+    }
+    if frames.is_empty() {
+        None
+    } else {
+        Some(frames)
+    }
+}
+
+fn read_tables(path: &Path) -> Option<GoTables> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len < 64 {
+        return None;
+    }
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    if magic == [0x7f, b'E', b'L', b'F'] {
+        return elf_pclntab(&mut file, len).and_then(|bytes| parse_pclntab(&bytes));
+    }
+    let macho = u32::from_le_bytes(magic);
+    let fat = u32::from_be_bytes(magic);
+    if macho == 0xFEED_FACF || fat == 0xCAFE_BABE {
+        return macho_pclntab(&mut file, len).and_then(|bytes| parse_pclntab(&bytes));
+    }
+    if magic[0] == b'M' && magic[1] == b'Z' {
+        if !file_contains_build_info(&mut file, len) {
+            return None;
+        }
+        return pe_pclntab(&mut file, len).and_then(|bytes| parse_pclntab(&bytes));
+    }
+    None
+}
+
+fn parse_pclntab(data: &[u8]) -> Option<GoTables> {
+    if data.len() < 16 || data.len() as u64 > MAX_TABLE {
+        return None;
+    }
+    let magic = u32::from_le_bytes(data.get(0..4)?.try_into().ok()?);
+    if magic != GO_1_18 && magic != GO_1_20 {
+        return None;
+    }
+    if data[4] != 0 || data[5] != 0 {
+        return None;
+    }
+    let quantum = u32::from(data[6]);
+    if !matches!(quantum, 1 | 2 | 4) || data[7] != 8 {
+        return None;
+    }
+    let word = |index: usize| -> Option<u64> {
+        let at = 8 + index * 8;
+        Some(u64::from_le_bytes(data.get(at..at + 8)?.try_into().ok()?))
+    };
+    let nfunc = word(0)?;
+    let text_start = word(2)?;
+    let funcname = usize::try_from(word(3)?).ok()?;
+    let cutab = usize::try_from(word(4)?).ok()?;
+    let filetab = usize::try_from(word(5)?).ok()?;
+    let pctab = usize::try_from(word(6)?).ok()?;
+    let pcln = usize::try_from(word(7)?).ok()?;
+    if nfunc == 0 || nfunc > MAX_FUNCS || text_start == 0 {
+        return None;
+    }
+    for off in [funcname, cutab, filetab, pctab, pcln] {
+        if off >= data.len() {
+            return None;
+        }
+    }
+    let functab_bytes = (nfunc as usize)
+        .checked_mul(2)?
+        .checked_add(1)?
+        .checked_mul(4)?;
+    if pcln.checked_add(functab_bytes)? > data.len() {
+        return None;
+    }
+    let mut funcs = Vec::with_capacity(nfunc as usize);
+    for index in 0..nfunc as usize {
+        let at = pcln + index * 8;
+        let entry = u32::from_le_bytes(data[at..at + 4].try_into().ok()?);
+        let funcoff = u32::from_le_bytes(data[at + 4..at + 8].try_into().ok()?) as usize;
+        let end_at = pcln + (index + 1) * 8;
+        let end = u32::from_le_bytes(data[end_at..end_at + 4].try_into().ok()?);
+        if end <= entry {
+            return None;
+        }
+        let base = pcln.checked_add(funcoff)?;
+        let raw = data.get(base..base + FUNC_HEAD)?;
+        let entry_off = u32::from_le_bytes(raw[0..4].try_into().ok()?);
+        if entry_off != entry {
+            return None;
+        }
+        funcs.push(FuncRec {
+            entry,
+            end,
+            name_off: u32::from_le_bytes(raw[4..8].try_into().ok()?),
+            pcsp: u32::from_le_bytes(raw[16..20].try_into().ok()?),
+            pcfile: u32::from_le_bytes(raw[20..24].try_into().ok()?),
+            pcln: u32::from_le_bytes(raw[24..28].try_into().ok()?),
+            cu_off: u32::from_le_bytes(raw[32..36].try_into().ok()?),
+            flag: raw[41],
+        });
+    }
+    let tables = GoTables {
+        text_start,
+        quantum,
+        funcs,
+        data: data.to_vec(),
+        funcname,
+        cutab,
+        filetab,
+        pctab,
+    };
+    // The first entry is `go:buildid` on Windows and a dotted name on ELF.
+    // Either is a Go pclntab; a random byte string that merely parses is not.
+    let looks_go = tables.funcs.iter().take(8).any(|func| {
+        tables
+            .name(func.name_off)
+            .is_some_and(|name| name.contains('.') || name.starts_with("go:"))
+    });
+    if !looks_go {
+        return None;
+    }
+    Some(tables)
+}
+
+fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let mut ehdr = [0u8; 64];
+    reader.read_exact(&mut ehdr).ok()?;
+    if ehdr[4] != 2 || ehdr[5] != 1 {
+        return None;
+    }
+    let shoff = u64::from_le_bytes(ehdr[40..48].try_into().ok()?);
+    let shentsize = u16::from_le_bytes(ehdr[58..60].try_into().ok()?) as u64;
+    let mut shnum = u16::from_le_bytes(ehdr[60..62].try_into().ok()?) as u64;
+    let shstrndx = u16::from_le_bytes(ehdr[62..64].try_into().ok()?) as u64;
+    if shentsize < 64 || shoff == 0 || shnum > 10_000 {
+        return None;
+    }
+    if shnum == 0 {
+        shnum = read_u64_at(reader, shoff + 4 * 8, len).unwrap_or(0);
+    }
+    if shstrndx >= shnum {
+        return None;
+    }
+    let str_hdr = shoff.checked_add(shstrndx.checked_mul(shentsize)?)?;
+    let str_off = read_u64_at(reader, str_hdr + 24, len)?;
+    let str_size = read_u64_at(reader, str_hdr + 32, len)?;
+    if str_size > MAX_TABLE {
+        return None;
+    }
+    let mut strings = vec![0u8; str_size as usize];
+    reader.seek(SeekFrom::Start(str_off)).ok()?;
+    reader.read_exact(&mut strings).ok()?;
+    for index in 0..shnum {
+        let hdr = shoff.checked_add(index.checked_mul(shentsize)?)?;
+        reader.seek(SeekFrom::Start(hdr)).ok()?;
+        let mut buf = [0u8; 64];
+        reader.read_exact(&mut buf).ok()?;
+        let name_off = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+        let name = cstr_at(&strings, name_off)?;
+        if name != ".gopclntab" && name != ".data.rel.ro.gopclntab" {
+            continue;
+        }
+        let off = u64::from_le_bytes(buf[24..32].try_into().ok()?);
+        let size = u64::from_le_bytes(buf[32..40].try_into().ok()?);
+        return read_span(reader, off, size, len);
+    }
+    None
+}
+
+fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
+    let (offset, size) = macho_slice(reader, len)?;
+    let (text, section) = macho_sections(reader, offset, size)?;
+    let _ = text;
+    let (off, size) = section?;
+    read_span(reader, off, size, len)
+}
+
+/// ASLR slide: runtime header address minus the link `__TEXT` vmaddr.
+#[cfg(target_os = "macos")]
+pub(crate) fn macho_bias(path: &Path, load_addr: u64) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let (offset, size) = macho_slice(&mut file, len)?;
+    let (text, _) = macho_sections(&mut file, offset, size)?;
+    Some(load_addr.wrapping_sub(text))
+}
+
+fn macho_slice<R: Read + Seek>(reader: &mut R, len: u64) -> Option<(u64, u64)> {
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).ok()?;
+    if u32::from_le_bytes(magic) == 0xFEED_FACF {
+        return Some((0, len));
+    }
+    if u32::from_be_bytes(magic) != 0xCAFE_BABE {
+        return None;
+    }
+    let mut count = [0u8; 4];
+    reader.read_exact(&mut count).ok()?;
+    let nfat = u32::from_be_bytes(count);
+    if nfat == 0 || nfat > 64 {
+        return None;
+    }
+    let want = macho_host_cpu()?;
+    for _ in 0..nfat {
+        let mut arch = [0u8; 20];
+        reader.read_exact(&mut arch).ok()?;
+        let cpu = u32::from_be_bytes(arch[0..4].try_into().ok()?);
+        let offset = u64::from(u32::from_be_bytes(arch[8..12].try_into().ok()?));
+        let size = u64::from(u32::from_be_bytes(arch[12..16].try_into().ok()?));
+        if cpu == want {
+            return Some((offset, size));
+        }
+    }
+    None
+}
+
+fn macho_host_cpu() -> Option<u32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(0x0100_000C)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(0x0100_0007)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        None
+    }
+}
+
+/// `__TEXT` vmaddr, and the file span of `__gopclntab` when that section exists.
+fn macho_sections<R: Read + Seek>(
+    reader: &mut R,
+    slice_off: u64,
+    slice_size: u64,
+) -> Option<(u64, Option<(u64, u64)>)> {
+    reader.seek(SeekFrom::Start(slice_off)).ok()?;
+    let mut header = [0u8; 32];
+    reader.read_exact(&mut header).ok()?;
+    if u32::from_le_bytes(header[0..4].try_into().ok()?) != 0xFEED_FACF {
+        return None;
+    }
+    let ncmds = u32::from_le_bytes(header[16..20].try_into().ok()?) as usize;
+    let sizeofcmds = u32::from_le_bytes(header[20..24].try_into().ok()?) as usize;
+    if ncmds > 10_000 || sizeofcmds > 1024 * 1024 {
+        return None;
+    }
+    let mut commands = vec![0u8; sizeofcmds];
+    reader.read_exact(&mut commands).ok()?;
+    let end = slice_off.saturating_add(slice_size);
+    let mut text = None;
+    let mut section = None;
+    let mut at = 0usize;
+    for _ in 0..ncmds {
+        if at + 8 > commands.len() {
+            break;
+        }
+        let cmd = u32::from_le_bytes(commands[at..at + 4].try_into().ok()?);
+        let cmdsize = u32::from_le_bytes(commands[at + 4..at + 8].try_into().ok()?) as usize;
+        if cmdsize < 8 || at + cmdsize > commands.len() {
+            return None;
+        }
+        if cmd == 0x19 && cmdsize >= 72 {
+            let data = &commands[at + 8..at + cmdsize];
+            let name = sect_name(&data[0..16]);
+            let vmaddr = u64::from_le_bytes(data[16..24].try_into().ok()?);
+            if name == "__TEXT" {
+                text = Some(vmaddr);
+            }
+            let nsects = u32::from_le_bytes(data[56..60].try_into().ok()?) as usize;
+            let mut sect = 64usize;
+            for _ in 0..nsects {
+                if sect + 80 > data.len() {
+                    break;
+                }
+                let raw = &data[sect..sect + 80];
+                if sect_name(&raw[0..16]) == "__gopclntab" {
+                    let size = u64::from_le_bytes(raw[40..48].try_into().ok()?);
+                    let file_off = u64::from(u32::from_le_bytes(raw[48..52].try_into().ok()?));
+                    let abs = slice_off.checked_add(file_off)?;
+                    if abs.checked_add(size)? <= end {
+                        section = Some((abs, size));
+                    }
+                }
+                sect += 80;
+            }
+        }
+        at += cmdsize;
+    }
+    Some((text?, section))
+}
+
+fn pe_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<u8>> {
+    let sections = pe_sections(reader, len)?;
+    for name in [".gopclntab", ".rdata", ".data"] {
+        if let Some((off, size)) = sections
+            .iter()
+            .find(|(section, _, _)| section == name)
+            .map(|(_, off, size)| (*off, *size))
+            && let Some(bytes) = read_span(reader, off, size.min(MAX_TABLE), len)
+            && let Some(table) = find_pclntab(&bytes)
+        {
+            return Some(table);
+        }
+    }
+    None
+}
+
+fn find_pclntab(bytes: &[u8]) -> Option<Vec<u8>> {
+    let magic = [0xf1, 0xff, 0xff, 0xff];
+    let older = [0xf0, 0xff, 0xff, 0xff];
+    let mut at = 0usize;
+    while at + 16 < bytes.len() {
+        if (bytes[at..at + 4] == magic || bytes[at..at + 4] == older)
+            && let Some(tables) = parse_pclntab(&bytes[at..])
+        {
+            // The parsed copy starts at the magic and includes the tail of
+            // the section. Offsets inside the header stay valid.
+            return Some(tables.data);
+        }
+        at += 4;
+    }
+    None
+}
+
+fn file_contains_build_info<R: Read + Seek>(reader: &mut R, len: u64) -> bool {
+    let cap = len.min(MAX_TABLE);
+    reader.seek(SeekFrom::Start(0)).ok();
+    let mut pending = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut scanned = 0u64;
+    while scanned < cap {
+        let n = reader.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        if pending
+            .windows(BUILD_INFO.len())
+            .any(|window| window == BUILD_INFO)
+        {
+            return true;
+        }
+        let keep = BUILD_INFO.len() - 1;
+        if pending.len() > keep {
+            pending.drain(..pending.len() - keep);
+        }
+        scanned += n as u64;
+    }
+    false
+}
+
+fn pe_sections<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<(String, u64, u64)>> {
+    reader.seek(SeekFrom::Start(0x3c)).ok()?;
+    let mut lfanew_buf = [0u8; 4];
+    reader.read_exact(&mut lfanew_buf).ok()?;
+    let lfanew = u32::from_le_bytes(lfanew_buf) as u64;
+    if lfanew > 1024 * 1024 || lfanew + 24 > len {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(lfanew)).ok()?;
+    let mut pe = [0u8; 24];
+    reader.read_exact(&mut pe).ok()?;
+    if pe[0..4] != *b"PE\0\0" {
+        return None;
+    }
+    let nsections = u16::from_le_bytes(pe[6..8].try_into().ok()?) as u64;
+    let opt_size = u16::from_le_bytes(pe[20..22].try_into().ok()?) as u64;
+    if nsections > 96 || opt_size > 1024 * 1024 {
+        return None;
+    }
+    let start = lfanew.checked_add(24)?.checked_add(opt_size)?;
+    let mut sections = Vec::new();
+    for index in 0..nsections {
+        let at = start.checked_add(index.checked_mul(40)?)?;
+        reader.seek(SeekFrom::Start(at)).ok()?;
+        let mut raw = [0u8; 40];
+        reader.read_exact(&mut raw).ok()?;
+        let name_end = raw[..8].iter().position(|byte| *byte == 0).unwrap_or(8);
+        let name = String::from_utf8_lossy(&raw[..name_end]).into_owned();
+        let raw_size = u32::from_le_bytes(raw[16..20].try_into().ok()?) as u64;
+        let raw_ptr = u32::from_le_bytes(raw[20..24].try_into().ok()?) as u64;
+        sections.push((name, raw_ptr, raw_size));
+    }
+    Some(sections)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn image_base<R: Read + Seek>(reader: &mut R, len: u64) -> Option<u64> {
+    reader.seek(SeekFrom::Start(0x3c)).ok()?;
+    let mut lfanew_buf = [0u8; 4];
+    reader.read_exact(&mut lfanew_buf).ok()?;
+    let lfanew = u32::from_le_bytes(lfanew_buf) as u64;
+    reader.seek(SeekFrom::Start(lfanew)).ok()?;
+    let mut pe = [0u8; 24];
+    reader.read_exact(&mut pe).ok()?;
+    if pe[0..4] != *b"PE\0\0" {
+        return None;
+    }
+    let opt_size = u16::from_le_bytes(pe[20..22].try_into().ok()?) as u64;
+    if opt_size < 32 || lfanew + 24 + 32 > len {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(lfanew + 24)).ok()?;
+    let mut magic = [0u8; 2];
+    reader.read_exact(&mut magic).ok()?;
+    if u16::from_le_bytes(magic) != 0x20B {
+        return None;
+    }
+    // PE32+ ImageBase is 24 bytes into the optional header.
+    reader.seek(SeekFrom::Start(lfanew + 24 + 24)).ok()?;
+    let mut base = [0u8; 8];
+    reader.read_exact(&mut base).ok()?;
+    Some(u64::from_le_bytes(base))
+}
+
+fn read_span<R: Read + Seek>(reader: &mut R, off: u64, size: u64, len: u64) -> Option<Vec<u8>> {
+    if !(16..=MAX_TABLE).contains(&size) || off.checked_add(size)? > len {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(off)).ok()?;
+    let mut buf = vec![0u8; size as usize];
+    reader.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn read_u64_at<R: Read + Seek>(reader: &mut R, at: u64, len: u64) -> Option<u64> {
+    if at.checked_add(8)? > len {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(at)).ok()?;
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf).ok()?;
+    Some(u64::from_le_bytes(buf))
+}
+
+fn cstr_at(bytes: &[u8], off: usize) -> Option<&str> {
+    let rest = bytes.get(off..)?;
+    let end = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(rest.len());
+    std::str::from_utf8(&rest[..end]).ok()
+}
+
+fn sect_name(bytes: &[u8]) -> &str {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+fn read_uvarint(data: &[u8], mut index: usize) -> Option<(usize, u32)> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+    for _ in 0..5 {
+        let byte = *data.get(index)?;
+        index += 1;
+        value |= u32::from(byte & 0x7f).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some((index, value));
+        }
+        shift += 7;
+    }
+    None
+}
+
+fn zigzag(value: u32) -> i32 {
+    let magnitude = value >> 1;
+    if value & 1 == 0 {
+        magnitude as i32
+    } else {
+        (!magnitude) as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BUILD_INFO, GoImage, GoMachine, file_contains_build_info, image_base, open_image,
+        open_image_at, parse_pclntab, unwind,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_synthetic_table_names_the_leaf_and_walks_pcsp() {
+        let bytes = synthetic();
+        let tables = parse_pclntab(&bytes).expect("pclntab");
+        let image = GoImage::from_tables(tables, 0x1000);
+        let spin = image.symbol(0x401110).expect("spin");
+        assert_eq!(spin.name, "main.spin");
+        assert_eq!(spin.file.as_deref(), Some("a.go"));
+        assert_eq!(spin.line, Some(10));
+        let caller = image.symbol(0x401190).expect("caller");
+        assert_eq!(caller.name, "main.caller");
+        assert_eq!(caller.line, Some(20));
+
+        let sp = 0x7fff_0000_1000u64;
+        let mut memory = HashMap::new();
+        // spin's pcsp is 0, so the return PC is at SP. The caller's pcsp is 8,
+        // and after the first step SP has moved by one pointer.
+        memory.insert(sp, 0x401190u64);
+        memory.insert(sp + 16, 0x5555_0000_2000u64);
+        let frames = unwind(
+            &[image],
+            0x401110,
+            sp,
+            0,
+            GoMachine::X86_64,
+            |addr, buf| {
+                let Some(value) = memory.get(&addr) else {
+                    return false;
+                };
+                buf[..8].copy_from_slice(&value.to_le_bytes());
+                true
+            },
+            |addr| addr,
+        )
+        .expect("walk");
+        assert_eq!(frames, vec![0x401110, 0x401190, 0x5555_0000_2000]);
+    }
+
+    #[test]
+    fn arm64_keeps_the_link_register_until_the_frame_saves_it() {
+        let image = GoImage::from_tables(parse_pclntab(&synthetic()).unwrap(), 0x1000);
+        let sp = 0x7fff_0000_1000u64;
+        let mut memory = HashMap::new();
+        // The leaf's pcsp is 0, so LR is still the caller. The caller's pcsp
+        // is 8 and its return PC is the word at SP, not SP+pcsp+8.
+        memory.insert(sp, 0x5555_0000_2000u64);
+        let frames = unwind(
+            &[image],
+            0x401110,
+            sp,
+            0x401190,
+            GoMachine::Arm64,
+            |addr, buf| {
+                let Some(value) = memory.get(&addr) else {
+                    return false;
+                };
+                buf[..8].copy_from_slice(&value.to_le_bytes());
+                true
+            },
+            |addr| addr,
+        )
+        .expect("arm64 walk");
+        assert_eq!(frames, vec![0x401110, 0x401190, 0x5555_0000_2000]);
+    }
+
+    #[test]
+    fn a_pc_outside_the_module_is_not_a_go_walk() {
+        let image = GoImage::from_tables(parse_pclntab(&synthetic()).unwrap(), 0);
+        assert!(
+            unwind(
+                &[image],
+                0x5555_0000_1000,
+                0x7fff_0000_1000,
+                0,
+                GoMachine::X86_64,
+                |_, _| false,
+                |addr| addr,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn build_info_magic_must_include_the_marker_byte() {
+        let mut cursor = std::io::Cursor::new(BUILD_INFO.to_vec());
+        assert!(file_contains_build_info(
+            &mut cursor,
+            BUILD_INFO.len() as u64
+        ));
+        let mut plain = std::io::Cursor::new(b"Go buildinf:".to_vec());
+        assert!(!file_contains_build_info(
+            &mut plain,
+            b"Go buildinf:".len() as u64
+        ));
+        let mut nospace = std::io::Cursor::new(b"\xffGo buildinf:".to_vec());
+        assert!(!file_contains_build_info(
+            &mut nospace,
+            b"\xffGo buildinf:".len() as u64
+        ));
+    }
+
+    #[test]
+    fn a_real_go_toolchain_pclntab_names_main_spin() {
+        let go = match which_go() {
+            Some(go) => go,
+            None if required() => panic!("CI requires a Go toolchain"),
+            None => return,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "anyprof-go-pcln-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("main.go");
+        std::fs::write(
+            &source,
+            r#"package main
+func main() { caller() }
+//go:noinline
+func caller() { spin() }
+//go:noinline
+func spin() {
+    var x uint64
+    for { x++ }
+}
+"#,
+        )
+        .unwrap();
+        let binary = dir.join(if cfg!(windows) { "spin.exe" } else { "spin" });
+        let compile = std::process::Command::new(&go)
+            .args(["build", "-ldflags=-s -w", "-o"])
+            .arg(&binary)
+            .arg(&source)
+            .env("CGO_ENABLED", "0")
+            .current_dir(&dir)
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {go}: {err}"));
+        assert!(
+            compile.status.success(),
+            "go build\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let image = open_image(&binary).expect("pclntab in a stripped Go binary");
+        let found = find_named(&image, "main.spin");
+        assert!(
+            found
+                .file
+                .as_deref()
+                .is_some_and(|file| file.ends_with("main.go")),
+            "file {:?}",
+            found.file
+        );
+        assert!(found.line.is_some_and(|line| line > 0), "{found:?}");
+        let caller = find_named(&image, "main.caller");
+        assert_eq!(caller.file, found.file);
+        // The same pclntab layout is what macOS and Windows will open. Cross
+        // compile proves the Mach-O and PE readers, including a relocated PE
+        // image base, without those hosts.
+        for (goos, goarch) in [
+            ("windows", "amd64"),
+            ("darwin", "amd64"),
+            ("darwin", "arm64"),
+        ] {
+            let binary = dir.join(format!("spin-{goos}-{goarch}"));
+            let compile = std::process::Command::new(&go)
+                .args(["build", "-ldflags=-s -w", "-o"])
+                .arg(&binary)
+                .arg(&source)
+                .env("CGO_ENABLED", "0")
+                .env("GOOS", goos)
+                .env("GOARCH", goarch)
+                .current_dir(&dir)
+                .output()
+                .unwrap_or_else(|err| panic!("spawn {go}: {err}"));
+            assert!(
+                compile.status.success(),
+                "go build {goos}/{goarch}\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            let image = open_image(&binary)
+                .unwrap_or_else(|| panic!("pclntab in the stripped {goos}/{goarch} binary"));
+            let found = find_named(&image, "main.spin");
+            assert!(
+                found
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| file.ends_with("main.go")),
+                "{goos}/{goarch} file {:?}",
+                found.file
+            );
+            if goos == "windows" {
+                let mut file = std::fs::File::open(&binary).unwrap();
+                let len = file.metadata().unwrap().len();
+                let preferred = image_base(&mut file, len).expect("PE32+ image base");
+                assert!(
+                    image.runtime_text > preferred,
+                    "textStart {:#x} should sit above the image base {preferred:#x}",
+                    image.runtime_text
+                );
+                let slide = 0x1_0000_0000u64;
+                let slid = open_image_at(&binary, slide).unwrap();
+                let moved = slid.symbol(find_pc(&image, "main.spin").wrapping_add(slide));
+                assert_eq!(
+                    moved.as_ref().map(|symbol| symbol.name.as_str()),
+                    Some("main.spin")
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn find_pc(image: &GoImage, name: &str) -> u64 {
+        let limit = image
+            .tables
+            .funcs
+            .last()
+            .map(|func| u64::from(func.end))
+            .unwrap_or(0);
+        for off in (0..limit).step_by(4) {
+            let pc = image.runtime_text.wrapping_add(off);
+            if image.symbol(pc).is_some_and(|symbol| symbol.name == name) {
+                return pc;
+            }
+        }
+        panic!("pclntab did not contain {name}");
+    }
+
+    fn find_named(image: &GoImage, name: &str) -> super::GoSymbol {
+        let limit = image
+            .tables
+            .funcs
+            .last()
+            .map(|func| u64::from(func.end))
+            .unwrap_or(0);
+        for off in (0..limit).step_by(4) {
+            let pc = image.runtime_text.wrapping_add(off);
+            if let Some(symbol) = image.symbol(pc)
+                && symbol.name == name
+            {
+                return symbol;
+            }
+        }
+        panic!("pclntab did not contain {name} within text of {limit:#x} bytes");
+    }
+
+    fn which_go() -> Option<String> {
+        let output = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+            .arg("go")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let path = text.lines().next()?.trim();
+        if path.is_empty() {
+            None
+        } else {
+            Some(path.to_string())
+        }
+    }
+
+    fn required() -> bool {
+        std::env::var("ANYPROF_REQUIRE_NATIVE").ok().as_deref() == Some("1")
+    }
+
+    fn synthetic() -> Vec<u8> {
+        let names = b"main.spin\0main.caller\0";
+        let files = b"a.go\0";
+        let cutab = 0u32.to_le_bytes();
+        let spin_pcsp = pcdata(0);
+        let caller_pcsp = pcdata(8);
+        let file_idx = pcdata(0);
+        let spin_line = pcdata(10);
+        let caller_line = pcdata(20);
+        // Offset 0 in a pcdata field means "no table", so the streams start at 1.
+        let mut pctab = vec![0u8];
+        let spin_pcsp_off = push_stream(&mut pctab, &spin_pcsp);
+        let caller_pcsp_off = push_stream(&mut pctab, &caller_pcsp);
+        let file_off = push_stream(&mut pctab, &file_idx);
+        let spin_line_off = push_stream(&mut pctab, &spin_line);
+        let caller_line_off = push_stream(&mut pctab, &caller_line);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(names);
+        let file_at = body.len();
+        body.extend_from_slice(files);
+        let cu_at = body.len();
+        body.extend_from_slice(&cutab);
+        let pctab_at = body.len();
+        body.extend_from_slice(&pctab);
+        let pcln_at = body.len();
+        // functab: two funcs plus a sentinel entry. funcoff is relative to pcln.
+        let func0 = 20u32;
+        let func1 = 64u32;
+        body.extend_from_slice(&0x100u32.to_le_bytes());
+        body.extend_from_slice(&func0.to_le_bytes());
+        body.extend_from_slice(&0x180u32.to_le_bytes());
+        body.extend_from_slice(&func1.to_le_bytes());
+        body.extend_from_slice(&0x200u32.to_le_bytes());
+        write_func(
+            &mut body,
+            0x100,
+            0,
+            spin_pcsp_off,
+            file_off,
+            spin_line_off,
+            0,
+        );
+        write_func(
+            &mut body,
+            0x180,
+            10,
+            caller_pcsp_off,
+            file_off,
+            caller_line_off,
+            0,
+        );
+
+        let mut data = vec![0u8; 72];
+        data[0..4].copy_from_slice(&0xFFFF_FFF1u32.to_le_bytes());
+        data[6] = 1;
+        data[7] = 8;
+        put_u64(&mut data, 8, 2);
+        put_u64(&mut data, 16, 1);
+        put_u64(&mut data, 24, 0x400000);
+        put_u64(&mut data, 32, 72);
+        put_u64(&mut data, 40, 72 + cu_at as u64);
+        put_u64(&mut data, 48, 72 + file_at as u64);
+        put_u64(&mut data, 56, 72 + pctab_at as u64);
+        put_u64(&mut data, 64, 72 + pcln_at as u64);
+        data.extend_from_slice(&body);
+        let _ = file_at;
+        data
+    }
+
+    fn push_stream(out: &mut Vec<u8>, bytes: &[u8]) -> u32 {
+        let off = out.len() as u32;
+        out.extend_from_slice(bytes);
+        off
+    }
+
+    fn pcdata(value: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_uvarint(&mut out, zigzag_encode(value + 1));
+        write_uvarint(&mut out, 0x10000);
+        out.push(0);
+        out
+    }
+
+    fn zigzag_encode(delta: i32) -> u32 {
+        if delta >= 0 {
+            (delta as u32) << 1
+        } else {
+            (((-delta - 1) as u32) << 1) | 1
+        }
+    }
+
+    fn write_uvarint(out: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn write_func(
+        out: &mut Vec<u8>,
+        entry: u32,
+        name_off: u32,
+        pcsp: u32,
+        pcfile: u32,
+        pcln: u32,
+        cu: u32,
+    ) {
+        let start = out.len();
+        out.extend_from_slice(&entry.to_le_bytes());
+        out.extend_from_slice(&name_off.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&pcsp.to_le_bytes());
+        out.extend_from_slice(&pcfile.to_le_bytes());
+        out.extend_from_slice(&pcln.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&cu.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(out.len() - start, 44);
+    }
+
+    fn put_u64(data: &mut [u8], at: usize, value: u64) {
+        data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+}

@@ -145,7 +145,10 @@ name = "anyprof-go"
 version = "0.1.6"
 dependencies = [
  "anyprof-core",
+ "anyprof-export",
+ "anyprof-native",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
