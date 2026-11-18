@@ -21,6 +21,10 @@ mach2 = "0.4.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# Windows x64 reads a rustc PDB directly when dbghelp returns no name.
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+pdb = "0.8"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

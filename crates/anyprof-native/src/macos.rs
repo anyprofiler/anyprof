@@ -208,7 +208,7 @@ fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
                 .or_else(|| image.name_at(addr))
                 .map(|(name, symbol_runtime)| {
                     let runtime =
-                        crate::symbol::frame_runtime(symbol_runtime, name, image.rust_image);
+                        crate::symbol::frame_runtime(symbol_runtime, name, false, image.rust_image);
                     (name.to_string(), runtime)
                 })
         })

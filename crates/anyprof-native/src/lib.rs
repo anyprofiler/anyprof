@@ -19,6 +19,7 @@ mod elf;
 mod kallsyms;
 mod macho;
 mod maps;
+mod pdb_syms;
 mod perf_parse;
 mod policy;
 mod rust_image;

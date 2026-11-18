@@ -164,7 +164,8 @@ impl UserImage {
 /// when the adjusted address falls in a gap between symbols.
 ///
 /// The runtime is Rust when the symbol was Rust-mangled, or when the image
-/// is a Rust binary and the name is already a `::` path.
+/// is a Rust binary and the name is an undecorated `crate::item` path.
+/// Itanium C++ keeps a parameter list and stays native.
 pub(crate) fn name_for(
     images: &[UserImage],
     addr: u64,
@@ -177,7 +178,7 @@ pub(crate) fn name_for(
 fn find(images: &[UserImage], addr: u64) -> Option<(&str, &str, Runtime)> {
     let image = images.iter().find(|image| image.contains(addr))?;
     let (name, runtime) = image.name_at(addr)?;
-    let runtime = frame_runtime(runtime, name, image.rust_image);
+    let runtime = frame_runtime(runtime, name, false, image.rust_image);
     Some((name, image.module.as_str(), runtime))
 }
 

@@ -56,17 +56,26 @@ fn a_rustc_binary_is_detected_and_strip_does_not_hide_it() {
     {
         let stripped = dir.join(exe_name("fixture-stripped"));
         std::fs::copy(&binary, &stripped).unwrap();
-        let strip = Command::new("strip")
-            .arg("--strip-all")
-            .arg(&stripped)
-            .output();
-        if let Ok(output) = strip
-            && output.status.success()
-        {
-            assert!(
-                file_is_rust(&stripped),
-                "strip removed every Rust marker; detection must keep working for a stripped std binary"
-            );
+        let mut strip = Command::new("strip");
+        if cfg!(target_os = "macos") {
+            // macOS strip has no `--strip-all`. `-x` drops local symbols and
+            // `-S` drops the debug stab. The panic strings are not in there.
+            strip.args(["-x", "-S"]);
+        } else {
+            strip.arg("--strip-all");
+        }
+        match strip.arg(&stripped).output() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("strip is not installed; the strip assertion was not run");
+            }
+            Err(err) => panic!("failed to spawn strip: {err}"),
+            Ok(output) if output.status.success() => {
+                assert!(
+                    file_is_rust(&stripped),
+                    "strip removed every Rust marker; detection must keep working for a stripped std binary"
+                );
+            }
+            Ok(output) => panic!("strip failed\n{}", String::from_utf8_lossy(&output.stderr)),
         }
     }
 

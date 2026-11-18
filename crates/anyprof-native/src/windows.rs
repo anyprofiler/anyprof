@@ -32,16 +32,18 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ADDRESS64, AddrModeFlat, CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, IMAGEHLP_MODULE64,
-    STACKFRAME64, SYMBOL_INFO_PACKAGE, SYMOPT_DEFERRED_LOADS, SYMOPT_DISABLE_SYMSRV_AUTODETECT,
+    STACKFRAME64, SYMBOL_INFO, SYMOPT_DEFERRED_LOADS, SYMOPT_DISABLE_SYMSRV_AUTODETECT,
     SYMOPT_FAIL_CRITICAL_ERRORS, SYMOPT_IGNORE_NT_SYMPATH, SYMOPT_NO_PROMPTS, SYMOPT_UNDNAME,
     StackWalk64, SymCleanup, SymFromAddr, SymFunctionTableAccess64, SymGetModuleBase64,
-    SymGetModuleInfo64, SymInitializeW, SymSetOptions,
+    SymGetModuleInfo64, SymGetOptions, SymInitializeW, SymSetOptions,
 };
+use windows_sys::Win32::System::ProcessStatus::GetModuleFileNameExW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessInformation, IsWow64Process2, OpenProcess, OpenProcessToken,
-    OpenThread, PROCESS_PROTECTION_LEVEL_INFORMATION, PROCESS_QUERY_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, ProcessProtectionLevelInfo, ResumeThread,
-    SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    OpenThread, PROCESS_NAME_WIN32, PROCESS_PROTECTION_LEVEL_INFORMATION,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    ProcessProtectionLevelInfo, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
+    THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::policy::{self, DebugPrivilege};
@@ -210,10 +212,17 @@ impl Symbols {
             | SYMOPT_IGNORE_NT_SYMPATH
             | SYMOPT_DISABLE_SYMSRV_AUTODETECT;
         unsafe { SymSetOptions(options) };
+        // rustc's `/PDBALTPATH` often stores only the PDB file name. dbghelp
+        // finds that name in this directory. The embedded absolute path, when
+        // it still exists, is tried first, which is how a C/C++ PDB next to
+        // its exe is loaded. The path is not a symbol server.
+        let search = exe_symbol_dir(process);
+        let search_ptr = search
+            .as_ref()
+            .map_or(std::ptr::null(), |path| path.as_ptr());
         // SAFETY: `SymInitializeW` attaches dbghelp to this process handle.
-        // `Symbols` calls `SymCleanup`. A null path does not add a search
-        // directory; modules already mapped in the process are enumerated.
-        let ok = unsafe { SymInitializeW(process, std::ptr::null(), 1) };
+        // `Symbols` calls `SymCleanup`. `search` stays alive for the call.
+        let ok = unsafe { SymInitializeW(process, search_ptr, 1) };
         if ok == FALSE {
             let err = unsafe { GetLastError() };
             return Err(Error::backend(
@@ -458,12 +467,13 @@ fn finish_profile(
     interval: Duration,
 ) -> Profile {
     let mut rust_files = HashMap::<String, bool>::new();
+    let mut pdbs = HashMap::<String, crate::pdb_syms::ImageSymbols>::new();
     let mut stacks = Vec::with_capacity(counts.len());
     for (addresses, weight) in counts {
         let frames = addresses
             .iter()
             .enumerate()
-            .map(|(index, addr)| frame_for(process, *addr, index == 0, &mut rust_files))
+            .map(|(index, addr)| frame_for(process, *addr, index == 0, &mut rust_files, &mut pdbs))
             .collect();
         stacks.push(Stack { frames, weight });
     }
@@ -483,17 +493,18 @@ fn frame_for(
     addr: u64,
     leaf: bool,
     rust_files: &mut HashMap<String, bool>,
+    pdbs: &mut HashMap<String, crate::pdb_syms::ImageSymbols>,
 ) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
-    let hit = symbol_at(process, lookup).or_else(|| symbol_at(process, addr));
+    let hit = symbol_at(process, lookup, pdbs).or_else(|| symbol_at(process, addr, pdbs));
     let (name, module, runtime) = match hit {
-        Some((name, module, path, symbol_runtime)) => {
+        Some((name, module, path, symbol_runtime, from_cpp)) => {
             let image_rust = path.is_some_and(|path| {
                 *rust_files
                     .entry(path.clone())
                     .or_insert_with(|| crate::rust_image::file_is_rust(Path::new(&path)))
             });
-            let runtime = frame_runtime(symbol_runtime, &name, image_rust);
+            let runtime = frame_runtime(symbol_runtime, &name, from_cpp, image_rust);
             (name, module, runtime)
         }
         None => (
@@ -515,34 +526,156 @@ fn frame_for(
     frame
 }
 
-fn symbol_at(process: HANDLE, addr: u64) -> Option<(String, String, Option<String>, Runtime)> {
-    let (name, runtime) = symbol_name(process, addr)?;
-    let (module, path) = module_path(process, addr).unwrap_or_else(|| (String::new(), None));
-    Some((name, module, path, runtime))
+fn symbol_at(
+    process: HANDLE,
+    addr: u64,
+    pdbs: &mut HashMap<String, crate::pdb_syms::ImageSymbols>,
+) -> Option<(String, String, Option<String>, Runtime, bool)> {
+    let (module, dbg_path) = module_path(process, addr).unwrap_or_else(|| (String::new(), None));
+    let file = module_file(process, addr).or_else(|| dbg_path.map(std::path::PathBuf::from));
+    let path = file
+        .as_ref()
+        .map(|file| file.to_string_lossy().into_owned());
+    if let Some((name, runtime, from_cpp)) = symbol_name(process, addr) {
+        return Some((name, module, path, runtime, from_cpp));
+    }
+    let file = file?;
+    let (name, runtime, from_cpp) = pdb_name(process, addr, &file, pdbs)?;
+    let module = if module.is_empty() {
+        file.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        module
+    };
+    Some((name, module, path, runtime, from_cpp))
 }
 
-fn symbol_name(process: HANDLE, addr: u64) -> Option<(String, Runtime)> {
-    let mut package: SYMBOL_INFO_PACKAGE = unsafe { std::mem::zeroed() };
-    package.si.SizeOfStruct = std::mem::size_of_val(&package.si) as u32;
-    // `Name` is one byte inside `SYMBOL_INFO`, and `name` continues it.
-    package.si.MaxNameLen = 1 + package.name.len() as u32;
+/// `SymFromAddr` first. A rustc PDB often yields no name here even when the
+/// file sits next to the exe and the C++ path through this function works.
+/// The raw name is read with `SYMOPT_UNDNAME` off so an MSVC `?` symbol stays
+/// distinguishable from an undecorated Rust path, then undecorated for display.
+fn symbol_name(process: HANDLE, addr: u64) -> Option<(String, Runtime, bool)> {
+    let raw = read_symbol(process, addr, false).or_else(|| read_symbol(process, addr, true))?;
+    if raw.starts_with('?') {
+        let pretty = read_symbol(process, addr, true).unwrap_or(raw);
+        return Some((pretty, Runtime::Native, true));
+    }
+    let presented = symbol::present_elf_symbol(&raw);
+    Some((presented.name, presented.runtime, presented.from_cpp))
+}
+
+/// Bytes reserved for `SYMBOL_INFO::Name` past the one byte inside the struct.
+const SYMBOL_NAME_EXTRA: usize = 8191;
+
+#[repr(C)]
+struct SymbolBuf {
+    info: SYMBOL_INFO,
+    extra: [u8; SYMBOL_NAME_EXTRA],
+}
+
+fn read_symbol(process: HANDLE, addr: u64, undname: bool) -> Option<String> {
+    let previous = unsafe { SymGetOptions() };
+    let next = if undname {
+        previous | SYMOPT_UNDNAME
+    } else {
+        previous & !SYMOPT_UNDNAME
+    };
+    unsafe { SymSetOptions(next) };
+    let _restore = RestoreOptions(previous);
+    let mut buf: Box<SymbolBuf> = unsafe { Box::new(std::mem::zeroed()) };
+    buf.info.SizeOfStruct = std::mem::size_of::<SYMBOL_INFO>() as u32;
+    buf.info.MaxNameLen = (SYMBOL_NAME_EXTRA + 1) as u32;
     let mut displacement = 0u64;
-    let ok = unsafe { SymFromAddr(process, addr, &mut displacement, &mut package.si) };
+    let ok = unsafe { SymFromAddr(process, addr, &mut displacement, &mut buf.info) };
     if ok == FALSE {
         return None;
     }
-    let len = package.si.NameLen as usize;
-    let bytes =
-        unsafe { std::slice::from_raw_parts(package.si.Name.as_ptr().cast::<u8>(), len.min(1024)) };
-    let text = String::from_utf8_lossy(bytes)
-        .trim_end_matches('\0')
-        .to_string();
+    let cap = SYMBOL_NAME_EXTRA + 1;
+    let len = (buf.info.NameLen as usize).min(cap);
+    let bytes = unsafe { std::slice::from_raw_parts(buf.info.Name.as_ptr().cast::<u8>(), len) };
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let text = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+struct RestoreOptions(u32);
+
+impl Drop for RestoreOptions {
+    fn drop(&mut self) {
+        unsafe { SymSetOptions(self.0) };
+    }
+}
+
+fn pdb_name(
+    process: HANDLE,
+    addr: u64,
+    file: &Path,
+    pdbs: &mut HashMap<String, crate::pdb_syms::ImageSymbols>,
+) -> Option<(String, Runtime, bool)> {
+    let base = unsafe { SymGetModuleBase64(process, addr) };
+    if base == 0 || addr < base {
+        return None;
+    }
+    let key = file.to_string_lossy().into_owned();
+    let symbols = pdbs
+        .entry(key)
+        .or_insert_with(|| crate::pdb_syms::load(file));
+    let (name, runtime, from_cpp) = symbols.name_at(addr - base)?;
+    Some((name.to_string(), runtime, from_cpp))
+}
+
+/// Full path of the module containing `addr`. `IMAGEHLP_MODULE64` stores only
+/// 256 characters, which is enough for the CI fixture and short for a long
+/// temp path. `GetModuleFileNameExW` is the path the PDB is opened from.
+fn module_file(process: HANDLE, addr: u64) -> Option<std::path::PathBuf> {
+    let base = unsafe { SymGetModuleBase64(process, addr) };
+    if base == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; 32768];
+    let n = unsafe {
+        GetModuleFileNameExW(
+            process,
+            base as *mut std::ffi::c_void,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    let text = String::from_utf16_lossy(&buf[..n as usize]);
     if text.is_empty() {
         None
     } else {
-        let presented = symbol::present_elf_symbol(&text);
-        Some((presented.name, presented.runtime))
+        Some(std::path::PathBuf::from(text))
     }
+}
+
+fn exe_symbol_dir(process: HANDLE) -> Option<Vec<u16>> {
+    let mut buf = vec![0u16; 32768];
+    let mut len = buf.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+    };
+    if ok == FALSE || len == 0 {
+        return None;
+    }
+    let path = &buf[..len as usize];
+    let slash = path
+        .iter()
+        .rposition(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))?;
+    if slash == 0 {
+        return None;
+    }
+    let mut dir = path[..slash].to_vec();
+    dir.push(0);
+    Some(dir)
 }
 
 fn module_only(process: HANDLE, addr: u64) -> Option<String> {

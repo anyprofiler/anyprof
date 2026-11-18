@@ -11,9 +11,9 @@
 //! - a remapped panic path `/rustc/<40 hex chars>/library/`.
 //!
 //! The scan is bounded and stops at the first hit. It does not ptrace, and
-//! it does not read past [`MAX_SCAN`]. A Mach-O or PE `no_std` binary that
-//! was stripped and contains none of these strings is not detected; passing
-//! `--backend rust` still samples it.
+//! the last read is shortened so the total does not pass [`MAX_SCAN`]. A
+//! Mach-O or PE `no_std` binary that was stripped and contains none of these
+//! strings is not detected; passing `--backend rust` still samples it.
 
 use std::fs::File;
 use std::io::Read;
@@ -67,10 +67,12 @@ fn scan(path: &Path) -> std::io::Result<bool> {
     let mut buf = vec![0_u8; CHUNK];
     let mut scanned = 0_u64;
     loop {
-        if scanned >= MAX_SCAN {
+        let room = MAX_SCAN.saturating_sub(scanned);
+        if room == 0 {
             return Ok(false);
         }
-        let n = file.read(&mut buf)?;
+        let want = CHUNK.min(usize::try_from(room).unwrap_or(CHUNK));
+        let n = file.read(&mut buf[..want])?;
         if n == 0 {
             return Ok(false);
         }
@@ -125,8 +127,8 @@ fn find_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK, contains_marker, file_is_rust, scan};
-    use std::io::Write;
+    use super::{CHUNK, MAX_SCAN, contains_marker, file_is_rust, scan};
+    use std::io::{Seek, Write};
 
     #[test]
     fn markers_match_rustc_output_and_not_a_c_comment() {
@@ -161,6 +163,35 @@ mod tests {
         let found = scan(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(found);
+    }
+
+    #[test]
+    fn scan_does_not_read_a_marker_past_the_cap() {
+        let past = marker_file("past");
+        let mut file = std::fs::File::create(&past).unwrap();
+        let marker = b"called `Option::unwrap()` on a `None` value";
+        file.seek(std::io::SeekFrom::Start(MAX_SCAN)).unwrap();
+        file.write_all(marker).unwrap();
+        drop(file);
+        assert!(!scan(&past).unwrap());
+
+        let inside = marker_file("inside");
+        let mut file = std::fs::File::create(&inside).unwrap();
+        let at = MAX_SCAN - marker.len() as u64;
+        file.seek(std::io::SeekFrom::Start(at)).unwrap();
+        file.write_all(marker).unwrap();
+        drop(file);
+        assert!(scan(&inside).unwrap());
+        let _ = std::fs::remove_file(&past);
+        let _ = std::fs::remove_file(&inside);
+    }
+
+    fn marker_file(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "anyprof-rust-cap-{label}-{}-{}",
+            std::process::id(),
+            marker_nonce()
+        ))
     }
 
     #[test]

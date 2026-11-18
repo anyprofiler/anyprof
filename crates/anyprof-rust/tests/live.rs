@@ -25,14 +25,14 @@ mod supported {
     #[cfg(target_os = "macos")]
     #[test]
     fn samples_a_busy_rust_program() {
-        with_root("samples_a_busy_rust_program", sample_busy);
+        with_root("supported::samples_a_busy_rust_program", sample_busy);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn an_idle_rust_process_does_not_invent_on_cpu_samples() {
         with_root(
-            "an_idle_rust_process_does_not_invent_on_cpu_samples",
+            "supported::an_idle_rust_process_does_not_invent_on_cpu_samples",
             sample_idle,
         );
     }
@@ -40,7 +40,10 @@ mod supported {
     #[cfg(target_os = "macos")]
     #[test]
     fn both_running_rust_threads_are_sampled() {
-        with_root("both_running_rust_threads_are_sampled", sample_threads);
+        with_root(
+            "supported::both_running_rust_threads_are_sampled",
+            sample_threads,
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -505,7 +508,13 @@ mod supported {
         let output = command.output().expect("invoke sudo");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() && stdout.contains(test_name) && stdout.contains("ok") {
+        // `--exact` must be the libtest path (`supported::<fn>`). A bare
+        // function name filters every test out and still exits 0.
+        let ran = stdout.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("test ") && line.contains(test_name) && line.contains("... ok")
+        });
+        if output.status.success() && stdout.contains("running 1 test") && ran {
             return;
         }
         let sudo_missing = stderr.contains("a password is required")

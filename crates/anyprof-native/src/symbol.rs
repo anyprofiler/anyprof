@@ -20,6 +20,9 @@ pub(crate) struct Presented {
     pub name: String,
     /// [`Runtime::Rust`] when `name` came from Rust mangling.
     pub runtime: Runtime,
+    /// `cpp_demangle` produced `name`, or the raw symbol was MSVC `?` mangling.
+    /// A Rust image must not relabel that frame.
+    pub from_cpp: bool,
 }
 
 /// ELF, PE, and dbghelp names. A GNU version suffix (`@@GLIBC_2.2.5`) is removed.
@@ -34,7 +37,7 @@ pub(crate) fn present_elf_symbol(raw: &str) -> Presented {
         trimmed.to_string()
     };
     if let Some(name) = demangle_cpp(&candidate) {
-        return native(name);
+        return cpp(name);
     }
     if candidate == raw {
         native(raw.to_string())
@@ -64,7 +67,7 @@ pub(crate) fn present_macho_symbol(raw: &str) -> Presented {
     if let Some(candidate) = itanium
         && let Some(name) = demangle_cpp(&candidate)
     {
-        return native(name);
+        return cpp(name);
     }
     match raw.strip_prefix('_') {
         Some(rest) if !rest.starts_with('_') => native(rest.to_string()),
@@ -76,22 +79,46 @@ pub(crate) fn present_macho_symbol(raw: &str) -> Presented {
 ///
 /// Demangled Rust mangling wins. On Windows, dbghelp can hand back an
 /// already-undecorated Rust path (`crate::function`) with no mangled form
-/// left to recognize. Those names are labeled Rust when the file they came
-/// from is a Rust image. A C symbol in that image (`main`) has no `::` and
-/// stays native. C++ images are not Rust images, so their `::` names stay
-/// native.
-pub(crate) fn frame_runtime(symbol: Runtime, name: &str, image_is_rust: bool) -> Runtime {
-    if symbol == Runtime::Rust || (image_is_rust && name.contains("::")) {
-        Runtime::Rust
-    } else {
-        Runtime::Native
+/// left to recognize. That path is labeled Rust when the file is a Rust
+/// image. Itanium C++ demangles to `ns::fn()` and is marked `from_cpp`, so
+/// it stays native inside that image. An MSVC `?` name is also `from_cpp`.
+/// A C symbol (`main`) has no `::` and stays native.
+pub(crate) fn frame_runtime(
+    symbol: Runtime,
+    name: &str,
+    from_cpp: bool,
+    image_is_rust: bool,
+) -> Runtime {
+    if symbol == Runtime::Rust {
+        return Runtime::Rust;
     }
+    if from_cpp || !image_is_rust || !undecorated_rust_path(name) {
+        return Runtime::Native;
+    }
+    Runtime::Rust
+}
+
+/// `crate::item` as dbghelp stores it after dropping Rust mangling.
+///
+/// Itanium demangling keeps a parameter list (`ns::fn()`). A signature,
+/// template argument, or space is not this fallback.
+fn undecorated_rust_path(name: &str) -> bool {
+    let mut parts = name.split("::");
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if first.is_empty() || parts.next().is_none() {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
 }
 
 fn rust(name: String) -> Presented {
     Presented {
         name,
         runtime: Runtime::Rust,
+        from_cpp: false,
     }
 }
 
@@ -99,6 +126,15 @@ fn native(name: String) -> Presented {
     Presented {
         name,
         runtime: Runtime::Native,
+        from_cpp: false,
+    }
+}
+
+fn cpp(name: String) -> Presented {
+    Presented {
+        name,
+        runtime: Runtime::Native,
+        from_cpp: true,
     }
 }
 
@@ -188,25 +224,59 @@ mod tests {
             frame_runtime(
                 Runtime::Native,
                 "anyprof_rust_fixture::anyprof_rust_spin",
+                false,
                 true
             ),
             Runtime::Rust
         );
         assert_eq!(
-            frame_runtime(Runtime::Native, "main", true),
+            frame_runtime(Runtime::Native, "main", false, true),
             Runtime::Native
         );
         assert_eq!(
-            frame_runtime(Runtime::Native, "anyprof_native::spin", false),
+            frame_runtime(Runtime::Native, "anyprof_native::spin", false, false),
             Runtime::Native
         );
         assert_eq!(
             frame_runtime(
                 Runtime::Rust,
                 "anyprof_rust_fixture::anyprof_rust_spin",
+                false,
                 false
             ),
             Runtime::Rust
+        );
+    }
+
+    #[test]
+    fn cpp_inside_a_rust_image_stays_native() {
+        let itanium = present_elf_symbol("_ZN2ns2fnEv");
+        assert!(itanium.from_cpp, "{}", itanium.name);
+        assert!(
+            itanium.name.contains('('),
+            "Itanium demangling keeps a parameter list: {}",
+            itanium.name
+        );
+        assert_eq!(itanium.runtime, Runtime::Native);
+        assert_eq!(
+            frame_runtime(itanium.runtime, &itanium.name, false, true),
+            Runtime::Native,
+            "the parentheses alone keep a C++ demangle native"
+        );
+        assert_eq!(
+            frame_runtime(itanium.runtime, &itanium.name, itanium.from_cpp, true),
+            Runtime::Native
+        );
+        let macho = present_macho_symbol("__ZN2ns2fnEv");
+        assert!(macho.from_cpp, "{}", macho.name);
+        assert_eq!(
+            frame_runtime(macho.runtime, &macho.name, macho.from_cpp, true),
+            Runtime::Native
+        );
+        // dbghelp undecorates MSVC `?` names to `ns::fn` with no parameter list.
+        assert_eq!(
+            frame_runtime(Runtime::Native, "anyprof_native::spin", true, true),
+            Runtime::Native
         );
     }
 }

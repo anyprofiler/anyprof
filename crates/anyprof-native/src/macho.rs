@@ -365,7 +365,7 @@ fn read_symbols<R: Read + Seek>(
         let Some(raw_name) = cstr_at(&strings, n_strx) else {
             continue;
         };
-        let Presented { name, runtime } = symbol::present_macho_symbol(raw_name);
+        let Presented { name, runtime, .. } = symbol::present_macho_symbol(raw_name);
         symbols.push((n_value, name, runtime));
     }
     Some(symbols)
