@@ -728,8 +728,9 @@ fn assemble_addresses(
     {
         // The perf sample is historical. The frame chain is the thread's
         // current Python stack, read when the sample is consumed. A tight
-        // loop is still on that function. A leaf outside the interpreter
-        // image keeps the native walk below.
+        // loop is still on that function. `None` covers a leaf outside the
+        // interpreter image and a leaf inside it whose chain cannot be
+        // read. Both keep the native walk below, unlabeled as Python.
         return Some(CountedStack::Python { kernel, frames });
     }
     let fp = sample.user_fp.unwrap_or(0);

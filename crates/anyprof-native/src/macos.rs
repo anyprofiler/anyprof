@@ -513,6 +513,8 @@ fn unwind_thread(
     let frames = if kr == KERN_SUCCESS {
         let (pc, sp, fp, lr) = registers(&state);
         let tid = thread_identifier(thread).unwrap_or(0);
+        // `frames` is `None` for a leaf outside the interpreter and for a
+        // leaf inside it whose chain cannot be read. Both keep the native walk.
         if let Some(vm) = python
             && let Some(py_frames) = vm.frames(tid, pc, &mut |addr, buf| read_task(task, addr, buf))
         {

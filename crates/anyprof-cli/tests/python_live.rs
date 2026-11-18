@@ -95,8 +95,8 @@ path = sys.argv[1]
 def caller():
     with open(path, "wb") as handle:
         handle.write((1).to_bytes(8, "little"))
-    spin()
-def spin():
+    spin_é()
+def spin_é():
     x = 0
     while True:
         x = x + 1
@@ -194,7 +194,7 @@ caller()
     );
     let folded = std::fs::read_to_string(&collapsed).unwrap();
     assert!(
-        folded.contains("[python] spin") && folded.contains("[python] caller"),
+        folded.contains("[python] spin_é") && folded.contains("[python] caller"),
         "collapsed stacks:\n{folded}"
     );
     let _ = std::fs::remove_dir_all(&dir);
