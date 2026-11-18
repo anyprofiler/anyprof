@@ -101,17 +101,42 @@ pub(crate) fn frame_runtime(
 /// `crate::item` as dbghelp stores it after dropping Rust mangling.
 ///
 /// Itanium demangling keeps a parameter list (`ns::fn()`). A signature,
-/// template argument, or space is not this fallback.
+/// template argument, or space is not this fallback: `foo::<T>` and
+/// `<T as Trait>` stay native so a C++ template in the same image is not
+/// relabeled. A mangled closure or generic still goes through
+/// `rustc-demangle` and is labeled Rust before this check. rustc's
+/// already-printed `{closure#0}` and `{impl#0}` segments are Rust-only, so
+/// those are accepted here.
 fn undecorated_rust_path(name: &str) -> bool {
     let mut parts = name.split("::");
     let Some(first) = parts.next() else {
         return false;
     };
-    if first.is_empty() || parts.next().is_none() {
+    if !rust_ident(first) || parts.next().is_none() {
         return false;
     }
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    name.split("::").all(rust_path_component)
+}
+
+fn rust_ident(part: &str) -> bool {
+    !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// An identifier, or a rustc path segment such as `{closure#0}` / `{impl#1}`.
+fn rust_path_component(part: &str) -> bool {
+    if rust_ident(part) {
+        return true;
+    }
+    let Some(inner) = part
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let Some((kind, index)) = inner.split_once('#') else {
+        return false;
+    };
+    rust_ident(kind) && !index.is_empty() && index.chars().all(|c| c.is_ascii_digit())
 }
 
 fn rust(name: String) -> Presented {
@@ -278,5 +303,43 @@ mod tests {
             frame_runtime(Runtime::Native, "anyprof_native::spin", true, true),
             Runtime::Native
         );
+    }
+
+    #[test]
+    fn closure_segments_are_rust_and_generics_are_not_this_fallback() {
+        assert_eq!(
+            frame_runtime(
+                Runtime::Native,
+                "anyprof_rust_fixture::spin::{closure#0}",
+                false,
+                true
+            ),
+            Runtime::Rust
+        );
+        assert_eq!(
+            frame_runtime(
+                Runtime::Native,
+                "anyprof_rust_fixture::{impl#1}::call",
+                false,
+                true
+            ),
+            Runtime::Rust
+        );
+        assert_eq!(
+            frame_runtime(Runtime::Native, "foo::bar::<i32>", false, true),
+            Runtime::Native
+        );
+        assert_eq!(
+            frame_runtime(
+                Runtime::Native,
+                "<core::slice::Iter as Iterator>::next",
+                false,
+                true
+            ),
+            Runtime::Native
+        );
+        let mangled = present_elf_symbol("_RNCNCNgCs6DXkGYLi8lr_2cc5spawn00B5_");
+        assert_eq!(mangled.runtime, Runtime::Rust);
+        assert!(mangled.name.contains("{closure#0}"), "{}", mangled.name);
     }
 }
