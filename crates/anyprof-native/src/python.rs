@@ -10,8 +10,13 @@
 //! executable or `libpython` that exports `_PyRuntime`). C helpers in that
 //! image, such as allocation the eval loop calls, stay attributed to the
 //! Python function. A leaf in another image (libc, a ctypes extension)
-//! keeps the native walk. A thread blocked in `time.sleep` is off CPU and
-//! is not recorded. Only the thread that holds the GIL runs bytecode, so
+//! keeps the native walk. A leaf inside the image does too when this read
+//! returns no chain: the thread id is missing, a pointer is not plausible,
+//! or a read is short. Those frames stay native and are not labeled Python.
+//! A denied `process_vm_readv` does not reach that path. `prepare_python`
+//! fails `start` before a profile exists. A thread blocked in `time.sleep`
+//! is off CPU and is not recorded. Only the thread that holds the GIL runs
+//! bytecode, so
 //! two pure-Python threads show up as the GIL switches. Parked threads are
 //! not walked.
 //!
@@ -109,8 +114,11 @@ pub(crate) struct PythonVm {
 impl PythonVm {
     /// Python frames for `tid` when `pc` is inside the interpreter image.
     ///
-    /// `read` copies remote bytes. A bad pointer returns `None` and the
-    /// caller keeps the native stack. This does not panic.
+    /// `read` copies remote bytes. `None` means the leaf is outside the
+    /// image, or it is inside and the chain cannot be read (missing thread
+    /// id, a pointer that is not plausible, or a short read). The caller
+    /// keeps the native stack either way. This does not panic and does not
+    /// invent a Python name.
     pub(crate) fn frames(
         &self,
         tid: u64,

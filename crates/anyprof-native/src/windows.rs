@@ -520,6 +520,8 @@ fn walk_suspended(
     if ok == FALSE {
         return None;
     }
+    // `frames` is `None` for a leaf outside the interpreter and for a
+    // leaf inside it whose chain cannot be read. Both keep the native walk.
     if let Some(vm) = python
         && let Some(frames) = vm.frames(u64::from(tid), aligned.context.Rip, &mut |addr, buf| {
             read_process(process, addr, buf)

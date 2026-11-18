@@ -3,10 +3,13 @@
 //! There is no second on-CPU event source. A CPython process is profiled by
 //! the native backend (Mach on macOS, `StackWalk64` on Windows x64,
 //! `perf_event_open` on Linux x86_64). When the leaf program counter is
-//! inside the CPython image, that sampler replaces the user stack with the
-//! interpreter frame chain. Those frames are
+//! inside the CPython image and the frame chain can be read, that sampler
+//! replaces the user stack with the chain. Those frames are
 //! [`anyprof_core::Runtime::Python`]. A leaf in another image, such as libc
 //! or a C extension, keeps the native walk, so that time is not relabeled.
+//! A leaf inside the image whose chain cannot be read keeps the native walk
+//! too. Those frames are not labeled Python. A denied `process_vm_readv`
+//! does not: `start` returns an error and no profile is written.
 //!
 //! Only a thread actually on CPU is recorded. A thread blocked in
 //! `time.sleep` is not a Python sample. The GIL means one thread runs

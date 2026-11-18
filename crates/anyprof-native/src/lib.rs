@@ -18,9 +18,10 @@
 //! that is not a Go function still uses the frame-pointer or `StackWalk64` walk.
 //!
 //! Python sampling reuses the same on-CPU events. When the leaf is inside
-//! the CPython image, the user stack is the interpreter frame chain and the
-//! frames are [`anyprof_core::Runtime::Python`]. A leaf in another image
-//! keeps the native walk.
+//! the CPython image and the frame chain can be read, the user stack is that
+//! chain and the frames are [`anyprof_core::Runtime::Python`]. A leaf in
+//! another image keeps the native walk. A leaf inside the image whose chain
+//! cannot be read keeps it too, and those frames are not labeled Python.
 //!
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.

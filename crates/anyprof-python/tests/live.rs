@@ -23,14 +23,18 @@ mod supported {
     use anyprof_core::{Backend, Format, Runtime};
     use anyprof_python::PythonBackend;
 
+    /// `spin_é` is a Latin-1 name, so CPython stores it as a compact
+    /// non-ASCII string. The ASCII data offset would not decode it.
+    const SPIN_NAME: &str = "spin_é";
+
     const BUSY: &str = r#"
 import sys
 path = sys.argv[1]
 def caller():
     with open(path, "wb") as handle:
         handle.write((1).to_bytes(8, "little"))
-    spin()
-def spin():
+    spin_é()
+def spin_é():
     x = 0
     while True:
         x = x + 1
@@ -111,7 +115,7 @@ while True:
     /// `process_vm_readv` then follows `kernel.yama.ptrace_scope`: scope 1
     /// refuses the read, and the python backend must say so instead of
     /// recording native eval-loop frames. Scope 0 (or root) allows the read,
-    /// and the profile has to contain `[python] spin` and `[python] caller`.
+    /// and the profile has to contain `[python] spin_é` and `[python] caller`.
     #[cfg(target_os = "linux")]
     #[test]
     fn unrelated_same_user_read_follows_ptrace_scope() {
@@ -432,7 +436,12 @@ os.execv(sys.executable, [sys.executable, script, counter])
         python: &Path,
     ) {
         let total = profile.total_weight();
-        let spin_weight = weight_named(profile, "spin");
+        let spin_weight = weight_named(profile, SPIN_NAME);
+        let increment = source_line(BUSY, "x = x + 1");
+        let jump = source_line(BUSY, "while True");
+        let call = source_line(BUSY, "    spin_é()");
+        let mut saw_increment = false;
+        let mut saw_call = false;
         assert!(
             (20..=1_000).contains(&total),
             "expected on the order of 100 samples at 100 Hz for 1s, got {total} ({})\n{}",
@@ -449,26 +458,52 @@ os.execv(sys.executable, [sys.executable, script, counter])
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("spin.py");
+        for stack in &profile.stacks {
+            let spins: Vec<_> = stack
+                .frames
+                .iter()
+                .filter(|frame| frame.name == SPIN_NAME)
+                .collect();
+            if spins.is_empty() {
+                continue;
+            }
+            for frame in &spins {
+                assert_eq!(frame.runtime, Runtime::Python, "{}", explain(profile));
+                let line = frame.line.unwrap_or(0);
+                assert!(
+                    line == increment || line == jump,
+                    "{SPIN_NAME} line {line} is not {increment} (`x = x + 1`) or {jump} (`while True`) ({})\n{}",
+                    python.display(),
+                    explain(profile)
+                );
+                assert!(
+                    frame
+                        .file
+                        .as_deref()
+                        .is_some_and(|file| file.ends_with(script_name)),
+                    "file {:?} should end with {script_name}\n{}",
+                    frame.file,
+                    explain(profile)
+                );
+                if line == increment {
+                    saw_increment = true;
+                }
+            }
+            assert!(
+                stack.frames.iter().any(|frame| {
+                    frame.runtime == Runtime::Python
+                        && frame.name == "caller"
+                        && frame.line == Some(call)
+                }),
+                "a {SPIN_NAME} stack should include caller on source line {call} ({})\n{}",
+                python.display(),
+                explain(profile)
+            );
+            saw_call = true;
+        }
         assert!(
-            profile.stacks.iter().any(|stack| {
-                let names: Vec<_> = stack
-                    .frames
-                    .iter()
-                    .map(|frame| frame.name.as_str())
-                    .collect();
-                names.iter().any(|name| name.contains("spin"))
-                    && names.iter().any(|name| name.contains("caller"))
-                    && stack.frames.iter().any(|frame| {
-                        frame.runtime == Runtime::Python
-                            && frame.name.contains("spin")
-                            && frame.line.is_some_and(|line| line > 0)
-                            && frame
-                                .file
-                                .as_deref()
-                                .is_some_and(|file| file.ends_with(script_name))
-                    })
-            }),
-            "expected a Python stack with spin and caller in {script_name} ({})\n{}",
+            saw_increment && saw_call,
+            "{SPIN_NAME} should be sampled on source line {increment} with caller on {call} ({})\n{}",
             python.display(),
             explain(profile)
         );
@@ -496,9 +531,12 @@ os.execv(sys.executable, [sys.executable, script, counter])
         assert!(
             rendered.stacks.iter().any(|stack| {
                 stack.frames.iter().any(|frame| {
-                    frame.name.contains("spin")
+                    frame.name == SPIN_NAME
                         && frame.runtime == Runtime::Python
-                        && frame.line.is_some()
+                        && frame.line.is_some_and(|line| {
+                            line == source_line(BUSY, "x = x + 1")
+                                || line == source_line(BUSY, "while True")
+                        })
                         && frame
                             .file
                             .as_deref()
@@ -510,9 +548,20 @@ os.execv(sys.executable, [sys.executable, script, counter])
         let collapsed = anyprof_export::export(profile, Format::Collapsed).unwrap();
         let text = String::from_utf8(collapsed).unwrap();
         assert!(
-            text.contains("[python] spin") && text.contains("[python] caller"),
+            text.contains(&format!("[python] {SPIN_NAME}")) && text.contains("[python] caller"),
             "{text}"
         );
+    }
+
+    fn source_line(source: &str, needle: &str) -> u32 {
+        u32::try_from(
+            source
+                .lines()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("fixture has no {needle:?}")),
+        )
+        .expect("line number")
+            + 1
     }
 
     fn weight_named(profile: &anyprof_core::Profile, needle: &str) -> u64 {
@@ -540,7 +589,15 @@ os.execv(sys.executable, [sys.executable, script, counter])
                     if frame.name.is_empty() {
                         format!("0x{:x}", frame.address.unwrap_or(0))
                     } else {
-                        format!("{}:{}", frame.runtime, frame.name)
+                        format!(
+                            "{}:{}{}",
+                            frame.runtime,
+                            frame.name,
+                            frame
+                                .line
+                                .map(|line| format!(":{line}"))
+                                .unwrap_or_default()
+                        )
                     }
                 })
                 .collect::<Vec<_>>()
