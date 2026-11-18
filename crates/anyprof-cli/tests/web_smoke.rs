@@ -373,6 +373,9 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
             "{name}: clearing search did not restore the tree"
         );
     }
+    if kind == "studio" {
+        assert_studio_chart(cdp, session, &name);
+    }
     let shot = cdp.call(
         session,
         "Page.captureScreenshot",
@@ -488,6 +491,57 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
         )
         .unwrap();
     }
+    if kind == "studio" {
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=tab-flame]').click()",
+                "returnByValue": true,
+            }),
+        );
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "document.documentElement.dataset.theme === 'dark' && !!document.querySelector('[data-testid=flame]')"
+            ),
+            "{name}: dark flame graph did not render"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let dark_flame = canvas_colored_ratio(cdp, session);
+        assert!(
+            dark_flame >= 0.08,
+            "{name}: dark flame graph was almost empty ({:.1}% colored pixels)",
+            dark_flame * 100.0
+        );
+        let shot = cdp.call(
+            session,
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+        );
+        std::fs::write(
+            keep.join(format!("{name}.dark-flame.png")),
+            base64_decode(shot["data"].as_str().unwrap()),
+        )
+        .unwrap();
+        let (before, after) = drag_inspector(cdp, session);
+        assert!(
+            after >= before + 40.0,
+            "{name}: dragging the detail splitter left the inspector at {after}px from {before}px"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        let shot = cdp.call(
+            session,
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+        );
+        std::fs::write(
+            keep.join(format!("{name}.splitter.png")),
+            base64_decode(shot["data"].as_str().unwrap()),
+        )
+        .unwrap();
+    }
 
     let stderr = viewer.stderr();
     assert!(
@@ -499,6 +553,176 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
         "{name}: rendered ({:.1}% of the flame graph area colored)",
         colored * 100.0
     );
+}
+
+fn assert_studio_chart(cdp: &mut Cdp, session: Option<&str>, name: &str) {
+    let expression = r#"(function () {
+  const button = document.querySelector('[data-testid=timeline-help]');
+  button.click();
+  const panel = document.querySelector('[data-testid=timeline-help-panel]');
+  const text = panel.innerText || '';
+  const box = panel.getBoundingClientRect();
+  const help = {
+    open: !panel.hidden && box.height > 36 && panel.scrollWidth <= panel.clientWidth + 2,
+    weight: text.indexOf('sample weight') >= 0,
+    cpu: text.indexOf('not a CPU percent') >= 0,
+    tracks: text.indexOf('not thread ids recovered') >= 0
+  };
+  button.click();
+  help.closed = !!panel.hidden;
+  const head = document.querySelector('.timeline-head');
+  const title = head.querySelector('strong');
+  const hint = head.querySelector('.hint');
+  const range = document.getElementById('range-label');
+  function oneLine(node) {
+    return !!node && node.scrollWidth <= node.clientWidth + 1 && node.scrollHeight <= 22;
+  }
+  const ticks = Array.from(document.querySelectorAll('.ruler span')).map(function (node) {
+    return node.textContent.trim();
+  });
+  const units = {};
+  ticks.forEach(function (tick) {
+    const parts = tick.split(' ');
+    units[parts[parts.length - 1]] = true;
+  });
+  const unitNames = Object.keys(units);
+  const numbers = ticks.map(function (tick) { return tick.split(' ')[0]; }).join(',');
+  const row = document.querySelector('.row[aria-selected="true"]');
+  const nums = row ? Array.from(row.querySelectorAll('.num')).map(function (node) { return node.textContent; }) : [];
+  const canvas = document.querySelector('#timeline');
+  let gap = { ok: false, gap: 0, marks: 0 };
+  if (canvas && canvas.width) {
+    const ratio = window.devicePixelRatio || 1;
+    const gutter = Math.floor(128 * ratio);
+    const trackH = Math.floor(26 * ratio);
+    const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+    const width = canvas.width;
+    function isMark(x, y) {
+      const i = (y * width + x) * 4;
+      const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+      return a > 40 && b > r + 15 && b > g;
+    }
+    let best = null;
+    for (let y = 1; y < trackH - 1; y++) {
+      let marks = 0, gaps = 0;
+      for (let x = gutter; x < width; x++) {
+        if (isMark(x, y)) marks++;
+        else gaps++;
+      }
+      if (!best || marks > best.marks) best = { marks: marks, gaps: gaps };
+    }
+    if (best && best.marks >= 8) {
+      const share = best.gaps / (best.marks + best.gaps);
+      gap = { ok: share >= 0.35, gap: share, marks: best.marks };
+    }
+  }
+  return {
+    help: help,
+    title: oneLine(title),
+    hint: oneLine(hint) && hint.textContent.indexOf('Not CPU utilization') === 0,
+    range: oneLine(range),
+    ruler: unitNames.length === 1 && unitNames[0] === 'ms' && numbers === '0,500,1000,1500,2000',
+    ticks: ticks,
+    zero: nums.indexOf('0') >= 0 && document.body.innerText.indexOf('0 ns') < 0,
+    scope: (document.querySelector('[data-testid=heaviest-scope]') || {}).textContent || '',
+    first: (document.querySelector('#heaviest li') || {}).textContent || '',
+    gap: gap
+  };
+})()"#;
+    let report = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({ "expression": expression, "returnByValue": true }),
+    );
+    let value = report
+        .pointer("/result/value")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        value["help"]["open"].as_bool() == Some(true)
+            && value["help"]["closed"].as_bool() == Some(true)
+            && value["help"]["weight"].as_bool() == Some(true)
+            && value["help"]["cpu"].as_bool() == Some(true)
+            && value["help"]["tracks"].as_bool() == Some(true),
+        "{name}: timeline details were clipped or incomplete: {value}"
+    );
+    assert!(
+        value["title"].as_bool() == Some(true)
+            && value["hint"].as_bool() == Some(true)
+            && value["range"].as_bool() == Some(true),
+        "{name}: timeline header clipped: {value}"
+    );
+    assert!(
+        value["ruler"].as_bool() == Some(true),
+        "{name}: ruler was not one millisecond scale: {value}"
+    );
+    assert!(
+        value["zero"].as_bool() == Some(true),
+        "{name}: a zero weight was not plain 0: {value}"
+    );
+    assert!(
+        value["scope"].as_str() == Some("Through the selected function")
+            && value["first"].as_str() == Some("main"),
+        "{name}: heaviest path was not the selected function: {value}"
+    );
+    assert!(
+        value["gap"]["ok"].as_bool() == Some(true),
+        "{name}: sample marks formed a solid band: {value}"
+    );
+}
+
+/// Drag the detail splitter toward the call tree and return the inspector
+/// width before and after.
+fn drag_inspector(cdp: &mut Cdp, session: Option<&str>) -> (f64, f64) {
+    let point = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "(function(){ const splitter = document.querySelector('#split-inspector'); const inspector = document.querySelector('.inspector'); const rect = splitter.getBoundingClientRect(); return {x: rect.left + rect.width / 2, y: rect.top + 80, before: inspector.getBoundingClientRect().width}; })()",
+            "returnByValue": true,
+        }),
+    );
+    let value = point
+        .pointer("/result/value")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let x = value["x"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("splitter rect: {point}"));
+    let y = value["y"].as_f64().unwrap();
+    let before = value["before"].as_f64().unwrap();
+    let next = x - 90.0;
+    for (kind, px) in [
+        ("mousePressed", x),
+        ("mouseMoved", next),
+        ("mouseReleased", next),
+    ] {
+        cdp.call(
+            session,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": kind,
+                "x": px,
+                "y": y,
+                "button": "left",
+                "buttons": if kind == "mouseReleased" { 0 } else { 1 },
+                "clickCount": 1,
+            }),
+        );
+    }
+    let after = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.querySelector('.inspector').getBoundingClientRect().width",
+            "returnByValue": true,
+        }),
+    );
+    let width = after
+        .pointer("/result/value")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    (before, width)
 }
 
 /// Drag across the right side of the sample chart, where the fixture's last

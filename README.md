@@ -248,6 +248,8 @@ The timeline is drawn only when the file is a time series:
 
 A stack deeper than 8,192 frames is refused, with the limit in the error. The page walks the call tree and the flame graph without recursion. The flame graph draws the first 40 levels and says when the tree is deeper; the call tree still lists every kept frame, and the weights are the weights from the file.
 
+On a time series the ruler uses one unit for the visible range, a zero weight is shown as `0`, and the marks stay separated. The chart says it is not CPU utilization. Details holds the longer note, including when the tracks are profiles from the file rather than thread ids. The side pane lists the heaviest path through the selected function and labels that scope.
+
 Native, Rust, Go, Python, and Java recordings fold each distinct stack into one weight before the file is written. The samplers see a thread id (and, on Linux, a perf timestamp) while they are sampling, and `Profile` does not keep either. A timeline for those recordings would mean keeping the sample series in the profile and in the exporters. That is not part of this viewer, and neither is a system-wide capture mode. Sample order, a weight copied into `timeDeltas`, and `period * count / wall` are not used as a clock, a thread list, or a CPU curve. CPU time is shown as text only when a pprof profile has a real `cpu` column and a wall duration. anyprof's own pprof files are `samples/count` plus a wall duration and a sampling period, so they do not show CPU time.
 
 | Flag | Meaning |

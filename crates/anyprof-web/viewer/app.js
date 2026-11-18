@@ -62,6 +62,39 @@ function formatNs(ns) {
   return sign + Math.round(abs) + " ns";
 }
 
+// One unit for the whole visible range, chosen so a tick step is at least 1
+// of that unit. A 0–2 s range is 0/500/1000/1500/2000 ms, not a mix of ns and s.
+function timeScale(start, end) {
+  const span = Math.max(1, Number(end) - Number(start));
+  const step = span / 4;
+  const units = [
+    { size: 1e9, suffix: "s" },
+    { size: 1e6, suffix: "ms" },
+    { size: 1e3, suffix: "µs" },
+    { size: 1, suffix: "ns" },
+  ];
+  for (const unit of units) {
+    if (step >= unit.size) return unit;
+  }
+  return units[units.length - 1];
+}
+
+function formatTick(ns, unit) {
+  const scaled = Number(ns) / unit.size;
+  const rounded = Math.round(scaled * 1000) / 1000;
+  let text;
+  if (Math.abs(rounded - Math.round(rounded)) < 1e-6) text = String(Math.round(rounded));
+  else if (Math.abs(rounded * 10 - Math.round(rounded * 10)) < 1e-4) text = rounded.toFixed(1);
+  else text = rounded.toFixed(2);
+  if (text === "-0") text = "0";
+  return text + " " + unit.suffix;
+}
+
+function formatRange(start, end) {
+  const unit = timeScale(start, end);
+  return formatTick(start, unit) + " – " + formatTick(end, unit);
+}
+
 function formatCount(value) {
   return Number(value).toLocaleString("en-US");
 }
@@ -77,6 +110,7 @@ function formatBytes(value) {
 function formatWeight(value) {
   const kind = state.session ? state.session.weightKind : "count";
   if (kind === "sampled-time" || kind === "cpu-time" || kind === "duration") {
+    if (!Number(value)) return "0";
     return formatNs(value);
   }
   if (kind === "bytes") return formatBytes(value);
@@ -234,17 +268,21 @@ function renderOverview() {
   wrap.dataset.testid = "timeline-status";
   const head = el("div", "timeline-head");
   head.append(el("strong", null, "Sample activity"));
-  const hint = el("span", "hint");
   const kinds = new Set(session.threads.map((thread) => thread.kind));
-  const sentences = ["Each mark is sample weight in that bucket, not CPU utilization."];
-  if (kinds.size === 1 && kinds.has("profile")) {
-    sentences.unshift("Thread ids were not recorded.");
-  }
-  if (session.notes && session.notes.length) sentences.push(session.notes.join(" "));
-  hint.textContent = sentences.join(" ");
+  const profileTracks = kinds.size === 1 && kinds.has("profile");
+  const hint = el("span", "hint");
+  hint.textContent = profileTracks
+    ? "Not CPU utilization. Profiles, not thread ids."
+    : "Not CPU utilization.";
   head.append(hint);
-  head.append(el("span", "hint", ""));
-  const range = el("span", "hint");
+  const help = el("button", "mini", "Details");
+  help.type = "button";
+  help.id = "timeline-help";
+  help.dataset.testid = "timeline-help";
+  help.setAttribute("aria-expanded", "false");
+  help.setAttribute("aria-controls", "timeline-help-panel");
+  head.append(help);
+  const range = el("span", "range");
   range.id = "range-label";
   head.append(range);
   const zoom = el("button", "mini", "Zoom");
@@ -273,6 +311,23 @@ function renderOverview() {
   head.append(zoom);
   head.append(reset);
   wrap.append(head);
+  const panel = el("div", "help-panel");
+  panel.id = "timeline-help-panel";
+  panel.dataset.testid = "timeline-help-panel";
+  panel.hidden = true;
+  const paragraphs = [
+    "Each mark is sample weight in a time bucket. Spacing and darkness follow that weight. This is not a CPU percent.",
+  ];
+  if (profileTracks) paragraphs.push("Thread ids were not recorded.");
+  if (session.notes) {
+    for (const note of session.notes) paragraphs.push(note);
+  }
+  for (const text of paragraphs) panel.append(el("p", null, text));
+  help.addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+    help.setAttribute("aria-expanded", panel.hidden ? "false" : "true");
+  });
+  wrap.append(panel);
   const ruler = el("div", "ruler");
   ruler.id = "ruler";
   wrap.append(ruler);
@@ -296,20 +351,22 @@ function renderTrackFilter() {
       : "Tracks";
   host.append(el("span", "muted", caption));
   if (!state.tracks) state.tracks = new Set(threads.map((thread) => thread.id));
+  const group = el("div", "segment");
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", caption);
   for (const thread of threads) {
-    const label = el("label");
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = state.tracks.has(thread.id);
-    box.addEventListener("change", () => {
-      if (box.checked) state.tracks.add(thread.id);
-      else state.tracks.delete(thread.id);
+    const button = el("button", null, thread.name);
+    button.type = "button";
+    button.setAttribute("aria-pressed", state.tracks.has(thread.id) ? "true" : "false");
+    button.addEventListener("click", () => {
+      if (state.tracks.has(thread.id)) state.tracks.delete(thread.id);
+      else state.tracks.add(thread.id);
+      button.setAttribute("aria-pressed", state.tracks.has(thread.id) ? "true" : "false");
       refreshTree();
     });
-    label.append(box);
-    label.append(thread.name);
-    host.append(label);
+    group.append(button);
   }
+  host.append(group);
 }
 
 function currentBounds() {
@@ -321,7 +378,8 @@ async function refreshTimeline() {
   if (!state.session.timeline) return;
   const view = state.view;
   const width = Math.max(1, ($("timeline-rows") || document.body).clientWidth || 600);
-  const buckets = Math.max(20, Math.min(400, Math.floor(width / 3)));
+  const plot = Math.max(1, width - GUTTER);
+  const buckets = Math.max(16, Math.min(140, Math.floor(plot / 8)));
   const params = new URLSearchParams();
   params.set("start", String(view.start));
   params.set("end", String(view.end));
@@ -343,7 +401,7 @@ async function refreshTimeline() {
   const label = $("range-label");
   if (label) {
     const shown = state.selection || view;
-    label.textContent = formatNs(shown.start) + " – " + formatNs(shown.end);
+    label.textContent = formatRange(shown.start, shown.end);
   }
 }
 
@@ -398,19 +456,28 @@ function drawTimeline() {
     ctx.clip();
     ctx.fillText(thread.name, 8, y + 17);
     ctx.restore();
+  });
+  paintSelection(ctx, data, gutter, plotWidth, height, span, false);
+  threads.forEach((_, index) => {
+    const y = index * TRACK;
     const row = rows[index] || [];
     const bucketWidth = plotWidth / Math.max(1, row.length);
+    // A mark stays narrower than its slot, so a full series stays a comb.
+    const markWidth = Math.min(2, Math.max(1, bucketWidth * 0.28));
     row.forEach((value, bucket) => {
       if (!value) return;
-      const bar = Math.max(2, (8 * Number(value)) / max);
-      const markWidth = Math.max(1, Math.min(1.5, bucketWidth * 0.45));
+      const ratio = Math.max(0, Math.min(1, Number(value) / max));
+      const bar = 3 + 7 * ratio;
+      ctx.save();
+      ctx.globalAlpha = 0.42 + 0.58 * ratio;
       ctx.fillStyle = mark;
       ctx.fillRect(
         gutter + bucket * bucketWidth + (bucketWidth - markWidth) / 2,
-        y + TRACK - 5 - bar,
+        y + TRACK - 4 - bar,
         markWidth,
         bar
       );
+      ctx.restore();
     });
     ctx.strokeStyle = line;
     ctx.beginPath();
@@ -423,22 +490,35 @@ function drawTimeline() {
   ctx.moveTo(gutter - 0.5, 0);
   ctx.lineTo(gutter - 0.5, height);
   ctx.stroke();
-  if (state.selection && span > 0) {
-    const x0 = gutter + ((state.selection.start - data.start) / span) * plotWidth;
-    const x1 = gutter + ((state.selection.end - data.start) / span) * plotWidth;
-    const left = Math.min(x0, x1);
-    const wide = Math.max(1, Math.abs(x1 - x0));
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(gutter, 0, plotWidth, height);
-    ctx.clip();
-    ctx.fillStyle = "rgba(10, 95, 212, 0.22)";
-    ctx.fillRect(left, 0, wide, height);
-    ctx.strokeStyle = "rgba(10, 95, 212, 0.9)";
-    ctx.strokeRect(left + 0.5, 0.5, wide - 1, height - 1);
-    ctx.restore();
-  }
+  paintSelection(ctx, data, gutter, plotWidth, height, span, true);
   paintRuler(data, gutter, plotWidth);
+}
+
+function paintSelection(ctx, data, gutter, plotWidth, height, span, edges) {
+  if (!state.selection || span <= 0) return;
+  const x0 = gutter + ((state.selection.start - data.start) / span) * plotWidth;
+  const x1 = gutter + ((state.selection.end - data.start) / span) * plotWidth;
+  const left = Math.max(gutter, Math.min(x0, x1));
+  const right = Math.min(gutter + plotWidth, Math.max(x0, x1));
+  const wide = Math.max(1, right - left);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(gutter, 0, plotWidth, height);
+  ctx.clip();
+  if (!edges) {
+    ctx.fillStyle = "rgba(10, 95, 212, 0.08)";
+    ctx.fillRect(left, 0, wide, height);
+  } else {
+    ctx.strokeStyle = "rgba(10, 95, 212, 0.9)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left + 0.5, 0);
+    ctx.lineTo(left + 0.5, height);
+    ctx.moveTo(Math.max(left + 1, right) - 0.5, 0);
+    ctx.lineTo(Math.max(left + 1, right) - 0.5, height);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function paintRuler(data, gutter, width) {
@@ -450,8 +530,9 @@ function paintRuler(data, gutter, width) {
   const end = Number(data.end);
   const span = Math.max(1, end - start);
   const ticks = 4;
+  const unit = timeScale(start, end);
   for (let index = 0; index <= ticks; index += 1) {
-    const tick = el("span", null, formatNs(start + (span * index) / ticks));
+    const tick = el("span", null, formatTick(start + (span * index) / ticks, unit));
     tick.style.left = (width * index) / ticks + "px";
     if (index === 0) tick.style.transform = "translateX(0)";
     else if (index === ticks) tick.style.transform = "translateX(-100%)";
@@ -516,7 +597,7 @@ function updateRangeControls() {
   if (reset) reset.hidden = !(zoomed || state.selection);
   if (label) {
     const shown = state.selection || state.view;
-    label.textContent = formatNs(shown.start) + " – " + formatNs(shown.end);
+    label.textContent = formatRange(shown.start, shown.end);
   }
 }
 
@@ -995,10 +1076,53 @@ function hash(text) {
   return value;
 }
 
+function pathThroughSelection() {
+  if (state.selectedNode == null || !state.tree) return null;
+  const byId = new Map(state.tree.nodes.map((node) => [node.id, node]));
+  const selected = byId.get(state.selectedNode);
+  if (!selected) return null;
+  const seen = new Set();
+  const up = [];
+  let cursor = selected;
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id);
+    up.push(cursor);
+    if (cursor.parent == null) break;
+    cursor = byId.get(cursor.parent);
+  }
+  up.reverse();
+  const down = [];
+  cursor = selected;
+  while (cursor) {
+    const kids = (state.byParent.get(cursor.id) || []).slice();
+    if (!kids.length) break;
+    kids.sort((left, right) => Number(right.weight) - Number(left.weight) || left.id - right.id);
+    const next = kids[0];
+    if (!next || seen.has(next.id)) break;
+    seen.add(next.id);
+    down.push(next);
+    cursor = next;
+  }
+  return up.concat(down);
+}
+
 function renderInspector() {
   const heavy = $("heaviest");
   clear(heavy);
-  const frames = state.tree ? state.tree.heaviest : [];
+  const through = pathThroughSelection();
+  const label = $("heaviest-label");
+  const scope = $("heaviest-scope");
+  const frames = through
+    ? through.map((node) => node.frame)
+    : state.tree
+      ? state.tree.heaviest
+      : [];
+  if (label) label.textContent = through ? "Heaviest path" : "Heaviest stack";
+  if (scope) {
+    scope.textContent = through
+      ? "Through the selected function"
+      : "Heaviest stack in this view";
+  }
   if (!frames.length) {
     heavy.append(el("li", "muted", "No stack"));
   } else {
