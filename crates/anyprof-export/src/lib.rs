@@ -17,12 +17,17 @@ mod pprof;
 mod proto;
 mod speedscope;
 mod symbol;
+mod trace;
 
 use anyprof_core::{Profile, Runtime};
 
 pub use anyprof_core::Format;
 pub use cpuprofile::import_cpuprofile;
 pub use error::Error;
+pub use trace::{
+    Activity, Aggregate, FunctionRow, Query, Trace, TrackKind, TreeNode, ViewFrame, ViewThread,
+    WeightKind, activity, aggregate, load_trace,
+};
 
 /// Encode `profile` as `format`.
 pub fn export(profile: &Profile, format: Format) -> Result<Vec<u8>, Error> {

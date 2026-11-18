@@ -28,11 +28,13 @@ pub enum Command {
     /// Convert a profile between collapsed stacks, speedscope, pprof, and cpuprofile.
     #[command(visible_alias = "conv")]
     Convert(ConvertArgs),
-    /// Open a profile in the built-in speedscope viewer (offline, 127.0.0.1 only).
+    /// Open a profile in the built-in viewer (offline, 127.0.0.1 only).
     ///
     /// Reads `.cpuprofile`, pprof (`.pb.gz`), speedscope JSON, and collapsed
-    /// stacks; speedscope detects the format from the contents. The viewer is
-    /// served from inside this binary and needs no network access.
+    /// stacks. Folded profiles show a call tree and flame graph without a
+    /// timeline. A real V8 time series or speedscope event trace can show
+    /// sample activity. The viewer is served from inside this binary and needs
+    /// no network access.
     #[command(visible_alias = "v")]
     View(ViewArgs),
     /// Upgrade this install to the latest GitHub release.
@@ -159,7 +161,7 @@ pub struct RecordArgs {
     #[arg(short = 't', long, value_name = "URL_TITLE_OR_ID")]
     pub tab: Option<String>,
 
-    /// After writing the profile, open it in the built-in speedscope viewer.
+    /// After writing the profile, open it in the built-in viewer.
     ///
     /// Same as running `anyprof view` on the written file.
     #[arg(short = 'w', long)]

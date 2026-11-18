@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>anyprof</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app" class="app" data-testid="app">
+  <header class="toolbar" data-testid="toolbar">
+    <div class="brand">anyprof</div>
+    <div id="file-name" class="file-name" data-testid="file-name"></div>
+    <div id="meta" class="meta" data-testid="meta"></div>
+    <div class="spacer"></div>
+    <div class="theme" role="group" aria-label="Appearance">
+      <button type="button" data-theme="system" data-testid="theme-system">System</button>
+      <button type="button" data-theme="light" data-testid="theme-light">Light</button>
+      <button type="button" data-theme="dark" data-testid="theme-dark">Dark</button>
+    </div>
+  </header>
+  <section id="overview" class="overview" data-testid="overview"></section>
+  <div class="workspace">
+    <section class="main">
+      <div class="pane-bar">
+        <div class="tabs" role="tablist" aria-label="Profile views">
+          <button type="button" role="tab" id="tab-tree" data-pane="tree" aria-selected="true" data-testid="tab-tree">Call Tree</button>
+          <button type="button" role="tab" id="tab-flame" data-pane="flame" aria-selected="false" data-testid="tab-flame">Flame Graph</button>
+          <button type="button" role="tab" id="tab-functions" data-pane="functions" aria-selected="false" data-testid="tab-functions">Functions</button>
+        </div>
+        <label class="search">
+          <span class="sr">Search</span>
+          <input id="search" type="text" placeholder="Search" data-testid="search" autocomplete="off" spellcheck="false">
+        </label>
+        <button type="button" id="invert" data-testid="invert" aria-pressed="false">Invert</button>
+        <button type="button" id="hide-system" data-testid="hide-system" aria-pressed="false" disabled>Hide system</button>
+        <div id="tracks" class="tracks" data-testid="tracks"></div>
+      </div>
+      <div id="pane" class="pane" data-testid="pane" tabindex="0" aria-label="Profile table. Arrow keys move, left and right collapse and expand, slash searches, i inverts, escape clears."></div>
+    </section>
+    <aside class="inspector" data-testid="inspector">
+      <h2>Heaviest stack</h2>
+      <ol id="heaviest" data-testid="heaviest"></ol>
+      <h2>Selected function</h2>
+      <dl id="detail" data-testid="detail"></dl>
+    </aside>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

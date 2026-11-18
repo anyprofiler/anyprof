@@ -310,21 +310,34 @@ impl StringTable {
 }
 
 struct RawProfile {
+    sample_types: Vec<(i64, i64)>,
     samples: Vec<RawSample>,
+    mappings: HashMap<u64, i64>,
     locations: HashMap<u64, RawLocation>,
     functions: HashMap<u64, RawFunction>,
     strings: Vec<String>,
     duration_nanos: i64,
     period_nanos: i64,
+    period_type: i64,
     period_unit: i64,
+    default_sample_type: i64,
 }
 
 struct RawSample {
     locations: Vec<u64>,
     values: Vec<i64>,
+    labels: Vec<RawLabel>,
+}
+
+struct RawLabel {
+    key: i64,
+    str_idx: i64,
+    num: i64,
+    has_num: bool,
 }
 
 struct RawLocation {
+    mapping_id: u64,
     address: u64,
     lines: Vec<RawLine>,
 }
@@ -342,17 +355,30 @@ struct RawFunction {
 
 fn parse_profile(bytes: &[u8]) -> Result<RawProfile, Error> {
     let mut raw = RawProfile {
+        sample_types: Vec::new(),
         samples: Vec::new(),
+        mappings: HashMap::new(),
         locations: HashMap::new(),
         functions: HashMap::new(),
         strings: Vec::new(),
         duration_nanos: 0,
         period_nanos: 0,
+        period_type: 0,
         period_unit: 0,
+        default_sample_type: 0,
     };
     for (field, value) in message_fields(bytes)? {
         match (field, value) {
+            (1, Owned::Bytes(sample_type)) => {
+                raw.sample_types.push(parse_value_type(&sample_type)?)
+            }
             (2, Owned::Bytes(sample)) => raw.samples.push(parse_sample(&sample)?),
+            (3, Owned::Bytes(mapping)) => {
+                let (id, filename) = parse_mapping(&mapping)?;
+                if id != 0 {
+                    raw.mappings.insert(id, filename);
+                }
+            }
             (4, Owned::Bytes(location)) => {
                 let (id, parsed) = parse_location(&location)?;
                 raw.locations.insert(id, parsed);
@@ -369,9 +395,14 @@ fn parse_profile(bytes: &[u8]) -> Result<RawProfile, Error> {
             }
             (10, Owned::Varint(duration)) => raw.duration_nanos = as_i64(duration)?,
             (11, Owned::Bytes(period_type)) => {
-                raw.period_unit = parse_value_type(&period_type)?.1;
+                let (type_index, unit_index) = parse_value_type(&period_type)?;
+                raw.period_type = type_index;
+                raw.period_unit = unit_index;
             }
             (12, Owned::Varint(period)) => raw.period_nanos = as_i64(period)?,
+            (14, Owned::Varint(default_type)) => {
+                raw.default_sample_type = as_i64(default_type)?;
+            }
             _ => {}
         }
     }
@@ -382,6 +413,7 @@ fn parse_sample(bytes: &[u8]) -> Result<RawSample, Error> {
     let mut sample = RawSample {
         locations: Vec::new(),
         values: Vec::new(),
+        labels: Vec::new(),
     };
     for (field, value) in message_fields(bytes)? {
         match (field, value) {
@@ -393,6 +425,7 @@ fn parse_sample(bytes: &[u8]) -> Result<RawSample, Error> {
                     sample.values.push(as_i64(value)?);
                 }
             }
+            (3, Owned::Bytes(label)) => sample.labels.push(parse_label(&label)?),
             _ => {}
         }
     }
@@ -401,11 +434,13 @@ fn parse_sample(bytes: &[u8]) -> Result<RawSample, Error> {
 
 fn parse_location(bytes: &[u8]) -> Result<(u64, RawLocation), Error> {
     let mut id = 0_u64;
+    let mut mapping_id = 0_u64;
     let mut address = 0_u64;
     let mut lines = Vec::new();
     for (field, value) in message_fields(bytes)? {
         match (field, value) {
             (1, Owned::Varint(value)) => id = value,
+            (2, Owned::Varint(value)) => mapping_id = value,
             (3, Owned::Varint(value)) => address = value,
             (4, Owned::Bytes(line)) => lines.push(parse_line(&line)?),
             _ => {}
@@ -414,7 +449,48 @@ fn parse_location(bytes: &[u8]) -> Result<(u64, RawLocation), Error> {
     if id == 0 {
         return Err(Error::invalid("pprof", "location id 0"));
     }
-    Ok((id, RawLocation { address, lines }))
+    Ok((
+        id,
+        RawLocation {
+            mapping_id,
+            address,
+            lines,
+        },
+    ))
+}
+
+fn parse_mapping(bytes: &[u8]) -> Result<(u64, i64), Error> {
+    let mut id = 0_u64;
+    let mut filename = 0_i64;
+    for (field, value) in message_fields(bytes)? {
+        match (field, value) {
+            (1, Owned::Varint(value)) => id = value,
+            (5, Owned::Varint(value)) => filename = as_i64(value)?,
+            _ => {}
+        }
+    }
+    Ok((id, filename))
+}
+
+fn parse_label(bytes: &[u8]) -> Result<RawLabel, Error> {
+    let mut label = RawLabel {
+        key: 0,
+        str_idx: 0,
+        num: 0,
+        has_num: false,
+    };
+    for (field, value) in message_fields(bytes)? {
+        match (field, value) {
+            (1, Owned::Varint(value)) => label.key = as_i64(value)?,
+            (2, Owned::Varint(value)) => label.str_idx = as_i64(value)?,
+            (3, Owned::Varint(value)) => {
+                label.num = as_i64(value)?;
+                label.has_num = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(label)
 }
 
 fn parse_line(bytes: &[u8]) -> Result<RawLine, Error> {
@@ -501,7 +577,7 @@ fn gzip(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(encoder.finish()?)
 }
 
-fn gunzip_if_needed(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+pub(crate) fn gunzip_if_needed(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut decoder = GzDecoder::new(bytes);
         let mut out = Vec::new();
@@ -510,6 +586,302 @@ fn gunzip_if_needed(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     } else {
         Ok(bytes.to_vec())
     }
+}
+
+/// One pprof sample, still leaf-first, with every value column kept.
+pub(crate) struct InspectedSample {
+    pub frames: Vec<InspectedFrame>,
+    pub values: Vec<i64>,
+    /// A thread or goroutine label when the sample actually carries one.
+    pub track: Option<InspectedTrack>,
+}
+
+pub(crate) struct InspectedFrame {
+    pub runtime: Runtime,
+    pub name: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    pub address: Option<u64>,
+    pub module: Option<String>,
+    pub system: bool,
+}
+
+pub(crate) struct InspectedTrack {
+    pub kind: TrackKind,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackKind {
+    Thread,
+    Goroutine,
+}
+
+/// Sample types, labels, and mappings that [`import`] drops.
+pub(crate) struct InspectedProfile {
+    pub sample_types: Vec<(String, String)>,
+    pub default_sample_type: usize,
+    pub samples: Vec<InspectedSample>,
+    pub duration_ns: u64,
+    pub period_ns: Option<u64>,
+    pub notes: Vec<String>,
+}
+
+/// Decode a gzip or raw pprof profile without collapsing value columns.
+pub(crate) fn inspect(bytes: &[u8]) -> Result<InspectedProfile, Error> {
+    let decoded = gunzip_if_needed(bytes)?;
+    let raw = parse_profile(&decoded)?;
+    if raw.strings.first().is_some_and(|first| !first.is_empty()) {
+        return Err(Error::invalid("pprof", "string_table[0] must be empty"));
+    }
+    let mut notes = Vec::new();
+    let sample_types = raw
+        .sample_types
+        .iter()
+        .map(|(type_index, unit_index)| {
+            Ok((
+                lookup(&raw.strings, *type_index)?.to_string(),
+                lookup(&raw.strings, *unit_index)?.to_string(),
+            ))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let default_sample_type = if sample_types.is_empty() {
+        0
+    } else if raw.default_sample_type < 0 || raw.default_sample_type as usize >= sample_types.len()
+    {
+        notes.push(format!(
+            "default sample type {} is outside the {} declared types; using the first",
+            raw.default_sample_type,
+            sample_types.len()
+        ));
+        0
+    } else {
+        raw.default_sample_type as usize
+    };
+    let period_ns = if raw.period_nanos > 0 {
+        let unit = if raw.period_unit == 0 {
+            ""
+        } else {
+            lookup(&raw.strings, raw.period_unit)?
+        };
+        match time_scale_ns(unit) {
+            Some(scale) => scale_i64(raw.period_nanos, scale).ok(),
+            None => {
+                if !unit.is_empty() {
+                    notes.push(format!(
+                        "sampling period uses unit {unit}, which is not a time unit, so it is not shown as a duration"
+                    ));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let duration_ns = if raw.duration_nanos > 0 {
+        u64::try_from(raw.duration_nanos).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut samples = Vec::with_capacity(raw.samples.len());
+    for sample in &raw.samples {
+        let mut frames = Vec::new();
+        for location_id in &sample.locations {
+            let location = raw.locations.get(location_id).ok_or_else(|| {
+                Error::invalid("pprof", format!("unknown location id {location_id}"))
+            })?;
+            let module = mapping_name(&raw, location.mapping_id)?;
+            let system = module.as_deref().is_some_and(is_system_library);
+            if location.lines.is_empty() {
+                frames.push(InspectedFrame {
+                    runtime: Runtime::Native,
+                    name: match none_if_zero(location.address) {
+                        Some(addr) => format!("0x{addr:x}"),
+                        None => "unknown".to_string(),
+                    },
+                    file: None,
+                    line: None,
+                    column: None,
+                    address: none_if_zero(location.address),
+                    module: module.clone(),
+                    system,
+                });
+                continue;
+            }
+            for line in &location.lines {
+                let mut frame = inspected_frame(&raw, location.address, line)?;
+                frame.module = module.clone();
+                frame.system = system || frame.runtime == Runtime::Kernel;
+                frames.push(frame);
+            }
+        }
+        samples.push(InspectedSample {
+            frames,
+            values: sample.values.clone(),
+            track: track_from_labels(&raw, &sample.labels)?,
+        });
+    }
+    Ok(InspectedProfile {
+        sample_types,
+        default_sample_type,
+        samples,
+        duration_ns,
+        period_ns,
+        notes,
+    })
+}
+
+fn inspected_frame(
+    raw: &RawProfile,
+    address: u64,
+    line: &RawLine,
+) -> Result<InspectedFrame, Error> {
+    let function = raw.functions.get(&line.function_id).ok_or_else(|| {
+        Error::invalid("pprof", format!("unknown function id {}", line.function_id))
+    })?;
+    let symbol = lookup(&raw.strings, function.name)?;
+    let (runtime, name) = parse_symbol(symbol);
+    let name = if name.is_empty() {
+        match none_if_zero(address) {
+            Some(addr) => format!("0x{addr:x}"),
+            None => "unknown".to_string(),
+        }
+    } else {
+        name.to_string()
+    };
+    let file = {
+        let filename = lookup(&raw.strings, function.filename)?;
+        if filename.is_empty() {
+            None
+        } else {
+            Some(filename.to_string())
+        }
+    };
+    Ok(InspectedFrame {
+        runtime,
+        name,
+        file,
+        line: none_if_zero_i64(line.line),
+        column: none_if_zero_i64(line.column),
+        address: none_if_zero(address),
+        module: None,
+        system: runtime == Runtime::Kernel,
+    })
+}
+
+fn mapping_name(raw: &RawProfile, mapping_id: u64) -> Result<Option<String>, Error> {
+    let Some(index) = raw.mappings.get(&mapping_id) else {
+        return Ok(None);
+    };
+    let name = lookup(&raw.strings, *index)?;
+    if name.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(name.to_string()))
+    }
+}
+
+fn track_from_labels(
+    raw: &RawProfile,
+    labels: &[RawLabel],
+) -> Result<Option<InspectedTrack>, Error> {
+    for label in labels {
+        let key = lookup(&raw.strings, label.key)?;
+        let Some(kind) = track_kind(key) else {
+            continue;
+        };
+        let text = if label.str_idx != 0 {
+            lookup(&raw.strings, label.str_idx)?.to_string()
+        } else {
+            String::new()
+        };
+        let name = if !text.is_empty() {
+            text
+        } else if label.has_num {
+            label.num.to_string()
+        } else {
+            continue;
+        };
+        return Ok(Some(InspectedTrack { kind, name }));
+    }
+    Ok(None)
+}
+
+fn track_kind(key: &str) -> Option<TrackKind> {
+    match key.to_ascii_lowercase().as_str() {
+        "thread" | "thread id" | "threadid" | "tid" | "os thread" | "osthread" => {
+            Some(TrackKind::Thread)
+        }
+        "goroutine" => Some(TrackKind::Goroutine),
+        _ => None,
+    }
+}
+
+/// Nanoseconds in one of `unit`, when `unit` is a time unit.
+pub(crate) fn time_scale_ns(unit: &str) -> Option<f64> {
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "nanoseconds" | "nanosecond" | "ns" => Some(1.0),
+        "microseconds" | "microsecond" | "us" | "µs" | "μs" => Some(1_000.0),
+        "milliseconds" | "millisecond" | "ms" => Some(1_000_000.0),
+        "seconds" | "second" | "s" => Some(1_000_000_000.0),
+        _ => None,
+    }
+}
+
+fn scale_i64(value: i64, scale: f64) -> Result<u64, Error> {
+    if value < 0 {
+        return Err(Error::invalid("pprof", format!("negative value {value}")));
+    }
+    ticks_from_f64(value as f64 * scale, "pprof")
+}
+
+pub(crate) fn ticks_from_f64(value: f64, format: &'static str) -> Result<u64, Error> {
+    if !value.is_finite() || value < 0.0 || value > u64::MAX as f64 {
+        return Err(Error::invalid(
+            format,
+            format!("value {value} is not a duration"),
+        ));
+    }
+    Ok(value.round() as u64)
+}
+
+/// Operating-system libraries anyprof can recognize from a mapped path.
+///
+/// A bare function name is not enough: `std::` and `java.` are not marked.
+pub(crate) fn is_system_library(path: &str) -> bool {
+    let lower = path.trim().replace('\\', "/").to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    const WINDOWS: &[&str] = &[
+        "ntdll.dll",
+        "kernel32.dll",
+        "kernelbase.dll",
+        "win32u.dll",
+        "ucrtbase.dll",
+        "msvcrt.dll",
+    ];
+    if WINDOWS.contains(&base) {
+        return true;
+    }
+    const PREFIXES: &[&str] = &[
+        "/usr/lib/",
+        "/usr/lib64/",
+        "/lib/",
+        "/lib64/",
+        "/system/library/",
+        "/usr/lib/system/",
+        "/library/apple/",
+        "c:/windows/system32/",
+        "c:/windows/syswow64/",
+        "/windows/system32/",
+        "/windows/syswow64/",
+    ];
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+        || lower.contains("/windows/system32/")
+        || lower.contains("/windows/syswow64/")
 }
 
 #[cfg(test)]

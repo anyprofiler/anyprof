@@ -358,10 +358,9 @@ fn view_serves_the_profile_on_loopback_until_the_timeout() {
     assert!(profile.starts_with("HTTP/1.0 200 OK"), "{profile}");
     assert!(profile.ends_with("main;work 3\n"), "{profile}");
     let landing = get(&format!("/{path}"));
-    assert!(
-        landing.contains("index.html#profileURL=profile&amp;title=cpu.collapsed"),
-        "{landing}"
-    );
+    assert!(landing.contains("data-testid=\"app\""), "{landing}");
+    assert!(landing.contains("app.js"), "{landing}");
+    assert!(!landing.contains("profileURL"), "{landing}");
     assert!(get("/t/00000000000000000000000000000000/profile").contains(" 404 "));
 
     let status = child.wait().unwrap();

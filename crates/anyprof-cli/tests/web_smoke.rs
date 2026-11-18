@@ -1,9 +1,10 @@
 //! `anyprof view` in headless Chrome, driven over the DevTools Protocol.
 //!
-//! For a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope
-//! JSON, this checks that the viewer served the profile, that speedscope
-//! picked the matching importer, that the page logged no exceptions or CSP
-//! violations, and that the screenshot shows a flame graph.
+//! Folded profiles (collapsed stacks and the pprof, speedscope, and
+//! `.cpuprofile` files `convert` writes from them) must say there is no
+//! timeline. A hand-written V8 time series must show sample activity. A
+//! function name that looks like markup must stay text. The page must not log
+//! exceptions or CSP violations, and the flame graph must be visible.
 //!
 //! Skips when no Chrome is found unless `ANYPROF_REQUIRE_CHROME` is set (CI
 //! sets it). `ANYPROF_CHROME` overrides the browser path.
@@ -25,7 +26,7 @@ use tungstenite::{Message, WebSocket};
 const DEADLINE: Duration = Duration::from_secs(60);
 
 #[test]
-fn speedscope_renders_profiles_in_headless_chrome() {
+fn viewer_renders_profiles_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         assert!(
             std::env::var_os("ANYPROF_REQUIRE_CHROME").is_none(),
@@ -39,23 +40,11 @@ fn speedscope_renders_profiles_in_headless_chrome() {
     let dir = scratch_dir("anyprof-web-smoke");
     let collapsed = dir.join("smoke.collapsed");
     std::fs::write(&collapsed, collapsed_fixture()).unwrap();
-    let mut cases = vec![(collapsed.clone(), "Importing as collapsed stack format")];
-    for (name, to, importer) in [
-        (
-            "smoke.cpuprofile",
-            "cpuprofile",
-            "Importing as Chrome CPU Profile",
-        ),
-        (
-            "smoke.pb.gz",
-            "pprof",
-            "Importing as protobuf encoded pprof file",
-        ),
-        (
-            "smoke.speedscope.json",
-            "speedscope",
-            "Importing as speedscope json file",
-        ),
+    let mut cases = vec![(collapsed.clone(), "aggregate")];
+    for (name, to) in [
+        ("smoke.cpuprofile", "cpuprofile"),
+        ("smoke.pb.gz", "pprof"),
+        ("smoke.speedscope.json", "speedscope"),
     ] {
         let path = dir.join(name);
         let status = Command::new(env!("CARGO_BIN_EXE_anyprof"))
@@ -68,8 +57,21 @@ fn speedscope_renders_profiles_in_headless_chrome() {
             .status()
             .unwrap();
         assert!(status.success(), "convert to {to}");
-        cases.push((path, importer));
+        cases.push((path, "aggregate"));
     }
+    let series = dir.join("series.cpuprofile");
+    std::fs::write(&series, SERIES_CPUPROFILE).unwrap();
+    cases.push((series, "timeline"));
+    let markup = dir.join("markup.collapsed");
+    std::fs::write(
+        &markup,
+        "<img src=x onerror=alert(1)>;<script>alert(1)</script> 4\n",
+    )
+    .unwrap();
+    cases.push((markup, "markup"));
+    let broken = dir.join("broken.cpuprofile");
+    std::fs::write(&broken, b"{").unwrap();
+    cases.push((broken, "broken"));
 
     let browser = Browser::launch(&chrome, &dir.join("chrome-profile"));
     let artifacts = std::env::var_os("ANYPROF_SMOKE_ARTIFACTS").map(PathBuf::from);
@@ -77,13 +79,8 @@ fn speedscope_renders_profiles_in_headless_chrome() {
         std::fs::create_dir_all(dir).unwrap();
     }
     let mut cdp = browser.connect();
-    for (path, importer) in &cases {
-        check_one(
-            &mut cdp,
-            path,
-            importer,
-            artifacts.as_deref().unwrap_or(&dir),
-        );
+    for (path, kind) in &cases {
+        check_one(&mut cdp, path, kind, artifacts.as_deref().unwrap_or(&dir));
     }
     drop(cdp);
     drop(browser);
@@ -92,7 +89,19 @@ fn speedscope_renders_profiles_in_headless_chrome() {
 
 /// Load `path` and check it rendered. Screenshots and failure reports go to
 /// `keep`.
-fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
+const SERIES_CPUPROFILE: &str = r#"{
+  "nodes": [
+    {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "1", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": [2]},
+    {"id": 2, "callFrame": {"functionName": "hot", "scriptId": "7", "url": "app.js", "lineNumber": 9, "columnNumber": 0}, "children": [3]},
+    {"id": 3, "callFrame": {"functionName": "leaf", "scriptId": "7", "url": "app.js", "lineNumber": 12, "columnNumber": 0}, "children": []}
+  ],
+  "startTime": 1000,
+  "endTime": 4000,
+  "samples": [3, 3, 3, 2],
+  "timeDeltas": [1000, 1000, 1000, 1000]
+}"#;
+
+fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
     let viewer = ViewerProcess::start(path);
     eprintln!("{name}: {}", viewer.url);
@@ -124,7 +133,7 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
             session,
             "Runtime.evaluate",
             json!({
-                "expression": "JSON.stringify({hash: location.hash, text: document.body ? document.body.innerText : '', canvases: document.querySelectorAll('canvas').length})",
+                "expression": "JSON.stringify({ready: document.documentElement.dataset.ready || '', timeline: document.documentElement.dataset.timeline || '', text: document.body ? document.body.innerText : '', imgs: document.querySelectorAll('img').length, inlineScripts: [...document.scripts].filter(s => !s.src).length})",
                 "returnByValue": true,
             }),
         );
@@ -136,13 +145,22 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
             .and_then(|text| serde_json::from_str(text).ok())
             .unwrap_or(Value::Null);
         let text = state["text"].as_str().unwrap_or_default();
-        let imported = cdp.console().iter().any(|line| line.contains(importer));
-        if imported && text.contains(&name) && text.contains("Left Heavy") {
+        let ready = state["ready"].as_str() == Some("1");
+        let failed = state["ready"].as_str() == Some("error");
+        if kind == "broken"
+            && failed
+            && text
+                .to_ascii_lowercase()
+                .contains("could not read this profile")
+        {
+            break state;
+        }
+        if kind != "broken" && ready && text.contains(&name) {
             break state;
         }
         if started.elapsed() >= DEADLINE {
             let report = format!(
-                "{name}: speedscope did not finish loading within {DEADLINE:?}.\nurl: {}\nstate: {state}\nconsole: {:#?}\nlog: {:#?}\nviewer: {}",
+                "{name}: viewer did not finish loading within {DEADLINE:?}.\nurl: {}\nstate: {state}\nconsole: {:#?}\nlog: {:#?}\nviewer: {}",
                 viewer.url,
                 cdp.console(),
                 cdp.problems(),
@@ -153,9 +171,222 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
         }
         std::thread::sleep(Duration::from_millis(250));
     };
-    // Let the flame graph draw a frame after the import.
-    std::thread::sleep(Duration::from_millis(750));
 
+    let text = state["text"].as_str().unwrap_or_default();
+    let lower = text.to_ascii_lowercase();
+    match kind {
+        "aggregate" => assert!(
+            lower.contains("no timeline"),
+            "{name}: folded profile drew a timeline:\n{text}"
+        ),
+        "timeline" => {
+            assert!(
+                lower.contains("sample activity"),
+                "{name}: time series had no sample activity:\n{text}"
+            );
+            assert!(
+                !lower.contains("no timeline"),
+                "{name}: time series hid its timeline:\n{text}"
+            );
+            assert!(
+                !lower.contains("cpu usage"),
+                "{name}: sample activity was labeled as CPU usage:\n{text}"
+            );
+        }
+        "markup" => {
+            assert_eq!(state["imgs"].as_u64(), Some(0), "{name}: {state}");
+            assert_eq!(state["inlineScripts"].as_u64(), Some(0), "{name}: {state}");
+            assert!(
+                text.contains("<script>alert(1)</script>"),
+                "{name}: markup name was not shown as text:\n{text}"
+            );
+            assert!(lower.contains("no timeline"), "{name}:\n{text}");
+        }
+        "broken" => assert!(
+            lower.contains("could not read this profile"),
+            "{name}: a malformed profile rendered a tree:\n{text}"
+        ),
+        other => panic!("unknown case {other}"),
+    }
+    if kind == "broken" {
+        let stderr = viewer.stderr();
+        assert!(
+            stderr.contains("browser fetched the profile"),
+            "{name}: the viewer never served the session:\n{stderr}"
+        );
+        cdp.call(None, "Target.closeTarget", json!({ "targetId": target_id }));
+        eprintln!("{name}: refused");
+        return;
+    }
+    if kind == "timeline" {
+        drag_timeline(cdp, session);
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "!document.body.innerText.includes('leaf') && document.querySelector('[data-testid=zoom-range]') && !document.querySelector('[data-testid=zoom-range]').hidden"
+            ),
+            "{name}: dragging the last samples did not drop the earlier stack"
+        );
+        let selected = cdp.call(
+            session,
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+        );
+        std::fs::write(
+            keep.join(format!("{name}.selection.png")),
+            base64_decode(selected["data"].as_str().unwrap()),
+        )
+        .unwrap();
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=zoom-range]').click()",
+                "returnByValue": true,
+            }),
+        );
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "!document.body.innerText.includes('leaf') && document.querySelector('[data-testid=zoom-range]').hidden"
+            ),
+            "{name}: zoom did not keep the selected interval"
+        );
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=reset-range]').click()",
+                "returnByValue": true,
+            }),
+        );
+        assert!(
+            wait_for(cdp, session, "document.body.innerText.includes('leaf')"),
+            "{name}: reset did not restore the full series"
+        );
+    }
+    if kind == "aggregate" && name.ends_with(".collapsed") {
+        let disabled = cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=hide-system]').disabled",
+                "returnByValue": true,
+            }),
+        );
+        assert_eq!(
+            disabled.pointer("/result/value").and_then(Value::as_bool),
+            Some(true),
+            "{name}: hide system was enabled without a system frame"
+        );
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.getElementById('pane').focus()",
+                "returnByValue": true,
+            }),
+        );
+        cdp.call(
+            session,
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyDown",
+                "key": "ArrowDown",
+                "code": "ArrowDown",
+                "windowsVirtualKeyCode": 40,
+                "nativeVirtualKeyCode": 40,
+            }),
+        );
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "!!document.querySelector('[data-testid=tree-row][aria-selected=\"true\"]')"
+            ),
+            "{name}: ArrowDown did not select a row"
+        );
+    }
+    if kind == "markup" {
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=invert]').click()",
+                "returnByValue": true,
+            }),
+        );
+        let inverted = wait_for(
+            cdp,
+            session,
+            "document.querySelector('[data-testid=tree-row] .label') && document.querySelector('[data-testid=tree-row] .label').textContent.includes('<script>')",
+        );
+        assert!(inverted, "{name}: invert did not put the leaf at the root");
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=search]').value = 'no-such-function-zz'; document.querySelector('[data-testid=search]').dispatchEvent(new Event('input', {bubbles: true}));",
+                "returnByValue": true,
+            }),
+        );
+        let filtered = wait_for(
+            cdp,
+            session,
+            "document.body.innerText.includes('No functions match.')",
+        );
+        assert!(filtered, "{name}: search did not filter the tree");
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=search]').value = ''; document.querySelector('[data-testid=search]').dispatchEvent(new Event('input', {bubbles: true}));",
+                "returnByValue": true,
+            }),
+        );
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "document.querySelector('[data-testid=search]').value === '' && !!document.querySelector('[data-testid=tree-row]')"
+            ),
+            "{name}: clearing search did not restore the tree"
+        );
+    }
+    let shot = cdp.call(
+        session,
+        "Page.captureScreenshot",
+        json!({ "format": "png" }),
+    );
+    std::fs::write(
+        keep.join(format!("{name}.call-tree.png")),
+        base64_decode(shot["data"].as_str().unwrap()),
+    )
+    .unwrap();
+    cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.querySelector('[data-testid=tab-flame]').click()",
+            "returnByValue": true,
+        }),
+    );
+    assert!(
+        wait_for(
+            cdp,
+            session,
+            "!!document.querySelector('[data-testid=flame]')"
+        ),
+        "{name}: flame graph did not render"
+    );
+    let problems = cdp.problems();
+    assert!(
+        problems.is_empty(),
+        "{name}: exceptions or CSP violations: {problems:#?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
     let shot = cdp.call(
         session,
         "Page.captureScreenshot",
@@ -163,38 +394,6 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
     );
     let png = base64_decode(shot["data"].as_str().unwrap());
     std::fs::write(keep.join(format!("{name}.png")), &png).unwrap();
-    let renderer = cdp
-        .console()
-        .into_iter()
-        .find(|line| line.starts_with("WebGL initialized"))
-        .unwrap_or_else(|| "no WebGL renderer logged".to_string());
-    eprintln!("{name}: {renderer}");
-
-    let text = state["text"].as_str().unwrap_or_default();
-    assert!(
-        !text.contains("Something went wrong"),
-        "{name}: speedscope error page: {text}"
-    );
-    assert!(
-        !text.contains("Drag and drop"),
-        "{name}: still on the landing page"
-    );
-    assert!(
-        state["hash"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("profileURL=profile"),
-        "{name}: {state}"
-    );
-    assert!(
-        state["canvases"].as_u64().unwrap_or(0) > 0,
-        "{name}: {state}"
-    );
-    let problems = cdp.problems();
-    assert!(
-        problems.is_empty(),
-        "{name}: exceptions or CSP violations: {problems:#?}"
-    );
 
     let colored = flame_graph_coverage(&png);
     assert!(
@@ -202,6 +401,28 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
         "{name}: no flame graph in the screenshot ({:.1}% colored pixels)",
         colored * 100.0
     );
+
+    if kind == "aggregate" && name.ends_with(".collapsed") {
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=theme-dark]').click()",
+                "returnByValue": true,
+            }),
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        let dark = cdp.call(
+            session,
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+        );
+        std::fs::write(
+            keep.join(format!("{name}.dark.png")),
+            base64_decode(dark["data"].as_str().unwrap()),
+        )
+        .unwrap();
+    }
 
     let stderr = viewer.stderr();
     assert!(
@@ -213,6 +434,68 @@ fn check_one(cdp: &mut Cdp, path: &Path, importer: &str, keep: &Path) {
         "{name}: rendered ({:.1}% of the flame graph area colored)",
         colored * 100.0
     );
+}
+
+/// Drag across the right side of the sample chart, where the fixture's last
+/// sample is `hot` and the earlier samples are `leaf`.
+fn drag_timeline(cdp: &mut Cdp, session: Option<&str>) {
+    let point = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "(function(){ const canvas = document.querySelector('#timeline'); const rect = canvas.getBoundingClientRect(); const gutter = 120; const plot = Math.max(1, rect.width - gutter); return {y: rect.top + Math.min(8, rect.height / 2), x0: rect.left + gutter + plot * 0.80, x1: rect.left + gutter + plot * 0.97}; })()",
+            "returnByValue": true,
+        }),
+    );
+    let value = point
+        .pointer("/result/value")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let x0 = value["x0"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("timeline rect: {point}"));
+    let x1 = value["x1"].as_f64().unwrap();
+    let y = value["y"].as_f64().unwrap();
+    for (kind, x) in [
+        ("mousePressed", x0),
+        ("mouseMoved", x1),
+        ("mouseReleased", x1),
+    ] {
+        cdp.call(
+            session,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": kind,
+                "x": x,
+                "y": y,
+                "button": "left",
+                "buttons": if kind == "mouseReleased" { 0 } else { 1 },
+                "clickCount": 1,
+            }),
+        );
+    }
+}
+
+fn wait_for(cdp: &mut Cdp, session: Option<&str>, expression: &str) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        let state = cdp.try_call(
+            session,
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true }),
+        );
+        let ready = state
+            .ok()
+            .as_ref()
+            .and_then(|state| state.pointer("/result/value"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if ready {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 /// Write `<name>.timeout.png` (when the page can still be captured) and
@@ -476,8 +759,13 @@ struct Cdp {
 
 impl Cdp {
     fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Value {
-        self.try_call(session, method, params)
-            .unwrap_or_else(|error| panic!("{method}: {error}"))
+        let value = self
+            .try_call(session, method, params)
+            .unwrap_or_else(|error| panic!("{method}: {error}"));
+        if let Some(details) = value.get("exceptionDetails") {
+            panic!("{method} threw in the page: {details}");
+        }
+        value
     }
 
     /// The command's result, or the protocol error it returned.
