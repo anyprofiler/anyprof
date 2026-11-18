@@ -42,7 +42,7 @@ Auto-detection tries `node`, then `rust`, then `go`, then `native`. The browser 
 | Browser page | Works (CI, headless Chrome) | Works (CI, headless Chrome) | Works (CI, headless Chrome) |
 | C, C++ | Works (CI) on Apple Silicon and Intel. Root, Mach `task_for_pid`, frame pointers, Mach-O symbols. Busy and idle programs. User frames only. | Works (CI) on x64. Same user, no administrator token. Suspends only threads whose state is Running, walks with `StackWalk64`, resolves dbghelp symbols. Busy and idle programs. Refuses this process before `OpenProcess`. 32-bit processes, ARM64 processes, and non-x64 builds are not sampled. A kernel address is not stored as a user frame. | Works (CI) on x86_64. `perf_event_open` task clock (on-CPU; the thread is not suspended). Frame-pointer walk of the user stack copy, ELF symbols. Busy, idle, and two running threads. Kernel frames with `-k` when `perf_event_paranoid` is 1 or lower. aarch64 and other architectures are not sampled and do not advertise `-k`. |
 | Rust | Works (CI) on Apple Silicon and Intel. Same Mach sampler and root requirement as C/C++. rustc 1.99 does not emit frame pointers unless `-C force-frame-pointers=yes`. The library tests sample a busy program, an idle park, and two running threads. | Works (CI) on x64. Same user, no administrator token. `StackWalk64` uses the PE unwind data rustc emits. Names come from dbghelp, or from a PDB whose GUID and age match the image when dbghelp returns none. The fixture passes `-C force-frame-pointers=yes` and `-C debuginfo=2`. Busy, idle, and two running threads. Refuses this process before `OpenProcess`. Non-x64 builds are not sampled. | Works (CI) on x86_64. Same `perf_event_open` sampler as C/C++. rustc 1.99 does not emit frame pointers at `-O0` or `-O2` unless `-C force-frame-pointers=yes`. Busy, idle, and two running threads. `-k` is the native Linux behavior. musl x86_64 is the same code and is only `cargo check`ed. aarch64 and other architectures are not sampled and do not advertise `-k`. |
-| Go | Works (CI) on Apple Silicon and Intel for Go 1.22 and Go 1.26. Same Mach sampler and root requirement as C/C++. The user stack is the pclntab pcsp walk of the running goroutine. Busy, parked, and two running goroutines, `CGO_ENABLED=0 -ldflags=-s -w`. Those live tests passed on both hosts and both Go versions in run 44227429060. | Works (CI) on x64 for Go 1.22 and Go 1.26. Same user, no administrator token. pcsp replaces `StackWalk64` when the PC is in the Go pclntab; otherwise `StackWalk64` is unchanged. Busy, parked, and two running goroutines. Refuses this process before `OpenProcess`. Non-x64 builds are not sampled. Run 44227429060 passed those live tests for both Go versions. | Works (CI) on x86_64 for Go 1.22 and Go 1.26. Same `perf_event_open` sampler as C/C++. The copied user stack is 8 KiB and is unwound with pcsp. Busy, parked, and two running goroutines. Also live-sampled here on Go 1.22.2 and Go 1.26.11. `-k` is the native Linux behavior. musl x86_64 is the same code and is only `cargo check`ed. aarch64 and other architectures are not sampled and do not advertise `-k`. |
+| Go | Works (CI) on Apple Silicon and Intel for Go 1.22 and Go 1.26. Same Mach sampler and root requirement as C/C++. The user stack is the pclntab pcsp walk of the running goroutine. Busy, parked, and two running goroutines, `CGO_ENABLED=0 -ldflags=-s -w`. Those live tests, and the cgo `runtime.text` comparison with `go tool nm`, passed on both hosts and both Go versions in run 44231049432. | Works (CI) on x64 for Go 1.22 and Go 1.26. Same user, no administrator token. pcsp replaces `StackWalk64` when the PC is in the Go pclntab; otherwise `StackWalk64` is unchanged. Busy, parked, and two running goroutines. Refuses this process before `OpenProcess`. Non-x64 builds are not sampled. Run 44231049432 passed those live tests and the cgo `nm` comparison for both Go versions. | Works (CI) on x86_64 for Go 1.22 and Go 1.26. Same `perf_event_open` sampler as C/C++. The copied user stack is 8 KiB and is unwound with pcsp. Busy, parked, and two running goroutines. Also live-sampled here on Go 1.22.2 and Go 1.26.11. Run 44231049432 passed those live tests and the cgo `nm` comparison for both Go versions. `-k` is the native Linux behavior. musl x86_64 is the same code and is only `cargo check`ed. aarch64 and other architectures are not sampled and do not advertise `-k`. |
 | Python, Java, Ruby, PHP, .NET | Not implemented | Not implemented | Not implemented |
 
 `macos-latest` is arm64. `macos-15-intel` is x86_64. Each of those jobs samples a busy C++ program and an idle program under sudo. The arm64 job also runs `xpaci` and `xpacd` on an unsigned pointer. The Intel job does not, and a green arm64 job is not x86_64 coverage. arm64e signed userspace is not its own CI image. Signed pointers follow Darwin's `__darwin_arm_thread_state64_ptrauth_strip`: `NO_PTRAUTH` leaves the register pc, lr, sp, and fp alone; `IB_SIGNED_LR` leaves the register lr alone; otherwise `xpaci` strips code pointers and `xpacd` strips data pointers. Saved frame records are stripped with those instructions even when the registers are already raw, because an arm64 process can be inside an arm64e system function. An unsigned pointer is left unchanged. `KERNEL_SIGNED_PC` and `KERNEL_SIGNED_LR` do not switch that to authentication, because a bad signature can trap. Where those instructions are not compiled, a signed pointer is left unchanged instead of masked to 48 bits. System libraries that exist only in the dyld shared cache (`dyld_v1`) keep an address range and do not get function names. The symbol reader still refuses a table above 2,000,000 symbols or a string table above 64 MiB.
@@ -97,18 +97,18 @@ A frame from a non-native runtime is written as `[runtime] name`, for example `[
 
 ## Install
 
-Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.6` is tag `v0.1.6`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
+Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anyprof/releases). Release tags are `v` plus the workspace version, so version `0.1.7` is tag `v0.1.7`. Each archive ships the `anyprof` executable (`anyprof.exe` on Windows) from the `anyprof-cli` crate, plus a checksum.
 
 macOS and Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.6/anyprof-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.7/anyprof-cli-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.6/anyprof-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.7/anyprof-cli-installer.ps1 | iex"
 ```
 
 The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
@@ -346,8 +346,8 @@ On `windows-latest`, `crates/anyprof-native/tests/windows_live.rs` compiles a bu
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`. Every crate inherits it.
 2. Commit that change on `main` (the release workflow has to be on the default branch).
-3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.6` is tag `v0.1.6`.
-4. Push the tag: `git push origin v0.1.6`.
+3. Tag that commit `vX.Y.Z`. The `v` prefix and the version must match the workspace version. Version `0.1.7` is tag `v0.1.7`.
+4. Push the tag: `git push origin v0.1.7`.
 
 Pushing the tag runs `.github/workflows/release.yml`. [cargo-dist](https://axodotdev.github.io/cargo-dist/) builds `anyprof` for Apple Silicon macOS, Intel macOS, 64-bit Windows, and 64-bit Linux (glibc and musl, x86_64 and ARM), then uploads the archives, checksums, shell installer, and PowerShell installer to a GitHub Release.
 
