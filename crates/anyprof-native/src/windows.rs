@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::java::{self, JavaVm};
 use crate::python::{self, CountedStack, PythonVm};
 use anyprof_core::{
     Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Stack, Target, inspect,
@@ -91,6 +92,9 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let symbols = Symbols::load(process.handle)?;
     let mut go = load_go(process.handle);
     let python = python::attach_process(process.handle);
+    let java = java::attach_process(process.handle, &mut |addr, buf| {
+        read_process(process.handle, addr, buf)
+    });
 
     let started = Instant::now();
     let mut next = started;
@@ -105,7 +109,13 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         {
             break;
         }
-        match sample_addresses(process.handle, target.pid, go.as_mut(), python.as_ref()) {
+        match sample_addresses(
+            process.handle,
+            target.pid,
+            go.as_mut(),
+            python.as_ref(),
+            java.as_ref(),
+        ) {
             Ok(stacks) => {
                 for stack in stacks {
                     if stack.recordable() {
@@ -188,6 +198,14 @@ impl Process {
             policy::windows_open_denied(pid, os_error, protection, privilege),
         ))
     }
+}
+
+pub(crate) fn with_process<T>(
+    pid: u32,
+    body: impl FnOnce(HANDLE) -> Result<T, String>,
+) -> Result<T, Error> {
+    let process = Process::open(pid)?;
+    body(process.handle).map_err(|message| Error::backend("native", message))
 }
 
 impl Drop for Process {
@@ -342,11 +360,12 @@ fn sample_addresses(
     pid: u32,
     mut go: Option<&mut GoProc>,
     python: Option<&PythonVm>,
+    java: Option<&JavaVm>,
 ) -> Result<Vec<CountedStack>, SampleFault> {
     let running = running_threads(pid)?;
     let mut stacks = Vec::with_capacity(running.len());
     for tid in running {
-        match unwind_thread(process, tid, go.as_deref_mut(), python) {
+        match unwind_thread(process, tid, go.as_deref_mut(), python, java) {
             Ok(Some(frames)) => stacks.push(frames),
             Ok(None) => {}
             Err(err) => return Err(err),
@@ -406,6 +425,7 @@ fn unwind_thread(
     tid: u32,
     go: Option<&mut GoProc>,
     python: Option<&PythonVm>,
+    java: Option<&JavaVm>,
 ) -> Result<Option<CountedStack>, SampleFault> {
     let access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION;
     let thread = unsafe { OpenThread(access, FALSE, tid) };
@@ -417,7 +437,7 @@ fn unwind_thread(
     let Some(suspended) = Suspended::new(thread.0, &mut resume_failure) else {
         return Ok(None);
     };
-    let frames = walk_suspended(process, thread.0, tid, go, python);
+    let frames = walk_suspended(process, thread.0, tid, go, python, java);
     drop(suspended);
     if let Some(code) = resume_failure {
         return Err(SampleFault::Fatal(format!(
@@ -509,6 +529,7 @@ fn walk_suspended(
     tid: u32,
     go: Option<&mut GoProc>,
     python: Option<&PythonVm>,
+    java: Option<&JavaVm>,
 ) -> Option<CountedStack> {
     let mut aligned = AlignedContext {
         context: unsafe { std::mem::zeroed() },
@@ -520,8 +541,21 @@ fn walk_suspended(
     if ok == FALSE {
         return None;
     }
-    // `frames` is `None` for a leaf outside the interpreter and for a
-    // leaf inside it whose chain cannot be read. Both keep the native walk.
+    // `frames` is `None` for a leaf outside the code cache and for a blob
+    // whose method cannot be read. Both keep the native walk.
+    if let Some(vm) = java
+        && let Some(frames) = vm.frames(
+            aligned.context.Rip,
+            aligned.context.Rsp,
+            aligned.context.Rbp,
+            &mut |addr, buf| read_process(process, addr, buf),
+        )
+    {
+        return Some(CountedStack::Java {
+            kernel: Vec::new(),
+            frames,
+        });
+    }
     if let Some(vm) = python
         && let Some(frames) = vm.frames(u64::from(tid), aligned.context.Rip, &mut |addr, buf| {
             read_process(process, addr, buf)
@@ -614,6 +648,7 @@ fn finish_profile(
                 })
                 .collect(),
             CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
+            CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
         };
         stacks.push(Stack { frames, weight });
     }

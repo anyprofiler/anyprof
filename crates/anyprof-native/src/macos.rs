@@ -32,6 +32,7 @@ use mach2::traps::{mach_task_self, task_for_pid};
 use mach2::vm::mach_vm_deallocate;
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 
+use crate::java::{self, JavaVm};
 use crate::macho::{ImageSymbols, MachCpu, segment_bounds};
 use crate::policy::{self, StripKind};
 use crate::python::{self, CountedStack, PythonVm};
@@ -82,12 +83,12 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
 
     let task = Task::attach(target.pid)?;
     let symbols = load_symbols(task.port, target.pid);
-    let python = python::attach_mach(
-        &remote_images(task.port)
-            .into_iter()
-            .map(|image| (image.path, image.load, image.end))
-            .collect::<Vec<_>>(),
-    );
+    let images = remote_images(task.port)
+        .into_iter()
+        .map(|image| (image.path, image.load, image.end))
+        .collect::<Vec<_>>();
+    let python = python::attach_mach(&images);
+    let java = java::attach_mach(&images, &mut |addr, buf| read_task(task.port, addr, buf));
     tracing::debug!(
         pid = target.pid,
         images = symbols.len(),
@@ -111,7 +112,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             .iter()
             .filter_map(|image| image.go.clone())
             .collect();
-        match task.sample_addresses(&go_images, python.as_ref()) {
+        match task.sample_addresses(&go_images, python.as_ref(), java.as_ref()) {
             Ok(stacks) => {
                 for stack in stacks {
                     if stack.recordable() {
@@ -195,6 +196,7 @@ fn finish_profile(
                 .map(|(index, addr)| frame_for(addr, symbols, index == 0))
                 .collect(),
             CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
+            CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
         };
         stacks.push(Stack { frames, weight });
     }
@@ -283,6 +285,7 @@ impl Task {
         &self,
         go_images: &[crate::go_sym::GoImage],
         python: Option<&PythonVm>,
+        java: Option<&JavaVm>,
     ) -> Result<Vec<CountedStack>, SampleFault> {
         let threads = self.threads()?;
         let running: Vec<thread_act_t> = threads
@@ -299,7 +302,7 @@ impl Task {
             // `threads` stays alive until this function returns, so each
             // resume in `unwind_thread` happens before `ThreadList` drops the
             // send rights.
-            match unwind_thread(self.port, *thread, go_images, python) {
+            match unwind_thread(self.port, *thread, go_images, python, java) {
                 Ok(Some(frames)) => stacks.push(frames),
                 Ok(None) => {}
                 Err(err) => return Err(err),
@@ -493,6 +496,7 @@ fn unwind_thread(
     thread: thread_act_t,
     go_images: &[crate::go_sym::GoImage],
     python: Option<&PythonVm>,
+    java: Option<&JavaVm>,
 ) -> Result<Option<CountedStack>, SampleFault> {
     let mut resume_failure = None;
     let Some(suspended) = Suspended::new(thread, &mut resume_failure) else {
@@ -513,9 +517,17 @@ fn unwind_thread(
     let frames = if kr == KERN_SUCCESS {
         let (pc, sp, fp, lr) = registers(&state);
         let tid = thread_identifier(thread).unwrap_or(0);
-        // `frames` is `None` for a leaf outside the interpreter and for a
-        // leaf inside it whose chain cannot be read. Both keep the native walk.
-        if let Some(vm) = python
+        // `frames` is `None` for a leaf outside the code cache and for a
+        // blob whose method cannot be read. Both keep the native walk.
+        if let Some(vm) = java
+            && let Some(java_frames) =
+                vm.frames(pc, sp, fp, &mut |addr, buf| read_task(task, addr, buf))
+        {
+            Some(CountedStack::Java {
+                kernel: Vec::new(),
+                frames: java_frames,
+            })
+        } else if let Some(vm) = python
             && let Some(py_frames) = vm.frames(tid, pc, &mut |addr, buf| read_task(task, addr, buf))
         {
             Some(CountedStack::Python {
@@ -735,6 +747,24 @@ fn read_task(task: task_t, addr: u64, buf: &mut [u8]) -> bool {
         )
     };
     kr == KERN_SUCCESS && copied == buf.len() as u64
+}
+
+/// Attach, list images, and run `body` before the port is dropped.
+pub(crate) fn with_task<T>(
+    pid: u32,
+    body: impl FnOnce(task_t, &[(String, u64, u64)]) -> Result<T, String>,
+) -> Result<T, Error> {
+    let task = Task::attach(pid)?;
+    let images = remote_images(task.port);
+    let listed: Vec<(String, u64, u64)> = images
+        .iter()
+        .map(|image| (image.path.clone(), image.load, image.end))
+        .collect();
+    body(task.port, &listed).map_err(|message| Error::backend("native", message))
+}
+
+pub(crate) fn read_memory(task: task_t, addr: u64, buf: &mut [u8]) -> bool {
+    read_task(task, addr, buf)
 }
 
 fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {

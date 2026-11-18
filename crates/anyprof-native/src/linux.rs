@@ -27,6 +27,7 @@ use anyprof_core::{
 
 use crate::elf::{self, UserImage};
 use crate::go_sym::{self, GoImage, GoMachine};
+use crate::java::JavaVm;
 use crate::kallsyms::{self, Kallsym};
 use crate::maps::{self, MapSpan};
 use crate::perf_parse::{self, ParsedSample, X86_USER_REGS};
@@ -150,6 +151,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let images = load_images(target.pid);
     let go_images: Vec<GoImage> = images.iter().filter_map(|image| image.go.clone()).collect();
     let python = python::attach_linux(target.pid);
+    let java = crate::java::attach_linux(target.pid);
     let kernel_symbols = if opts.include_kernel {
         load_kallsyms()
     } else {
@@ -182,6 +184,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             opts.include_kernel,
             &go_images,
             &python,
+            &java,
             &mut counts,
         ));
         lost = lost.saturating_add(take_samples(
@@ -190,6 +193,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             opts.include_kernel,
             &go_images,
             &python,
+            &java,
             &mut counts,
         ));
         next += interval;
@@ -212,6 +216,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         opts.include_kernel,
         &go_images,
         &python,
+        &java,
         &mut counts,
     ));
     if lost > 0 {
@@ -468,6 +473,7 @@ fn refresh(
     include_kernel: bool,
     go_images: &[GoImage],
     python: &Option<PythonVm>,
+    java: &Option<JavaVm>,
     counts: &mut HashMap<CountedStack, u64>,
 ) -> u64 {
     let Ok(live) = list_threads(pid) else {
@@ -487,6 +493,7 @@ fn refresh(
             include_kernel,
             go_images,
             python,
+            java,
             counts,
         ));
     }
@@ -652,10 +659,19 @@ fn take_samples(
     include_kernel: bool,
     go_images: &[GoImage],
     python: &Option<PythonVm>,
+    java: &Option<JavaVm>,
     counts: &mut HashMap<CountedStack, u64>,
 ) -> u64 {
     let (samples, lost) = sampler.drain();
-    record_samples(samples, pid, include_kernel, go_images, python, counts);
+    record_samples(
+        samples,
+        pid,
+        include_kernel,
+        go_images,
+        python,
+        java,
+        counts,
+    );
     lost
 }
 
@@ -665,10 +681,19 @@ fn ingest_mapped(
     include_kernel: bool,
     go_images: &[GoImage],
     python: &Option<PythonVm>,
+    java: &Option<JavaVm>,
     counts: &mut HashMap<CountedStack, u64>,
 ) -> u64 {
     let (samples, lost) = drain_mapped(mapped);
-    record_samples(samples, pid, include_kernel, go_images, python, counts);
+    record_samples(
+        samples,
+        pid,
+        include_kernel,
+        go_images,
+        python,
+        java,
+        counts,
+    );
     lost
 }
 
@@ -678,13 +703,15 @@ fn record_samples(
     include_kernel: bool,
     go_images: &[GoImage],
     python: &Option<PythonVm>,
+    java: &Option<JavaVm>,
     counts: &mut HashMap<CountedStack, u64>,
 ) {
     for sample in samples {
         if sample.pid != pid && sample.pid != 0 {
             continue;
         }
-        let Some(key) = assemble_addresses(&sample, pid, include_kernel, go_images, python) else {
+        let Some(key) = assemble_addresses(&sample, pid, include_kernel, go_images, python, java)
+        else {
             continue;
         };
         if !key.recordable() {
@@ -704,6 +731,7 @@ fn assemble_addresses(
     include_kernel: bool,
     go_images: &[GoImage],
     python: &Option<PythonVm>,
+    java: &Option<JavaVm>,
 ) -> Option<CountedStack> {
     let (kernel_chain, user_chain) = perf_parse::split_callchain(&sample.callchain);
     let mut kernel = if include_kernel {
@@ -721,6 +749,19 @@ fn assemble_addresses(
         .filter(|&ip| walk::plausible_user_address(ip))
         .or_else(|| walk::plausible_user_address(sample.ip).then_some(sample.ip))
         .unwrap_or(0);
+    let fp = sample.user_fp.unwrap_or(0);
+    let sp = sample.user_sp.unwrap_or(0);
+    if let Some(vm) = java
+        && let Some(frames) = vm.frames(pc, sp, fp, &mut |addr, buf| {
+            crate::python::read_process(pid, addr, buf)
+        })
+    {
+        // The perf sample is historical. The method chain is the thread's
+        // current Java stack, read when the sample is consumed. A tight loop
+        // is still on that method. `None` is a leaf outside the code cache
+        // or a blob whose method cannot be read. Both keep the native walk.
+        return Some(CountedStack::Java { kernel, frames });
+    }
     if let Some(vm) = python
         && let Some(frames) = vm.frames(u64::from(sample.tid), pc, &mut |addr, buf| {
             python::read_process(pid, addr, buf)
@@ -733,8 +774,6 @@ fn assemble_addresses(
         // read. Both keep the native walk below, unlabeled as Python.
         return Some(CountedStack::Python { kernel, frames });
     }
-    let fp = sample.user_fp.unwrap_or(0);
-    let sp = sample.user_sp.unwrap_or(0);
     let stack = sample.stack.as_slice();
     // Go's pcsp walk uses the copied user stack. A leaf that is not a Go
     // function keeps the frame-pointer walk below.
@@ -818,6 +857,14 @@ fn finish_profile(
                     out.push(kernel_frame(kernel_symbols, addr, index == 0));
                 }
                 out.extend(python::python_profile_frames(&frames));
+                out
+            }
+            CountedStack::Java { kernel, frames } => {
+                let mut out = Vec::with_capacity(kernel.len() + frames.len());
+                for (index, addr) in kernel.into_iter().enumerate() {
+                    out.push(kernel_frame(kernel_symbols, addr, index == 0));
+                }
+                out.extend(crate::java::java_profile_frames(&frames));
                 out
             }
         };
@@ -1111,9 +1158,12 @@ mod tests {
     use crate::python::CountedStack;
 
     fn native_stack(sample: &ParsedSample, include_kernel: bool) -> (Vec<u64>, u16) {
-        match assemble_addresses(sample, sample.pid, include_kernel, &[], &None).expect("frames") {
+        match assemble_addresses(sample, sample.pid, include_kernel, &[], &None, &None)
+            .expect("frames")
+        {
             CountedStack::Addresses { frames, kernel_len } => (frames, kernel_len),
             CountedStack::Python { .. } => panic!("a synthetic sample is not Python"),
+            CountedStack::Java { .. } => panic!("a synthetic sample is not Java"),
         }
     }
 

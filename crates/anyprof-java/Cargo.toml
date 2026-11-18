@@ -1,0 +1,21 @@
+[package]
+name = "anyprof-java"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "HotSpot Java CPU sampling backend for anyprof. Method frames on the native sampler."
+
+[dependencies]
+anyprof-core.workspace = true
+anyprof-native.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyprof-export.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
