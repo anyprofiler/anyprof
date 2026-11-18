@@ -43,6 +43,10 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
       - uses: actions/setup-python@v5
+        id: py311
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-python@v5
         id: py312
         with:
           python-version: "3.12"
@@ -64,14 +68,58 @@ jobs:
           cargo check --workspace --locked --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-      - name: Allow per-process perf sampling
+      - name: Check CPython offsets against the installed headers
+        if: matrix.os == 'ubuntu-latest'
+        # The frame walk's constants are checked here, not by cargo test, so
+        # the MSRV job does not need a C compiler. anyprof does not change
+        # ptrace_scope; this step only reads headers.
+        env:
+          PY311: ${{ steps.py311.outputs.python-path }}
+          PY312: ${{ steps.py312.outputs.python-path }}
+          PY313: ${{ steps.py313.outputs.python-path }}
+        run: |
+          set -eu
+          check() {
+            inc=$("$1" -c "import sysconfig; print(sysconfig.get_path('include'))")
+            test -f "$inc/Python.h"
+            test -d "$inc/internal"
+            gcc -std=c11 -Wall -Werror -DPy_BUILD_CORE -I"$inc" -I"$inc/internal" \
+              -o /tmp/cpython-offsets crates/anyprof-native/tests/cpython_offsets.c
+            /tmp/cpython-offsets
+          }
+          check "$PY311"
+          check "$PY312"
+          check "$PY313"
+      - name: Refuse an unrelated Python read at ptrace_scope 1
+        if: matrix.os == 'ubuntu-latest'
+        # The image default is 1. This step forces that value if a runner
+        # image changes it, then requires the permission error. anyprof does
+        # not write the sysctl. The next step sets 0 so the suite can read
+        # frames of a process it did not start.
+        env:
+          ANYPROF_PYTHON_311: ${{ steps.py311.outputs.python-path }}
+          ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}
+          ANYPROF_REQUIRE_NATIVE: "1"
+        run: |
+          set -eu
+          scope=$(cat /proc/sys/kernel/yama/ptrace_scope)
+          if [ "$scope" != "1" ]; then
+            sudo sysctl kernel.yama.ptrace_scope=1
+          fi
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
+          cargo test -p anyprof-python --test live --locked -- --exact supported::unrelated_same_user_read_follows_ptrace_scope
+      - name: Allow per-process perf sampling and Python frame reads
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo sysctl kernel.perf_event_paranoid=1
           sudo sysctl kernel.kptr_restrict=0
-          # ptrace_scope stays at the image default. Scope 1 limits ptrace
-          # attach. perf_event_open does not use that check, so the live test
-          # samples an unrelated same-user process at the image's scope.
+          # process_vm_readv uses ptrace attach. Scope 1 lets a parent read
+          # its child and refuses the anyprof process, which is not the
+          # parent of an already-running target. perf_event_open does not use
+          # that check. This job sets scope 0 for the Python frame reads
+          # after the denial step above. anyprof itself does not change it.
+          sudo sysctl kernel.yama.ptrace_scope=0
           echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
           echo "kptr_restrict=$(cat /proc/sys/kernel/kptr_restrict)"
           echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo absent)"
@@ -85,10 +133,11 @@ jobs:
           # after the sysctl step. Windows samples them as the same user. A
           # skip is a failure. The MSRV job does not set this and does not
           # change sysctls. musl is cargo check only, above. Go fixtures use
-          # the toolchain from setup-go. Python fixtures use the two
+          # the toolchain from setup-go. Python fixtures use the three
           # setup-python interpreters. They run inside this job, so each
-          # Go version also samples 3.12 and 3.13.
+          # Go version also samples 3.11, 3.12, and 3.13.
           ANYPROF_REQUIRE_NATIVE: "1"
+          ANYPROF_PYTHON_311: ${{ steps.py311.outputs.python-path }}
           ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
           ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}
       - name: Upload viewer screenshots

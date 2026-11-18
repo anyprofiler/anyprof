@@ -61,10 +61,21 @@ fn python_record_is_not_implemented_on_this_platform() {
 fn record_auto_detects_a_busy_python_program() {
     #[cfg(not(target_os = "macos"))]
     let _lock = live_lock();
-    let python = match interpreter() {
-        Some(python) => python,
-        None => return,
-    };
+    let pythons = interpreters();
+    if pythons.is_empty() {
+        return;
+    }
+    for python in pythons {
+        record_one(&python);
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64"),
+))]
+fn record_one(python: &Path) {
     let dir = std::env::temp_dir().join(format!(
         "anyprof-python-cli-{}-{}",
         std::process::id(),
@@ -95,7 +106,7 @@ caller()
     .unwrap();
     let counter = dir.join("counter");
     std::fs::write(&counter, [0u8; 8]).unwrap();
-    let mut child = Command::new(&python)
+    let mut child = Command::new(python)
         .arg(&script)
         .arg(&counter)
         .stdin(Stdio::null())
@@ -136,10 +147,13 @@ caller()
     let stderr = String::from_utf8_lossy(&recorded.stderr);
     let stdout = String::from_utf8_lossy(&recorded.stdout);
     if !recorded.status.success() {
-        let denied = stderr.contains("perf_event_open")
-            || stderr.contains("task_for_pid")
-            || stderr.contains("a password is required")
-            || stderr.contains("not permitted");
+        // A refused frame read is the product error under test. It must not
+        // be reported as a skipped native profile.
+        let denied = !stderr.contains("process_vm_readv")
+            && (stderr.contains("perf_event_open")
+                || stderr.contains("task_for_pid")
+                || stderr.contains("a password is required")
+                || stderr.contains("not permitted"));
         if denied && std::env::var("ANYPROF_REQUIRE_NATIVE").ok().as_deref() != Some("1") {
             eprintln!("skipping CLI python sample:\n{stderr}");
             let _ = std::fs::remove_dir_all(&dir);
@@ -191,33 +205,68 @@ caller()
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64"),
 ))]
-fn interpreter() -> Option<std::path::PathBuf> {
-    for key in ["ANYPROF_PYTHON_312", "ANYPROF_PYTHON", "ANYPROF_PYTHON_313"] {
+fn interpreters() -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for key in [
+        "ANYPROF_PYTHON_311",
+        "ANYPROF_PYTHON_312",
+        "ANYPROF_PYTHON_313",
+        "ANYPROF_PYTHON",
+    ] {
         if let Ok(path) = std::env::var(key)
             && !path.is_empty()
         {
-            return Some(std::path::PathBuf::from(path));
-        }
-    }
-    for name in ["python3.12", "python3.13", "python3"] {
-        let Ok(output) = Command::new(name)
-            .args(["-c", "import sys; print(sys.executable)"])
-            .output()
-        else {
-            continue;
-        };
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(std::path::PathBuf::from(path));
+            let path = std::path::PathBuf::from(path);
+            if !found.contains(&path) {
+                found.push(path);
             }
         }
     }
-    if std::env::var("ANYPROF_REQUIRE_NATIVE").ok().as_deref() == Some("1") {
-        panic!("no CPython interpreter was found");
+    if found.is_empty() {
+        for name in ["python3.11", "python3.12", "python3.13", "python3"] {
+            let Ok(output) = Command::new(name)
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                continue;
+            }
+            let path = std::path::PathBuf::from(path);
+            if !found.contains(&path) {
+                found.push(path);
+            }
+        }
     }
-    eprintln!("skipping CLI python sample: no interpreter");
-    None
+    found.retain(|path| {
+        let Ok(output) = Command::new(path)
+            .args([
+                "-c",
+                "import sys; print(sys.version_info[0], sys.version_info[1])",
+            ])
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut parts = text.split_whitespace();
+        matches!(
+            (parts.next(), parts.next()),
+            (Some("3"), Some("11") | Some("12") | Some("13"))
+        )
+    });
+    if found.is_empty() {
+        if std::env::var("ANYPROF_REQUIRE_NATIVE").ok().as_deref() == Some("1") {
+            panic!("no CPython 3.11, 3.12, or 3.13 interpreter was found");
+        }
+        eprintln!("skipping CLI python sample: no interpreter");
+    }
+    found
 }
 
 #[cfg(any(

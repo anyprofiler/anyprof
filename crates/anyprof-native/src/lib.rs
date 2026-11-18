@@ -40,7 +40,7 @@ mod snapshot;
 mod symbol;
 mod walk;
 
-pub use python::pid_is_cpython;
+pub use python::{pid_is_cpython, prepare_python};
 pub use rust_image::file_is_rust;
 
 #[cfg(target_os = "macos")]

@@ -1,9 +1,12 @@
-//! Locates `_PyRuntime`, `Py_Version`, and `_PyEval_EvalFrameDefault` in a
-//! CPython image without attaching to the process.
+//! Locates `_PyRuntime` in a CPython image without attaching to the process.
 //!
-//! ELF dynamic symbols, Mach-O nlist entries, and PE exports are enough. A
-//! stripped interpreter that no longer exports `_PyRuntime` is not treated as
-//! CPython. PyPy does not export that symbol.
+//! `Py_Version` and `_PyEval_EvalFrameDefault` are recorded when they are
+//! exported. Detection does not require them: 3.10 exports `_PyRuntime` and
+//! does not export `Py_Version` or `_PyEval_EvalFrameDefault`. The frame walk
+//! then refuses that process instead of guessing a layout. ELF dynamic
+//! symbols, Mach-O nlist entries, and PE exports are enough. A stripped
+//! interpreter that no longer exports `_PyRuntime` is not treated as CPython.
+//! PyPy does not export that symbol.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -31,7 +34,8 @@ pub(crate) struct PythonImage {
     pub runtime: u64,
     pub runtime_file: u64,
     pub version: u64,
-    pub version_file: u64,
+    /// File offset of `Py_Version`. `None` when that symbol is not exported.
+    pub version_file: Option<u64>,
     pub eval: u64,
     /// Zero when the format does not record a trustworthy size.
     pub eval_size: u64,
@@ -56,7 +60,9 @@ pub(crate) fn exports(path: &Path) -> Option<PythonImage> {
     if le == 0xFEED_FACF || be == 0xCAFE_BABE {
         return macho_exports(&mut file);
     }
-    if le == 0x0000_5A4D {
+    // A DOS header is `MZ` (`4D 5A`), usually followed by `0x90`. The
+    // little-endian word is `0x00905A4D`, not `0x00005A4D`.
+    if magic[0] == b'M' && magic[1] == b'Z' {
         return pe_exports(&mut file);
     }
     None
@@ -250,13 +256,17 @@ fn elf_exports(file: &mut File) -> Option<PythonImage> {
         }
     }
     let (runtime, runtime_file) = runtime?;
-    let (version, version_file) = version?;
+    let (version, version_file) = match version {
+        Some((version, file)) => (version, Some(file)),
+        None => (0, None),
+    };
+    let eval = eval.unwrap_or(0);
     Some(PythonImage {
         runtime,
         runtime_file,
         version,
         version_file,
-        eval: eval?,
+        eval,
         eval_size,
         loads,
         text_vmaddr: 0,
@@ -433,10 +443,13 @@ fn macho_exports(file: &mut File) -> Option<PythonImage> {
     }
     values.sort_unstable();
     values.dedup();
-    let eval = eval?;
-    let eval_size = next_gap(&values, eval);
+    let eval_size = eval.map(|value| next_gap(&values, value)).unwrap_or(0);
+    let eval = eval.unwrap_or(0);
     let (runtime, runtime_file) = runtime?;
-    let (version, version_file) = version?;
+    let (version, version_file) = match version {
+        Some((version, file)) => (version, Some(file)),
+        None => (0, None),
+    };
     Some(PythonImage {
         runtime,
         runtime_file,
@@ -526,7 +539,8 @@ fn pe_exports(file: &mut File) -> Option<PythonImage> {
     if nnames == 0 || nnames > MAX_SYMBOLS {
         return None;
     }
-    let name_table = read_vec(file, pe_file_offset(&mapped, names)?, nnames as usize * 4)?;
+    let names_off = pe_file_offset(&mapped, names)?;
+    let name_table = read_vec(file, names_off, nnames as usize * 4)?;
     let ordinal_table = read_vec(
         file,
         pe_file_offset(&mapped, ordinals)?,
@@ -537,12 +551,21 @@ fn pe_exports(file: &mut File) -> Option<PythonImage> {
     let mut eval = None;
     let mut rvas = Vec::new();
     for index in 0..nnames as usize {
-        let name_rva =
-            u32::from_le_bytes(name_table[index * 4..index * 4 + 4].try_into().ok()?) as u64;
-        let ordinal = u16::from_le_bytes(ordinal_table[index * 2..index * 2 + 2].try_into().ok()?);
-        let func_off = pe_file_offset(&mapped, functions + u64::from(ordinal) * 4)?;
+        let Some(name_bytes) = name_table.get(index * 4..index * 4 + 4) else {
+            continue;
+        };
+        let Some(ordinal_bytes) = ordinal_table.get(index * 2..index * 2 + 2) else {
+            continue;
+        };
+        let name_rva = u32::from_le_bytes(name_bytes.try_into().unwrap()) as u64;
+        let ordinal = u16::from_le_bytes(ordinal_bytes.try_into().unwrap());
+        let Some(func_off) = pe_file_offset(&mapped, functions + u64::from(ordinal) * 4) else {
+            continue;
+        };
         let mut rva_buf = [0u8; 4];
-        read_at(file, func_off, &mut rva_buf)?;
+        if read_at(file, func_off, &mut rva_buf).is_none() {
+            continue;
+        }
         let rva = u32::from_le_bytes(rva_buf) as u64;
         if rva == 0 || (rva >= export_rva && rva < export_rva + export_size) {
             continue;
@@ -576,11 +599,15 @@ fn pe_exports(file: &mut File) -> Option<PythonImage> {
     }
     rvas.sort_unstable();
     rvas.dedup();
-    let eval = eval?;
-    let eval_rva = eval.saturating_sub(image_base);
-    let eval_size = next_gap(&rvas, eval_rva);
     let (runtime, runtime_file) = runtime?;
-    let (version, version_file) = version?;
+    let (version, version_file) = match version {
+        Some((version, file)) => (version, Some(file)),
+        None => (0, None),
+    };
+    let eval_size = eval
+        .map(|value| next_gap(&rvas, value.saturating_sub(image_base)))
+        .unwrap_or(0);
+    let eval = eval.unwrap_or(0);
     Some(PythonImage {
         runtime,
         runtime_file,
@@ -617,6 +644,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_embed_dll_exports_the_runtime() {
+        let path = Path::new("/tmp/py313embed/python313.dll");
+        if !path.is_file() {
+            return;
+        }
+        let image = exports(path).expect("python313.dll exports");
+        assert!(image.runtime > 0);
+        assert!(image.version > 0);
+        assert!(image.image_base > 0);
+        let mut file = File::open(path).unwrap();
+        let mut version = [0u8; 4];
+        read_at(
+            &mut file,
+            image.version_file.expect("Py_Version"),
+            &mut version,
+        )
+        .unwrap();
+        let hex = u32::from_le_bytes(version);
+        assert_eq!(hex >> 24, 3, "{hex:#x}");
+        assert_eq!((hex >> 16) & 0xff, 13, "{hex:#x}");
+        let mut cookie = [0u8; 8];
+        read_at(&mut file, image.runtime_file, &mut cookie).unwrap();
+        assert_eq!(&cookie, b"xdebugpy");
+    }
+
+    #[test]
     fn local_cpython_exports_the_runtime() {
         let path = Path::new("/usr/bin/python3.12");
         if !path.is_file() {
@@ -629,9 +682,90 @@ mod tests {
         assert!(image.eval_size > 1024, "eval size {}", image.eval_size);
         let mut file = File::open(path).unwrap();
         let mut version = [0u8; 4];
-        read_at(&mut file, image.version_file, &mut version).unwrap();
+        read_at(
+            &mut file,
+            image.version_file.expect("Py_Version"),
+            &mut version,
+        )
+        .unwrap();
         let hex = u32::from_le_bytes(version);
         assert_eq!(hex >> 24, 3, "{hex:#x}");
         assert_eq!((hex >> 16) & 0xff, 12, "{hex:#x}");
+    }
+
+    #[test]
+    fn a_real_mz_header_is_a_pe_image() {
+        let bytes = synthetic_pe(true);
+        let path = std::env::temp_dir().join(format!("anyprof-mz-{}.dll", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let image = exports(&path).expect("MZ image exports _PyRuntime");
+        assert_eq!(image.image_base, 0x1_8000_0000);
+        assert!(image.version_file.is_some());
+        assert!(image.eval > 0);
+        let mut file = File::open(&path).unwrap();
+        let mut version = [0u8; 4];
+        read_at(&mut file, image.version_file.unwrap(), &mut version).unwrap();
+        assert_eq!(u32::from_le_bytes(version), 0x030D_12F0);
+        let mut cookie = [0u8; 8];
+        read_at(&mut file, image.runtime_file, &mut cookie).unwrap();
+        assert_eq!(&cookie, b"xdebugpy");
+
+        std::fs::write(&path, synthetic_pe(false)).unwrap();
+        let image = exports(&path).expect("runtime alone is still CPython");
+        assert!(image.version_file.is_none());
+        assert_eq!(image.eval, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A tiny PE32+ whose DOS header is the usual `MZ` plus `0x90`, not a
+    /// zero-padded `MZ` word. `with_symbols` also exports `Py_Version` and
+    /// `_PyEval_EvalFrameDefault`.
+    fn synthetic_pe(with_symbols: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x400];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        bytes[2] = 0x90;
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+        let optional = 0x98;
+        bytes[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[optional + 24..optional + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
+        bytes[optional + 112..optional + 116].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[optional + 116..optional + 120].copy_from_slice(&40u32.to_le_bytes());
+        let section = 0x188;
+        bytes[section + 8..section + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[section + 12..section + 16].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[section + 16..section + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+
+        let names = if with_symbols { 3u32 } else { 1 };
+        bytes[0x200 + 24..0x200 + 28].copy_from_slice(&names.to_le_bytes());
+        bytes[0x200 + 28..0x200 + 32].copy_from_slice(&0x240u32.to_le_bytes());
+        bytes[0x200 + 32..0x200 + 36].copy_from_slice(&0x260u32.to_le_bytes());
+        bytes[0x200 + 36..0x200 + 40].copy_from_slice(&0x280u32.to_le_bytes());
+        let rvas = if with_symbols {
+            [0x310u32, 0x300, 0x320]
+        } else {
+            [0x310, 0, 0]
+        };
+        for (index, rva) in rvas.iter().enumerate() {
+            let at = 0x240 + index * 4;
+            bytes[at..at + 4].copy_from_slice(&rva.to_le_bytes());
+            let ordinal_at = 0x280 + index * 2;
+            bytes[ordinal_at..ordinal_at + 2].copy_from_slice(&(index as u16).to_le_bytes());
+        }
+        let labels: [&[u8]; 3] = [b"_PyRuntime", b"Py_Version", b"_PyEval_EvalFrameDefault"];
+        let mut cursor = 0x2A0usize;
+        for (index, label) in labels.iter().enumerate().take(names as usize) {
+            let name_at = 0x260 + index * 4;
+            bytes[name_at..name_at + 4].copy_from_slice(&(cursor as u32).to_le_bytes());
+            bytes[cursor..cursor + label.len()].copy_from_slice(label);
+            cursor += label.len() + 1;
+        }
+        bytes[0x300..0x304].copy_from_slice(&0x030D_12F0u32.to_le_bytes());
+        bytes[0x310..0x318].copy_from_slice(b"xdebugpy");
+        bytes
     }
 }

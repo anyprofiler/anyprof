@@ -4,9 +4,11 @@
 //! from a native unwind of `_PyEval_EvalFrameDefault`.
 //!
 //! `ANYPROF_REQUIRE_NATIVE=1` (set by CI on the sampling jobs) turns a skip
-//! into a failure. CI installs CPython 3.12 and 3.13 and passes them as
-//! `ANYPROF_PYTHON_312` and `ANYPROF_PYTHON_313`. The MSRV job does not set
-//! the variable.
+//! into a failure. CI installs CPython 3.11, 3.12, and 3.13 and passes them
+//! as `ANYPROF_PYTHON_311`, `ANYPROF_PYTHON_312`, and `ANYPROF_PYTHON_313`.
+//! On Linux, an unrelated same-user process is refused while
+//! `kernel.yama.ptrace_scope` is 1 and is sampled once that scope is 0.
+//! The MSRV job does not set the variable and does not install Python.
 
 #[cfg(any(
     target_os = "macos",
@@ -103,6 +105,159 @@ while True:
     fn both_spinning_threads_are_sampled() {
         let _lock = LiveLock::acquire();
         sample_threads();
+    }
+
+    /// A double-forked interpreter is not a descendant of this test.
+    /// `process_vm_readv` then follows `kernel.yama.ptrace_scope`: scope 1
+    /// refuses the read, and the python backend must say so instead of
+    /// recording native eval-loop frames. Scope 0 (or root) allows the read,
+    /// and the profile has to contain `[python] spin` and `[python] caller`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_same_user_read_follows_ptrace_scope() {
+        let _lock = LiveLock::acquire();
+        let pythons = interpreters();
+        if pythons.is_empty() {
+            return;
+        }
+        // No Yama file means the classic same-user rule: the read is allowed.
+        // Scope 1 or higher, for a non-root caller, refuses an unrelated target.
+        let scope = ptrace_scope();
+        let root = euid() == 0;
+        let refused = scope.is_some_and(|scope| scope >= 1) && !root;
+        for python in pythons {
+            let dir = fixture_dir("orphan");
+            let script = dir.join("spin.py");
+            std::fs::write(&script, BUSY).unwrap();
+            let counter = dir.join("counter");
+            std::fs::write(&counter, [0u8; 8]).unwrap();
+            let launcher = dir.join("orphan.py");
+            std::fs::write(
+                &launcher,
+                r#"
+import os, sys
+script, counter = sys.argv[1], sys.argv[2]
+if os.fork() > 0:
+    os._exit(0)
+sys.stdout.write(str(os.getpid()) + "\n")
+sys.stdout.flush()
+os.execv(sys.executable, [sys.executable, script, counter])
+"#,
+            )
+            .unwrap();
+            let mut child = Command::new(&python)
+                .arg(&launcher)
+                .arg(&script)
+                .arg(&counter)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap_or_else(|err| panic!("spawn {}: {err}", python.display()));
+            let launcher_pid = child.id();
+            let mut line = String::new();
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(child.stdout.take().expect("stdout")),
+                &mut line,
+            )
+            .expect("grandchild pid");
+            let _ = child.wait();
+            let pid: u32 = line
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("grandchild pid from {line:?}"));
+            if !wait_for_counter(&counter) {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            let mut parent = ppid(pid);
+            for _ in 0..50 {
+                if parent != Some(std::process::id()) && parent != Some(launcher_pid) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                parent = ppid(pid);
+            }
+            assert_ne!(
+                parent,
+                Some(std::process::id()),
+                "the double-fork was reparented to this test ({parent:?})"
+            );
+            assert_ne!(
+                parent,
+                Some(launcher_pid),
+                "the launcher is still the parent ({parent:?})"
+            );
+            let started = PythonBackend.start(
+                &anyprof_core::Target { pid },
+                &anyprof_core::RecordOptions {
+                    duration: Some(Duration::from_secs(1)),
+                    sampling_interval: Some(Duration::from_millis(10)),
+                    ..anyprof_core::RecordOptions::default()
+                },
+            );
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            if refused {
+                let message = match started {
+                    Err(err) => err.to_string(),
+                    Ok(_) => panic!(
+                        "ptrace_scope {scope:?} must refuse process_vm_readv of unrelated {} and must not record native frames",
+                        python.display()
+                    ),
+                };
+                assert!(message.starts_with("python:"), "{message}");
+                assert!(message.contains("process_vm_readv"), "{message}");
+                assert!(message.contains("ptrace_scope"), "{message}");
+                assert!(
+                    message.contains("perf_event_open"),
+                    "the error must say perf permission is not enough: {message}"
+                );
+                assert!(message.contains(&format!("pid {pid}")), "{message}");
+                assert!(
+                    message.contains("anyprof does not change this sysctl"),
+                    "{message}"
+                );
+            } else {
+                let session = match started {
+                    Ok(session) => session,
+                    Err(err) => panic!(
+                        "ptrace_scope {scope:?} should read {} (root {root}): {err}",
+                        python.display()
+                    ),
+                };
+                let profile = session.stop().expect("stop");
+                assert_spin_profile(&profile, pid, &script, &python);
+                assert_exports(&profile);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ptrace_scope() -> Option<i32> {
+        let text = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok()?;
+        text.trim().parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn euid() -> u32 {
+        let text = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        text.lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix("Uid:")?;
+                rest.split_whitespace().nth(1)?.parse().ok()
+            })
+            .unwrap_or(0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ppid(pid: u32) -> Option<u32> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        text.lines().find_map(|line| {
+            let rest = line.strip_prefix("PPid:")?;
+            rest.trim().parse().ok()
+        })
     }
 
     fn sample_busy() {
@@ -402,10 +557,11 @@ while True:
             Ok(session) => Some(session),
             Err(err) => {
                 let message = err.to_string();
-                let denied = message.contains("perf_event_open")
-                    || message.contains("task_for_pid")
-                    || message.contains("not permitted")
-                    || message.contains("Operation not permitted");
+                let denied = !message.contains("process_vm_readv")
+                    && (message.contains("perf_event_open")
+                        || message.contains("task_for_pid")
+                        || message.contains("not permitted")
+                        || message.contains("Operation not permitted"));
                 if denied && !required() {
                     eprintln!("skipping live python sample: {message}");
                     return None;
@@ -417,7 +573,12 @@ while True:
 
     fn interpreters() -> Vec<PathBuf> {
         let mut found = Vec::new();
-        for key in ["ANYPROF_PYTHON_312", "ANYPROF_PYTHON_313", "ANYPROF_PYTHON"] {
+        for key in [
+            "ANYPROF_PYTHON_311",
+            "ANYPROF_PYTHON_312",
+            "ANYPROF_PYTHON_313",
+            "ANYPROF_PYTHON",
+        ] {
             if let Ok(path) = std::env::var(key)
                 && !path.is_empty()
             {
@@ -536,7 +697,12 @@ while True:
         let exe = std::env::current_exe().expect("test executable");
         let mut command = Command::new("sudo");
         command.args(["-n", "env", "ANYPROF_PYTHON_WORKER=1"]);
-        for key in ["ANYPROF_PYTHON_312", "ANYPROF_PYTHON_313", "ANYPROF_PYTHON"] {
+        for key in [
+            "ANYPROF_PYTHON_311",
+            "ANYPROF_PYTHON_312",
+            "ANYPROF_PYTHON_313",
+            "ANYPROF_PYTHON",
+        ] {
             if let Ok(value) = std::env::var(key)
                 && !value.is_empty()
             {

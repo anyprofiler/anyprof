@@ -15,17 +15,21 @@
 //! two pure-Python threads show up as the GIL switches. Parked threads are
 //! not walked.
 //!
-//! Layouts: 3.11 and 3.12 use offsets measured from those headers. 3.13 and
-//! a later build whose `_PyRuntime` starts with the `xdebugpy` cookie use
-//! `_Py_DebugOffsets` from the file, so Windows and Unix do not need
-//! separate constants. The cookie's field order is the 3.13 one; a later
-//! minor version that inserts fields fails the size check and the
-//! sample stays on the native walk. 3.10 and older are detected and not
-//! walked. 32-bit images are not walked.
+//! Layouts that are walked: the default GIL builds of 3.11, 3.12, and 3.13.
+//! 3.11 and 3.12 use offsets checked against those headers (`current_frame`
+//! is 8 in 3.11 because `_PyCFrame` starts with `use_tracing`, and compact
+//! ASCII data starts at 48 because `PyASCIIObject` still has `wstr`). 3.13
+//! reads `_Py_DebugOffsets` from the file when `free_threaded` is 0. Any
+//! other version, a free-threaded build, or a table that does not match
+//! that 3.13 layout is not walked. Selecting the python backend then fails
+//! instead of recording native interpreter frames under that name. On Linux
+//! the frame read is `process_vm_readv`, which needs ptrace attach
+//! permission; a denied read is the same kind of error. 32-bit images are
+//! not walked.
 
 use std::path::{Path, PathBuf};
 
-use anyprof_core::{Frame, Runtime};
+use anyprof_core::{Error, Frame, Runtime};
 
 use crate::python_sym::{self, PythonImage};
 
@@ -65,6 +69,7 @@ pub(crate) struct PyName {
 }
 
 /// Offsets into the running interpreter. Pointer fields are byte offsets.
+#[derive(Debug)]
 struct Offsets {
     interpreters_head: u64,
     interp_next: u64,
@@ -84,7 +89,11 @@ struct Offsets {
     code_adaptive: u64,
     str_state: u64,
     str_length: u64,
+    /// Compact ASCII data. 48 on 3.11 (`wstr` is still in `PyASCIIObject`),
+    /// 40 on 3.12 and 3.13.
     str_ascii: u64,
+    /// Compact non-ASCII data. 72 on 3.11, 56 on 3.12 and 3.13.
+    str_compact: u64,
     bytes_size: u64,
     bytes_data: u64,
 }
@@ -420,8 +429,7 @@ fn read_unicode(
     let (width, data_off) = if ascii && kind == 1 {
         (1usize, offsets.str_ascii)
     } else if kind == 1 || kind == 2 || kind == 4 {
-        // Compact non-ASCII stores the data after `utf8_length` and `utf8`.
-        (usize::from(kind), offsets.str_ascii.saturating_add(16))
+        (usize::from(kind), offsets.str_compact)
     } else {
         return None;
     };
@@ -483,6 +491,7 @@ fn fixed_312() -> Offsets {
         str_state: 32,
         str_length: 16,
         str_ascii: 40,
+        str_compact: 56,
         bytes_size: 16,
         bytes_data: 32,
     }
@@ -495,7 +504,9 @@ fn fixed_311() -> Offsets {
         threads_head: 16,
         tstate_next: 8,
         cframe: Some(56),
-        current_frame: 0,
+        // `_PyCFrame.use_tracing` is a byte, so the pointer is at 8.
+        current_frame: 8,
+        // `unsigned long` is 4 bytes on Windows, so this field is 4 earlier.
         native_thread_id: if cfg!(windows) { 156 } else { 160 },
         frame_code: 32,
         frame_previous: 48,
@@ -507,30 +518,76 @@ fn fixed_311() -> Offsets {
         code_adaptive: 184,
         str_state: 32,
         str_length: 16,
-        str_ascii: 40,
+        // `PyASCIIObject.wstr` puts compact ASCII data at 48. Compact
+        // non-ASCII data follows `wstr_length`, at 72.
+        str_ascii: 48,
+        str_compact: 72,
         bytes_size: 16,
         bytes_data: 32,
     }
 }
 
-fn layout_for(path: &Path, image: &PythonImage) -> Option<Offsets> {
-    let mut cookie = [0u8; 8];
-    if read_file(path, image.runtime_file, &mut cookie).is_some() && &cookie == b"xdebugpy" {
-        return debug_offsets(path, image.runtime_file);
+fn layout_for(path: &Path, image: &PythonImage) -> Result<Offsets, String> {
+    let Some((major, minor, micro)) = read_version(path, image) else {
+        return Err(
+            "CPython was detected from `_PyRuntime`, but `Py_Version` is not exported. The default GIL builds of 3.11, 3.12, and 3.13 export that symbol. This process was not walked"
+                .to_string(),
+        );
+    };
+    let label = format!("{major}.{minor}.{micro}");
+    if major != 3 || !matches!(minor, 11..=13) {
+        return Err(format!(
+            "CPython {label} was detected and is not walked. Supported builds are the default GIL layouts of 3.11, 3.12, and 3.13"
+        ));
     }
+    let cookie = runtime_cookie(path, image);
+    if matches!(minor, 11 | 12) {
+        if cookie {
+            return Err(format!(
+                "CPython {label} was detected, but `_PyRuntime` starts with the 3.13 `xdebugpy` cookie. That build is not walked"
+            ));
+        }
+        return Ok(if minor == 11 {
+            fixed_311()
+        } else {
+            fixed_312()
+        });
+    }
+    if !cookie {
+        return Err(format!(
+            "CPython {label} was detected, but `_PyRuntime` has no `xdebugpy` layout table. This build is not walked"
+        ));
+    }
+    let free = image
+        .runtime_file
+        .checked_add(16)
+        .and_then(|offset| read_file_u64(path, offset))
+        .unwrap_or(u64::MAX);
+    if free != 0 {
+        return Err(format!(
+            "CPython {label} free-threaded build was detected and is not walked. Supported builds are the default GIL layouts of 3.11, 3.12, and 3.13"
+        ));
+    }
+    debug_offsets(path, image.runtime_file).ok_or_else(|| {
+        format!(
+            "CPython {label} was detected, but its `_Py_DebugOffsets` table is not a supported GIL layout. This build was not walked"
+        )
+    })
+}
+
+fn read_version(path: &Path, image: &PythonImage) -> Option<(u32, u32, u32)> {
     let mut version = [0u8; 4];
-    read_file(path, image.version_file, &mut version)?;
+    read_file(path, image.version_file?, &mut version)?;
     let hex = u32::from_le_bytes(version);
     let major = hex >> 24;
     let minor = (hex >> 16) & 0xff;
-    if major != 3 {
-        return None;
-    }
-    match minor {
-        11 => Some(fixed_311()),
-        12 => Some(fixed_312()),
-        _ => None,
-    }
+    let micro = (hex >> 8) & 0xff;
+    (major > 0).then_some((major, minor, micro))
+}
+
+fn runtime_cookie(path: &Path, image: &PythonImage) -> bool {
+    let mut cookie = [0u8; 8];
+    read_file(path, image.runtime_file, &mut cookie).is_some() && &cookie == b"xdebugpy"
 }
 
 fn debug_offsets(path: &Path, runtime_file: u64) -> Option<Offsets> {
@@ -575,6 +632,8 @@ fn debug_offsets(path: &Path, runtime_file: u64) -> Option<Offsets> {
     let str_state = at(544)?;
     let str_length = at(552)?;
     let str_ascii = at(560)?;
+    // 3.13 compact non-ASCII data follows `utf8_length` and `utf8`.
+    let str_compact = str_ascii.checked_add(16)?;
     let inside = [
         (interpreters_head, runtime_size),
         (interp_next, interp_size),
@@ -643,6 +702,7 @@ fn debug_offsets(path: &Path, runtime_file: u64) -> Option<Offsets> {
         str_state,
         str_length,
         str_ascii,
+        str_compact,
         bytes_size,
         bytes_data,
     })
@@ -668,7 +728,7 @@ fn read_file_u64(path: &Path, offset: u64) -> Option<u64> {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn open_elf(path: &Path, spans: &[crate::maps::MapSpan]) -> Option<PythonVm> {
     let image = python_sym::exports(path)?;
-    let offsets = layout_for(path, &image)?;
+    let offsets = layout_for(path, &image).ok()?;
     let anchor = spans
         .iter()
         .find(|span| span.executable)
@@ -693,7 +753,7 @@ fn open_slid(path: &Path, slide: u64, start: u64, end: u64) -> Option<PythonVm> 
         return None;
     }
     let image = python_sym::exports(path)?;
-    let offsets = layout_for(path, &image)?;
+    let offsets = layout_for(path, &image).ok()?;
     Some(PythonVm {
         runtime: image.runtime.wrapping_add(slide),
         image_start: start,
@@ -706,6 +766,118 @@ fn mentions_python(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let lower = name.to_ascii_lowercase();
     lower.contains("python") || lower.contains("libpython")
+}
+
+/// Why a process is or is not a walked CPython.
+enum Support {
+    Absent,
+    Supported,
+    Rejected(String),
+}
+
+/// Refuses a python-backend profile that would not contain Python frames.
+///
+/// Detection only looks for `_PyRuntime`. This then requires one of the
+/// walked layouts: the default GIL builds of 3.11, 3.12, and 3.13. Anything
+/// else, including an older CPython, 3.14, and a free-threaded 3.13, is an
+/// error. On Linux x86_64 a supported process is also probed with
+/// `process_vm_readv`. `EPERM` and `EACCES` are errors that name the errno
+/// and `kernel.yama.ptrace_scope`. anyprof does not change that sysctl.
+/// Either failure returns before a native interpreter stack can be recorded
+/// under the python backend.
+pub fn prepare_python(pid: u32) -> Result<(), Error> {
+    if pid == 0 {
+        return Ok(());
+    }
+    match cpython_support(pid) {
+        Support::Absent => Ok(()),
+        Support::Rejected(message) => Err(Error::backend("python", message)),
+        Support::Supported => {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                let Some(vm) = attach_linux(pid) else {
+                    return Err(Error::backend(
+                        "python",
+                        "CPython was detected but its load address could not be resolved, so the frame chain was not read",
+                    ));
+                };
+                probe_runtime(pid, vm.runtime)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cpython_support(pid: u32) -> Support {
+    #[cfg(target_os = "linux")]
+    {
+        classify_paths(&candidate_paths(pid))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        classify_paths(&macos_candidates(pid))
+    }
+    #[cfg(windows)]
+    {
+        classify_paths(&windows_candidates(pid))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        Support::Absent
+    }
+}
+
+fn classify_paths(paths: &[PathBuf]) -> Support {
+    let mut rejected = None;
+    for path in paths {
+        let Some(image) = python_sym::exports(path) else {
+            continue;
+        };
+        match layout_for(path, &image) {
+            Ok(_) => return Support::Supported,
+            Err(message) => {
+                if rejected.is_none() {
+                    rejected = Some(message);
+                }
+            }
+        }
+    }
+    match rejected {
+        Some(message) => Support::Rejected(message),
+        None => Support::Absent,
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn probe_runtime(pid: u32, runtime: u64) -> Result<(), Error> {
+    let mut buf = [0u8; 8];
+    match read_process_errno(pid, runtime, &mut buf) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(Error::backend("python", read_denied_message(pid, err))),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_denied_message(pid: u32, err: i32) -> String {
+    let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let scope = match scope {
+        Some(value) => format!("kernel.yama.ptrace_scope is {value}"),
+        None => "kernel.yama.ptrace_scope could not be read".to_string(),
+    };
+    let os = std::io::Error::from_raw_os_error(err);
+    if err == libc::EPERM || err == libc::EACCES {
+        format!(
+            "cannot read the frame chain of pid {pid}: process_vm_readv failed with errno {err} ({os}). {scope}. Reading a CPython frame uses ptrace attach permission. perf_event_open permission is not enough. An ancestor of the target, root, or scope 0 can read it. anyprof does not change this sysctl"
+        )
+    } else {
+        format!(
+            "cannot read the frame chain of pid {pid}: process_vm_readv of _PyRuntime failed with errno {err} ({os}). {scope}. The profile was not recorded"
+        )
+    }
 }
 
 /// True when the process image exports `_PyRuntime`. This does not attach.
@@ -796,11 +968,19 @@ pub(crate) fn attach_linux(pid: u32) -> Option<PythonVm> {
     None
 }
 
-/// Copies `buf` from another process. Same-user, no ptrace.
+/// Copies `buf` from another process. The kernel checks ptrace attach
+/// permission (`PTRACE_MODE_ATTACH_REALCREDS`), not the perf read check.
+/// `kernel.yama.ptrace_scope` of 1 therefore allows a parent and refuses an
+/// unrelated same-user process. A short or failed read returns false.
 #[cfg(target_os = "linux")]
 pub(crate) fn read_process(pid: u32, addr: u64, buf: &mut [u8]) -> bool {
+    read_process_errno(pid, addr, buf).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_errno(pid: u32, addr: u64, buf: &mut [u8]) -> Result<(), i32> {
     if buf.is_empty() || addr < 0x1000 {
-        return false;
+        return Err(libc::EFAULT);
     }
     let local = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
@@ -811,9 +991,15 @@ pub(crate) fn read_process(pid: u32, addr: u64, buf: &mut [u8]) -> bool {
         iov_len: buf.len(),
     };
     // SAFETY: both iovecs describe this call's buffers. `process_vm_readv`
-    // only reads the remote process. A short or failed read returns false.
+    // only reads the remote process.
     let copied = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
-    copied == buf.len() as isize
+    if copied == buf.len() as isize {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
+    }
 }
 
 /// `(path, header address, end address)` from the dyld image list.
@@ -835,16 +1021,24 @@ pub(crate) fn attach_mach(images: &[(String, u64, u64)]) -> Option<PythonVm> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_exports(pid: u32) -> bool {
+fn macos_candidates(pid: u32) -> Vec<PathBuf> {
     let Some(path) = macos_exe(pid) else {
-        return false;
+        return Vec::new();
     };
-    if python_sym::exports(&path).is_some() {
-        return true;
+    let mut out = vec![path.clone()];
+    for library in python_sym::linked_python_libraries(&path) {
+        if !out.contains(&library) {
+            out.push(library);
+        }
     }
-    python_sym::linked_python_libraries(&path)
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn macos_exports(pid: u32) -> bool {
+    macos_candidates(pid)
         .iter()
-        .any(|library| python_sym::exports(library).is_some())
+        .any(|path| python_sym::exports(path).is_some())
 }
 
 #[cfg(target_os = "macos")]
@@ -852,7 +1046,7 @@ fn macos_exe(pid: u32) -> Option<PathBuf> {
     const MAX: u32 = 4 * 1024;
     let mut buf = vec![0u8; MAX as usize];
     let pid = i32::try_from(pid).ok()?;
-    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr(), MAX) };
+    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), MAX) };
     if n <= 0 {
         return None;
     }
@@ -864,7 +1058,7 @@ fn macos_exe(pid: u32) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
-    fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_char, buffersize: u32) -> i32;
 }
 
 #[cfg(windows)]
@@ -937,7 +1131,7 @@ pub(crate) fn attach_process(process: windows_sys::Win32::Foundation::HANDLE) ->
 }
 
 #[cfg(windows)]
-fn windows_exports(pid: u32) -> bool {
+fn windows_candidates(pid: u32) -> Vec<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
@@ -946,36 +1140,42 @@ fn windows_exports(pid: u32) -> bool {
 
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
-        return false;
+        return Vec::new();
     }
     let mut buf = vec![0u16; 32 * 1024];
     let mut len = buf.len() as u32;
     let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
     unsafe { CloseHandle(handle) };
     if ok == 0 || len == 0 {
-        return false;
+        return Vec::new();
     }
     let path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
-    if python_sym::exports(&path).is_some() {
-        return true;
-    }
+    let mut out = vec![path.clone()];
     let Some(dir) = path.parent() else {
-        return false;
+        return out;
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+        return out;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let text = name.to_string_lossy();
+        let text = entry.file_name();
+        let text = text.to_string_lossy();
         if !mentions_python(&text) {
             continue;
         }
-        if python_sym::exports(&entry.path()).is_some() {
-            return true;
+        let path = entry.path();
+        if !out.contains(&path) {
+            out.push(path);
         }
     }
-    false
+    out
+}
+
+#[cfg(windows)]
+fn windows_exports(pid: u32) -> bool {
+    windows_candidates(pid)
+        .iter()
+        .any(|path| python_sym::exports(path).is_some())
 }
 
 #[cfg(test)]
@@ -1033,13 +1233,17 @@ mod tests {
         put(&mut bytes, 544, 32);
         put(&mut bytes, 552, 16);
         put(&mut bytes, 560, 40);
-        let path = std::env::temp_dir().join("anyprof-py313-offsets.bin");
+        // 3.13.18 final. The version sits past the debug table.
+        let version_at = bytes.len();
+        bytes.extend_from_slice(&0x030D_12F0u32.to_le_bytes());
+        let path =
+            std::env::temp_dir().join(format!("anyprof-py313-offsets-{}", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let image = PythonImage {
             runtime: 0,
             runtime_file: 0,
             version: 0,
-            version_file: 0,
+            version_file: Some(version_at as u64),
             eval: 0,
             eval_size: 0,
             loads: Vec::new(),
@@ -1050,11 +1254,99 @@ mod tests {
         assert_eq!(offsets.interpreters_head, 632);
         assert_eq!(offsets.interp_next, 7_264);
         assert_eq!(offsets.frame_code, 0);
+        assert_eq!(offsets.str_ascii, 40);
+        assert_eq!(offsets.str_compact, 56);
         assert!(offsets.cframe.is_none());
         bytes[40] = 0xff;
         std::fs::write(&path, &bytes).unwrap();
-        assert!(layout_for(&path, &image).is_none());
+        let err = layout_for(&path, &image).expect_err("a corrupt table is not walked");
+        assert!(err.contains("not a supported GIL layout"), "{err}");
+
+        // The same table with a 3.14 version must be rejected even though
+        // every 3.13 slot is still in range. The version is the gate.
+        let mut later = bytes.clone();
+        later[40] = 0x78;
+        let version_at = 568;
+        later[version_at..version_at + 4].copy_from_slice(&0x030E_00F0u32.to_le_bytes());
+        std::fs::write(&path, &later).unwrap();
+        let err = layout_for(&path, &image).expect_err("3.14 is not walked");
+        assert!(err.contains("3.14.0"), "{err}");
+        assert!(err.contains("not walked"), "{err}");
+
+        // A free-threaded 3.13 keeps the cookie and the version. The flag
+        // at offset 16 is what rejects it.
+        let mut threaded = bytes.clone();
+        threaded[40] = 0x78;
+        threaded[version_at..version_at + 4].copy_from_slice(&0x030D_12F0u32.to_le_bytes());
+        threaded[16..24].copy_from_slice(&1u64.to_le_bytes());
+        std::fs::write(&path, &threaded).unwrap();
+        let err = layout_for(&path, &image).expect_err("free-threaded is not walked");
+        assert!(err.contains("free-threaded"), "{err}");
+        assert!(err.contains("not walked"), "{err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fixed_layouts_match_the_header_offsets() {
+        let dir = std::env::temp_dir().join(format!("anyprof-py-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image");
+        // Version word, then eight bytes that are not the 3.13 cookie.
+        let mut bytes = 0x030B_12F0u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut image = PythonImage {
+            runtime: 0,
+            runtime_file: 4,
+            version: 0,
+            version_file: Some(0),
+            eval: 0,
+            eval_size: 0,
+            loads: Vec::new(),
+            text_vmaddr: 0,
+            image_base: 0,
+        };
+        let offsets = layout_for(&path, &image).expect("3.11");
+        assert_eq!(offsets.current_frame, 8);
+        assert_eq!(offsets.cframe, Some(56));
+        assert_eq!(offsets.str_ascii, 48);
+        assert_eq!(offsets.str_compact, 72);
+        assert_eq!(offsets.frame_code, 32);
+        bytes[..4].copy_from_slice(&0x030C_10F0u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let offsets = layout_for(&path, &image).expect("3.12");
+        assert_eq!(offsets.current_frame, 0);
+        assert_eq!(offsets.str_ascii, 40);
+        assert_eq!(offsets.str_compact, 56);
+        image.version_file = None;
+        let err = layout_for(&path, &image).expect_err("no Py_Version");
+        assert!(err.contains("Py_Version"), "{err}");
+        assert!(err.contains("not walked"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_cross_user_read_names_process_vm_readv() {
+        // pid 1 belongs to another user. The credential check fails before a
+        // frame can be invented. Yama may be absent in this kernel; the
+        // cross-user denial is the same errno the scope-1 same-user denial uses.
+        let mut buf = [0u8; 8];
+        let err = read_process_errno(1, 0x10000, &mut buf).expect_err("pid 1 is not readable");
+        assert!(
+            err == libc::EPERM || err == libc::EACCES,
+            "expected a permission errno, got {err}"
+        );
+        let message = read_denied_message(1, err);
+        assert!(message.contains("process_vm_readv"), "{message}");
+        assert!(message.contains("ptrace_scope"), "{message}");
+        assert!(message.contains("perf_event_open"), "{message}");
+        assert!(message.contains("pid 1"), "{message}");
+        assert!(
+            message.contains("anyprof does not change this sysctl"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -13,6 +13,15 @@
 //! bytecode at a time; two spinning threads both appear as the lock
 //! switches. This is not a snapshot of every thread.
 //!
+//! The walked layouts are the default GIL builds of CPython 3.11, 3.12, and
+//! 3.13. An older interpreter, 3.14 or later, and a free-threaded build are
+//! detected from `_PyRuntime` and then refused: `start` returns an error
+//! instead of a native profile of the eval loop. On Linux the frame read is
+//! `process_vm_readv`, which needs ptrace attach permission. `perf_event_open`
+//! permission is not enough when `kernel.yama.ptrace_scope` is 1 and the
+//! target is not a descendant. That refusal names the errno and the current
+//! scope. anyprof does not change the sysctl.
+//!
 //! Other architectures compile. [`PythonBackend::start`] returns not
 //! implemented there, with the same platform split as the native sampler.
 
@@ -77,6 +86,10 @@ impl Backend for PythonBackend {
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
+        // An unsupported build, or a Linux read the kernel refuses, stops
+        // here. The native sampler is not asked to record interpreter frames
+        // under this backend's name.
+        anyprof_native::prepare_python(target.pid)?;
         NativeBackend.start(target, opts).map_err(retarget)
     }
 }
