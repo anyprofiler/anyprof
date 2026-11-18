@@ -7,13 +7,17 @@ use std::time::Duration;
 /// use their own variants so exporters can keep them distinct from language frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Runtime {
-    /// C, C++, Rust, or other native user-space code.
+    /// C, C++, or other native user-space code that is not a recognized
+    /// language runtime. Rust frames use [`Self::Rust`].
     #[default]
     Native,
     /// Kernel frame.
     Kernel,
     /// Go.
     Go,
+    /// Rust. Demangled Rust symbols use this even when the sample also
+    /// contains C or C++ frames from the same process.
+    Rust,
     /// Node.js / V8.
     Node,
     /// JavaScript in a browser page (Chrome, Chromium, or Edge).
@@ -34,10 +38,11 @@ pub enum Runtime {
 
 impl Runtime {
     /// Every variant, in a stable order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Native,
         Self::Kernel,
         Self::Go,
+        Self::Rust,
         Self::Node,
         Self::Browser,
         Self::Python,
@@ -55,6 +60,7 @@ impl Runtime {
             Self::Native => "native",
             Self::Kernel => "kernel",
             Self::Go => "go",
+            Self::Rust => "rust",
             Self::Node => "node",
             Self::Browser => "browser",
             Self::Python => "python",

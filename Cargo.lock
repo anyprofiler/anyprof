@@ -106,6 +106,7 @@ dependencies = [
  "anyprof-go",
  "anyprof-native",
  "anyprof-node",
+ "anyprof-rust",
  "anyprof-web",
  "axoupdater",
  "clap",
@@ -156,6 +157,7 @@ dependencies = [
  "cpp_demangle",
  "libc",
  "mach2",
+ "rustc-demangle",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -169,6 +171,17 @@ dependencies = [
  "anyprof-export",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "anyprof-rust"
+version = "0.1.5"
+dependencies = [
+ "anyprof-core",
+ "anyprof-export",
+ "anyprof-native",
+ "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1614,6 +1627,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
 name = "rustc-hash"

@@ -3,7 +3,7 @@
 //! The Linux sampler reads `/proc/<pid>/maps` for each file's load address,
 //! then reads that file's symbol table. Function names come from `SHT_SYMTAB`
 //! (the symbols `nm` prints), falling back to `SHT_DYNSYM` when the binary is
-//! stripped. Itanium C++ names are demangled. DWARF is not required.
+//! stripped. Itanium C++ names and Rust names are demangled. DWARF is not required.
 //!
 //! A table above 2,000,000 symbols or a string table above 64 MiB is rejected.
 //! The caller still keeps the mapping's address range, so the frame names the
@@ -17,7 +17,10 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use anyprof_core::Runtime;
+
 use crate::policy::symbol_lookup_address;
+use crate::symbol::{self, frame_runtime};
 
 /// How far past a symbol an instruction can sit and still belong to it.
 const MAX_SYMBOL_SPAN: u64 = 16 * 1024 * 1024;
@@ -56,8 +59,10 @@ pub(crate) struct ElfFunc {
     pub vaddr: u64,
     /// `st_size`. Zero means "until the next symbol".
     pub size: u64,
-    /// Demangled name when the symbol is Itanium C++; otherwise the raw name.
+    /// Demangled name when the symbol is Itanium C++ or Rust; otherwise the raw name.
     pub name: String,
+    /// [`Runtime::Rust`] when `name` was Rust-mangled.
+    pub runtime: Runtime,
 }
 
 /// Symbol table and load segments of one ELF file.
@@ -80,8 +85,11 @@ pub(crate) struct UserImage {
     pub end: u64,
     /// File name (`busy`, `libc.so.6`, ...).
     pub module: String,
-    /// `(runtime address, size, name)`, sorted by address.
-    symbols: Vec<(u64, u64, String)>,
+    /// The file contains a Rust image marker. Demangled `::` paths in it are
+    /// Rust frames when the mangled name is no longer available.
+    pub(crate) rust_image: bool,
+    /// `(runtime address, size, name, symbol runtime)`, sorted by address.
+    symbols: Vec<(u64, u64, String, Runtime)>,
 }
 
 impl UserImage {
@@ -91,6 +99,7 @@ impl UserImage {
             start,
             end,
             module,
+            rust_image: false,
             symbols: Vec::new(),
         }
     }
@@ -102,14 +111,20 @@ impl UserImage {
             if func.name.is_empty() || func.vaddr == 0 {
                 continue;
             }
-            symbols.push((func.vaddr.wrapping_add(bias), func.size, func.name.clone()));
+            symbols.push((
+                func.vaddr.wrapping_add(bias),
+                func.size,
+                func.name.clone(),
+                func.runtime,
+            ));
         }
-        symbols.sort_by_key(|(addr, _, _)| *addr);
+        symbols.sort_by_key(|(addr, _, _, _)| *addr);
         symbols.dedup_by(|right, left| right.0 == left.0 && right.2 == left.2);
         Self {
             start,
             end,
             module,
+            rust_image: false,
             symbols,
         }
     }
@@ -119,14 +134,16 @@ impl UserImage {
         addr >= self.start && addr < self.end
     }
 
-    /// Function name for `addr`, when a symbol covers it.
-    pub(crate) fn name_at(&self, addr: u64) -> Option<&str> {
-        let idx = self.symbols.partition_point(|(start, _, _)| *start <= addr);
-        let (start, size, name) = self.symbols.get(idx.checked_sub(1)?)?;
+    /// Function name and symbol runtime for `addr`, when a symbol covers it.
+    pub(crate) fn name_at(&self, addr: u64) -> Option<(&str, Runtime)> {
+        let idx = self
+            .symbols
+            .partition_point(|(start, _, _, _)| *start <= addr);
+        let (start, size, name, runtime) = self.symbols.get(idx.checked_sub(1)?)?;
         let next = self
             .symbols
             .get(idx)
-            .map(|(next, _, _)| *next)
+            .map(|(next, _, _, _)| *next)
             .unwrap_or(start.saturating_add(MAX_SYMBOL_SPAN));
         let sized_end = if *size == 0 {
             next
@@ -137,7 +154,7 @@ impl UserImage {
         if addr >= end || addr.saturating_sub(*start) > MAX_SYMBOL_SPAN {
             return None;
         }
-        Some(name.as_str())
+        Some((name.as_str(), *runtime))
     }
 }
 
@@ -145,26 +162,54 @@ impl UserImage {
 ///
 /// Non-leaf frames use [`symbol_lookup_address`]. The raw `addr` is tried
 /// when the adjusted address falls in a gap between symbols.
-pub(crate) fn name_for(images: &[UserImage], addr: u64, leaf: bool) -> Option<(&str, &str)> {
+///
+/// The runtime is Rust when the symbol was Rust-mangled, or when the image
+/// is a Rust binary and the name is already a `::` path.
+pub(crate) fn name_for(
+    images: &[UserImage],
+    addr: u64,
+    leaf: bool,
+) -> Option<(&str, &str, Runtime)> {
     let lookup = symbol_lookup_address(addr, leaf);
     find(images, lookup).or_else(|| find(images, addr))
 }
 
-fn find(images: &[UserImage], addr: u64) -> Option<(&str, &str)> {
+fn find(images: &[UserImage], addr: u64) -> Option<(&str, &str, Runtime)> {
     let image = images.iter().find(|image| image.contains(addr))?;
-    let name = image.name_at(addr)?;
-    Some((name, image.module.as_str()))
+    let (name, runtime) = image.name_at(addr)?;
+    let runtime = frame_runtime(runtime, name, image.rust_image);
+    Some((name, image.module.as_str(), runtime))
 }
 
+/// Linux x86_64 page size. The kernel maps each `PT_LOAD` from the page that
+/// contains `p_offset`, and the sampler only walks that architecture.
+const MAP_PAGE: u64 = 4096;
+
 /// Runtime load bias: `map_start - link_address_of_that_file_offset`.
+///
+/// The mapping's file offset is page-aligned. rustc (lld) emits an executable
+/// segment whose `p_offset` sits 0x820 bytes into a page, so the kernel maps
+/// file offset `p_offset & !4095`. That offset is still inside the previous
+/// segment's `p_filesz`. Treating the first containing segment as the mapping
+/// shifts every symbol in the executable segment by one page, and a Rust
+/// spin loop then symbolizes as unrelated standard-library functions. Match
+/// the segment whose own page contains this file offset first.
 pub(crate) fn load_bias(map_start: u64, map_offset: u64, loads: &[LoadSegment]) -> Option<u64> {
-    let load = loads.iter().find(|load| {
-        let end = load.offset.saturating_add(load.filesz.max(1));
-        map_offset >= load.offset && map_offset < end
-    })?;
-    let vaddr = load
-        .vaddr
-        .wrapping_add(map_offset.wrapping_sub(load.offset));
+    let load = loads
+        .iter()
+        .find(|load| load.filesz > 0 && load.offset & !(MAP_PAGE - 1) == map_offset)
+        .or_else(|| {
+            loads.iter().find(|load| {
+                let end = load.offset.saturating_add(load.filesz.max(1));
+                map_offset >= load.offset && map_offset < end
+            })
+        })?;
+    // The mapped page can start before `p_offset` (the rustc layout above).
+    let vaddr = if map_offset >= load.offset {
+        load.vaddr.wrapping_add(map_offset - load.offset)
+    } else {
+        load.vaddr.wrapping_sub(load.offset - map_offset)
+    };
     Some(map_start.wrapping_sub(vaddr))
 }
 
@@ -378,10 +423,12 @@ fn read_funcs<R: Read + Seek>(
         if raw.is_empty() {
             continue;
         }
+        let presented = symbol::present_elf_symbol(raw);
         funcs.push(ElfFunc {
             vaddr: value,
             size,
-            name: present_symbol(raw),
+            name: presented.name,
+            runtime: presented.runtime,
         });
     }
     funcs
@@ -396,36 +443,6 @@ fn cstr_at(buf: &[u8], offset: usize) -> Option<&str> {
     std::str::from_utf8(&rest[..end]).ok()
 }
 
-/// Show `raw` the way a profile should.
-///
-/// ELF does not add Mach-O's extra underscore. A GNU version suffix
-/// (`@@GLIBC_2.2.5`) is removed before demangling and kept out of the result.
-pub(crate) fn present_symbol(raw: &str) -> String {
-    let trimmed = raw.split("@@").next().unwrap_or(raw);
-    let candidate = if let Some(rest) = trimmed.strip_prefix("__Z") {
-        format!("_Z{rest}")
-    } else {
-        trimmed.to_string()
-    };
-    demangle(&candidate).unwrap_or_else(|| {
-        if candidate.as_str() == raw {
-            raw.to_string()
-        } else {
-            candidate
-        }
-    })
-}
-
-fn demangle(raw: &str) -> Option<String> {
-    let symbol = cpp_demangle::Symbol::new(raw).ok()?;
-    let text = symbol.to_string();
-    if text.is_empty() || text == raw {
-        None
-    } else {
-        Some(text)
-    }
-}
-
 /// Whether this ELF is the x86_64 image the Linux sampler can walk.
 pub(crate) fn is_x86_64(elf: &ElfFile) -> bool {
     elf.machine == EM_X86_64
@@ -433,17 +450,22 @@ pub(crate) fn is_x86_64(elf: &ElfFile) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{UserImage, load_bias, name_for, parse_bytes, present_symbol};
+    use super::{UserImage, load_bias, name_for, parse_bytes};
 
     #[test]
     fn itanium_names_are_demangled_and_c_names_stay() {
-        let pretty = present_symbol("_ZN14anyprof_native4spinEv");
+        let pretty = crate::symbol::present_elf_symbol("_ZN14anyprof_native4spinEv");
+        assert_eq!(pretty.runtime, anyprof_core::Runtime::Native);
         assert!(
-            pretty.contains("anyprof_native") && pretty.contains("spin"),
-            "{pretty}"
+            pretty.name.contains("anyprof_native") && pretty.name.contains("spin"),
+            "{}",
+            pretty.name
         );
-        assert_eq!(present_symbol("main"), "main");
-        assert_eq!(present_symbol("read@@GLIBC_2.2.5"), "read");
+        assert_eq!(crate::symbol::present_elf_symbol("main").name, "main");
+        assert_eq!(
+            crate::symbol::present_elf_symbol("read@@GLIBC_2.2.5").name,
+            "read"
+        );
     }
 
     #[test]
@@ -457,16 +479,42 @@ mod tests {
         let bias = load_bias(0x5555_0000_0000, 0, &elf.loads).unwrap();
         assert_eq!(bias, 0x5555_0000_0000);
         let image = UserImage::from_elf(bias, bias + 0x2000, "busy".to_string(), &elf, bias);
-        let (name, module) = name_for(std::slice::from_ref(&image), bias + 0x1050, true).unwrap();
+        let (name, module, runtime) =
+            name_for(std::slice::from_ref(&image), bias + 0x1050, true).unwrap();
         assert!(name.contains("spin"), "{name}");
         assert_eq!(module, "busy");
+        assert_eq!(runtime, anyprof_core::Runtime::Native);
         // 0x1200 is the first byte of main. A non-leaf sample of that address
         // is the call in spin, not main itself.
-        let (name, _) = name_for(std::slice::from_ref(&image), bias + 0x1200, false).unwrap();
+        let (name, _, _) = name_for(std::slice::from_ref(&image), bias + 0x1200, false).unwrap();
         assert!(name.contains("spin"), "{name}");
-        let (name, _) = name_for(std::slice::from_ref(&image), bias + 0x1200, true).unwrap();
+        let (name, _, _) = name_for(std::slice::from_ref(&image), bias + 0x1200, true).unwrap();
         assert_eq!(name, "main");
         assert!(name_for(std::slice::from_ref(&image), bias + 0x10, true).is_none());
+    }
+
+    #[test]
+    fn rustc_executable_segment_is_not_shifted_by_a_page() {
+        // rustc/lld: the executable PT_LOAD starts at file offset 0x15820 /
+        // vaddr 0x16820. Linux maps that page at file offset 0x15000, which
+        // is still inside the previous segment's p_filesz (0x15814).
+        let loads = [
+            super::LoadSegment {
+                offset: 0,
+                vaddr: 0,
+                filesz: 0x15814,
+            },
+            super::LoadSegment {
+                offset: 0x15820,
+                vaddr: 0x16820,
+                filesz: 0x3d570,
+            },
+        ];
+        let map_start = 0x5555_0008_8000u64;
+        let bias = load_bias(map_start, 0x15000, &loads).unwrap();
+        assert_eq!(bias, map_start - 0x16000);
+        // Link vaddr 0x17440 is file offset 0x16440, 0x1440 bytes into the map.
+        assert_eq!(bias.wrapping_add(0x17440), map_start + 0x1440);
     }
 
     #[test]

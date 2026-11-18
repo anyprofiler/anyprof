@@ -771,13 +771,16 @@ fn finish_profile(
 fn user_frame(images: &[UserImage], addr: u64, leaf: bool) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
     let named = elf::name_for(images, addr, leaf);
-    let module = named.map(|(_, module)| module.to_string()).or_else(|| {
+    let module = named.map(|(_, module, _)| module.to_string()).or_else(|| {
         images
             .iter()
             .find(|image| image.contains(lookup) || image.contains(addr))
             .map(|image| image.module.clone())
     });
-    let mut frame = Frame::new(Runtime::Native, named.map(|(name, _)| name).unwrap_or(""));
+    let (name, runtime) = named
+        .map(|(name, _, runtime)| (name, runtime))
+        .unwrap_or(("", Runtime::Native));
+    let mut frame = Frame::new(runtime, name);
     frame.address = Some(addr);
     frame.module = module;
     frame
@@ -821,6 +824,14 @@ fn images_from_maps(text: &str) -> Vec<UserImage> {
 }
 
 fn image_from_group(path: &str, group: &[MapSpan]) -> UserImage {
+    let mut image = image_from_elf(path, group);
+    // One scan per mapped file. libc and the dynamic linker miss and stay
+    // native; the Rust executable hits and labels its `::` paths.
+    image.rust_image = crate::rust_image::file_is_rust(Path::new(path));
+    image
+}
+
+fn image_from_elf(path: &str, group: &[MapSpan]) -> UserImage {
     let start = group.iter().map(|span| span.start).min().unwrap_or(0);
     let end = group.iter().map(|span| span.end).max().unwrap_or(start);
     let module = Path::new(path)

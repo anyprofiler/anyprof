@@ -44,9 +44,9 @@ use windows_sys::Win32::System::Threading::{
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::elf::present_symbol;
 use crate::policy::{self, DebugPrivilege};
 use crate::snapshot::{self, SnapshotError};
+use crate::symbol::{self, frame_runtime};
 
 const MAX_FRAMES: usize = 64;
 /// `IMAGE_FILE_MACHINE_AMD64`. `StackWalk64` takes it as a `u32`.
@@ -457,12 +457,13 @@ fn finish_profile(
     elapsed: Duration,
     interval: Duration,
 ) -> Profile {
+    let mut rust_files = HashMap::<String, bool>::new();
     let mut stacks = Vec::with_capacity(counts.len());
     for (addresses, weight) in counts {
         let frames = addresses
             .iter()
             .enumerate()
-            .map(|(index, addr)| frame_for(process, *addr, index == 0))
+            .map(|(index, addr)| frame_for(process, *addr, index == 0, &mut rust_files))
             .collect();
         stacks.push(Stack { frames, weight });
     }
@@ -477,36 +478,50 @@ fn finish_profile(
     }
 }
 
-fn frame_for(process: HANDLE, addr: u64, leaf: bool) -> Frame {
+fn frame_for(
+    process: HANDLE,
+    addr: u64,
+    leaf: bool,
+    rust_files: &mut HashMap<String, bool>,
+) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
-    let (name, module) = symbol_at(process, lookup)
-        .or_else(|| symbol_at(process, addr))
-        .unwrap_or_else(|| {
-            (
-                String::new(),
-                module_only(process, lookup)
-                    .or_else(|| module_only(process, addr))
-                    .unwrap_or_default(),
-            )
-        });
+    let hit = symbol_at(process, lookup).or_else(|| symbol_at(process, addr));
+    let (name, module, runtime) = match hit {
+        Some((name, module, path, symbol_runtime)) => {
+            let image_rust = path.is_some_and(|path| {
+                *rust_files
+                    .entry(path.clone())
+                    .or_insert_with(|| crate::rust_image::file_is_rust(Path::new(&path)))
+            });
+            let runtime = frame_runtime(symbol_runtime, &name, image_rust);
+            (name, module, runtime)
+        }
+        None => (
+            String::new(),
+            module_only(process, lookup)
+                .or_else(|| module_only(process, addr))
+                .unwrap_or_default(),
+            Runtime::Native,
+        ),
+    };
     let module = if module.is_empty() {
         None
     } else {
         Some(module)
     };
-    let mut frame = Frame::new(Runtime::Native, name);
+    let mut frame = Frame::new(runtime, name);
     frame.address = Some(addr);
     frame.module = module;
     frame
 }
 
-fn symbol_at(process: HANDLE, addr: u64) -> Option<(String, String)> {
-    let name = symbol_name(process, addr)?;
-    let module = module_only(process, addr).unwrap_or_default();
-    Some((name, module))
+fn symbol_at(process: HANDLE, addr: u64) -> Option<(String, String, Option<String>, Runtime)> {
+    let (name, runtime) = symbol_name(process, addr)?;
+    let (module, path) = module_path(process, addr).unwrap_or_else(|| (String::new(), None));
+    Some((name, module, path, runtime))
 }
 
-fn symbol_name(process: HANDLE, addr: u64) -> Option<String> {
+fn symbol_name(process: HANDLE, addr: u64) -> Option<(String, Runtime)> {
     let mut package: SYMBOL_INFO_PACKAGE = unsafe { std::mem::zeroed() };
     package.si.SizeOfStruct = std::mem::size_of_val(&package.si) as u32;
     // `Name` is one byte inside `SYMBOL_INFO`, and `name` continues it.
@@ -525,11 +540,17 @@ fn symbol_name(process: HANDLE, addr: u64) -> Option<String> {
     if text.is_empty() {
         None
     } else {
-        Some(present_symbol(&text))
+        let presented = symbol::present_elf_symbol(&text);
+        Some((presented.name, presented.runtime))
     }
 }
 
 fn module_only(process: HANDLE, addr: u64) -> Option<String> {
+    module_path(process, addr).map(|(name, _)| name)
+}
+
+/// File name shown on the frame, and the full path used to recognize a Rust image.
+fn module_path(process: HANDLE, addr: u64) -> Option<(String, Option<String>)> {
     let mut info: IMAGEHLP_MODULE64 = unsafe { std::mem::zeroed() };
     info.SizeOfStruct = std::mem::size_of::<IMAGEHLP_MODULE64>() as u32;
     let ok = unsafe { SymGetModuleInfo64(process, addr, &mut info) };
@@ -542,12 +563,13 @@ fn module_only(process: HANDLE, addr: u64) -> Option<String> {
     let name = Path::new(&path)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(path.as_str());
+        .unwrap_or(path.as_str())
+        .to_string();
     if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+        return None;
     }
+    let full = if path == name { None } else { Some(path) };
+    Some((name, full))
 }
 
 fn c_string(bytes: &[i8]) -> Option<String> {

@@ -3,15 +3,18 @@ use anyprof_core::Registry;
 use anyprof_go::GoBackend;
 use anyprof_native::NativeBackend;
 use anyprof_node::NodeBackend;
+use anyprof_rust::RustBackend;
 
 /// Node is the first-class pid backend. The browser backend is explicit
-/// (`--browser`) and never matches a pid. Go is more specific than native, so
-/// it stays ahead of the fallback even though sampling it is lower priority.
-/// Native matches any live pid.
+/// (`--browser`) and never matches a pid. Rust and Go are more specific than
+/// native, so they stay ahead of the fallback. Rust is ahead of Go because
+/// that is the language order in the roadmap; a binary is not both. Native
+/// matches any live pid.
 pub fn default_registry() -> Registry {
     Registry::new(vec![
         Box::new(NodeBackend),
         Box::new(BrowserBackend),
+        Box::new(RustBackend),
         Box::new(GoBackend),
         Box::new(NativeBackend),
     ])
@@ -25,12 +28,13 @@ mod tests {
     use anyprof_go::GoBackend;
     use anyprof_native::NativeBackend;
     use anyprof_node::NodeBackend;
+    use anyprof_rust::RustBackend;
 
     #[test]
-    fn detection_order_is_node_browser_go_native() {
+    fn detection_order_is_node_browser_rust_go_native() {
         assert_eq!(
             default_registry().names(),
-            vec!["node", "browser", "go", "native"]
+            vec!["node", "browser", "rust", "go", "native"]
         );
     }
 
@@ -38,6 +42,7 @@ mod tests {
     fn each_backend_defaults_to_its_ecosystem_format() {
         assert_eq!(NodeBackend.default_format(), Format::Cpuprofile);
         assert_eq!(BrowserBackend.default_format(), Format::Cpuprofile);
+        assert_eq!(RustBackend.default_format(), Format::Pprof);
         assert_eq!(GoBackend.default_format(), Format::Pprof);
         assert_eq!(NativeBackend.default_format(), Format::Pprof);
     }
@@ -49,6 +54,7 @@ mod tests {
         let devtools = Duration::from_micros(100);
         assert_eq!(NodeBackend.default_sampling_interval(), devtools);
         assert_eq!(BrowserBackend.default_sampling_interval(), devtools);
+        assert_eq!(RustBackend.default_sampling_interval().as_micros(), 10_101);
         assert_eq!(GoBackend.default_sampling_interval().as_micros(), 10_101);
         assert_eq!(
             NativeBackend.default_sampling_interval().as_micros(),

@@ -110,7 +110,7 @@ pub struct RecordArgs {
     /// Otherwise a file path's extension is used (`.cpuprofile`, `.pb.gz`,
     /// `.pprof`, `.speedscope.json`, `.collapsed`, `.folded`, `.txt`). A
     /// directory, or no `-o`, uses the backend default: cpuprofile for Node and
-    /// browser, pprof for Go and native.
+    /// browser, pprof for Rust, Go, and native.
     #[arg(short = 'f', long, value_enum)]
     pub format: Option<ProfileFormat>,
 
@@ -118,8 +118,8 @@ pub struct RecordArgs {
     ///
     /// 1000000 Hz (one sample per microsecond) is the finest rate. Defaults
     /// depend on the backend: Node and browser sample every 100us (10000 Hz),
-    /// the same rate as a Chrome DevTools recording, and Go and native sample
-    /// at 99 Hz. Conflicts with `--interval`.
+    /// the same rate as a Chrome DevTools recording, and Rust, Go, and native
+    /// sample at 99 Hz. Conflicts with `--interval`.
     #[arg(
         short = 'F',
         long,
@@ -144,7 +144,7 @@ pub struct RecordArgs {
     #[arg(short = 'k', long)]
     pub kernel: bool,
 
-    /// Force a backend (`node`, `browser`, `go`, or `native`) instead of auto-detecting.
+    /// Force a backend (`node`, `browser`, `rust`, `go`, or `native`) instead of auto-detecting.
     #[arg(short = 'b', long, value_name = "NAME")]
     pub backend: Option<String>,
 

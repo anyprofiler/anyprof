@@ -1,4 +1,4 @@
-//! Native (C, C++, and later Rust) CPU sampling backend.
+//! Native (C and C++) CPU sampling backend.
 //!
 //! macOS samples on-CPU stacks through Mach (`task_for_pid`, frame pointers,
 //! Mach-O symbols) and needs root. Linux x86_64 samples through
@@ -7,9 +7,10 @@
 //! `StackWalk64`. Other architectures compile and `start` returns not
 //! implemented.
 //!
-//! C++ is the native target after Node.js and browser pages. A Rust-specific
-//! sampler comes after that; until then Rust processes fall through to this
-//! backend and get the native stacks for the platform.
+//! Rust sampling reuses this sampler. [`file_is_rust`] recognizes a Rust
+//! image, and symbol lookup demangles Rust names into
+//! [`anyprof_core::Runtime::Rust`] frames. The `anyprof-rust` backend selects
+//! that path; this backend remains the fallback for every other live pid.
 //!
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
@@ -20,8 +21,12 @@ mod macho;
 mod maps;
 mod perf_parse;
 mod policy;
+mod rust_image;
 mod snapshot;
+mod symbol;
 mod walk;
+
+pub use rust_image::file_is_rust;
 
 #[cfg(target_os = "macos")]
 mod macos;

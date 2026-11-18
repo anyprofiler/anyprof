@@ -12,6 +12,7 @@ description = "Native CPU sampling backend for anyprof. macOS uses Mach, Windows
 [dependencies]
 anyprof-core.workspace = true
 cpp_demangle = "0.4.4"
+rustc-demangle = "0.1.26"
 tracing.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

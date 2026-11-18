@@ -73,6 +73,17 @@ mod tests {
     }
 
     #[test]
+    fn rust_frames_keep_their_prefix() {
+        let frame = Frame::new(Runtime::Rust, "anyprof_rust_fixture::anyprof_rust_spin");
+        let token = format_symbol(&frame);
+        assert_eq!(token, "[rust] anyprof_rust_fixture::anyprof_rust_spin");
+        assert_eq!(
+            parse_symbol(&token),
+            (Runtime::Rust, "anyprof_rust_fixture::anyprof_rust_spin")
+        );
+    }
+
+    #[test]
     fn empty_native_frame_uses_the_address() {
         let mut frame = Frame::new(Runtime::Native, "");
         frame.address = Some(0xab);

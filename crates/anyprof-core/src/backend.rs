@@ -148,7 +148,7 @@ pub trait Session: Send {
 /// whose [`Backend::detect`] returns true. Node.js is the first-class pid
 /// backend. The browser backend is selected explicitly and does not match pids.
 pub trait Backend: Send + Sync {
-    /// Stable name used by `--backend` (`node`, `browser`, `native`, `go`, ...).
+    /// Stable name used by `--backend` (`node`, `browser`, `rust`, `go`, `native`, ...).
     fn name(&self) -> &'static str;
 
     /// Whether this backend should profile `pid`.
@@ -163,15 +163,15 @@ pub trait Backend: Send + Sync {
     /// Format written when the user does not pass `--format` or a recognized
     /// output-file extension.
     ///
-    /// Node.js and browser tabs return [`Format::Cpuprofile`]. Go and native
-    /// return [`Format::Pprof`]. A future Python, Ruby, or PHP backend should
-    /// return [`Format::Speedscope`].
+    /// Node.js and browser tabs return [`Format::Cpuprofile`]. Go, Rust, and
+    /// native return [`Format::Pprof`]. A future Python, Ruby, or PHP backend
+    /// should return [`Format::Speedscope`].
     fn default_format(&self) -> Format;
 
     /// Interval used when [`RecordOptions::sampling_interval`] is `None`.
     ///
     /// Node.js and browser tabs return [`DEVTOOLS_SAMPLING_INTERVAL`] (100 µs)
-    /// to match a DevTools recording. Go and native return
+    /// to match a DevTools recording. Go, Rust, and native return
     /// [`PERF_SAMPLING_INTERVAL`] (99 Hz).
     fn default_sampling_interval(&self) -> Duration;
 

@@ -201,8 +201,19 @@ fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
         .iter()
         .find(|image| image.contains(lookup))
         .or_else(|| symbols.iter().find(|image| image.contains(addr)));
-    let name = image.and_then(|image| image.name_at(lookup)).unwrap_or("");
-    let mut frame = Frame::new(Runtime::Native, name);
+    let (name, runtime) = image
+        .and_then(|image| {
+            image
+                .name_at(lookup)
+                .or_else(|| image.name_at(addr))
+                .map(|(name, symbol_runtime)| {
+                    let runtime =
+                        crate::symbol::frame_runtime(symbol_runtime, name, image.rust_image);
+                    (name.to_string(), runtime)
+                })
+        })
+        .unwrap_or_else(|| (String::new(), Runtime::Native));
+    let mut frame = Frame::new(runtime, name);
     frame.address = Some(addr);
     frame.module = image.map(|image| image.module.clone());
     frame
@@ -626,23 +637,28 @@ fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {
         let module = module_name(&remote.path);
         let file_symbols =
             ImageSymbols::parse_file(Path::new(&remote.path), remote.load, &module, cpu);
-        if let Some(parsed) = file_symbols {
+        let rust_image = crate::rust_image::file_is_rust(Path::new(&remote.path));
+        if let Some(mut parsed) = file_symbols {
+            parsed.rust_image = rust_image;
             images.push(parsed);
             continue;
         }
         if remote.end > remote.load {
-            images.push(ImageSymbols::range_only(remote.load, remote.end, module));
+            let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
+            image.rust_image = rust_image;
+            images.push(image);
         }
     }
     if images.is_empty()
         && let Some(path) = pid_path(pid)
-        && let Some(parsed) =
+        && let Some(mut parsed) =
             ImageSymbols::parse_file(Path::new(&path), 0, &module_name(&path), cpu)
     {
         // No dyld list. A slide of 0 is wrong for a PIE binary, so this only
         // helps when the image was linked at a fixed address. The dyld path
         // above is the one the sampler relies on.
         tracing::debug!(pid, path, "native symbol load fell back to proc_pidpath");
+        parsed.rust_image = crate::rust_image::file_is_rust(Path::new(&path));
         images.push(parsed);
     }
     images

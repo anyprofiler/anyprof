@@ -3,7 +3,8 @@
 //! The macOS sampler reads each loaded image's header from the target, then
 //! opens the on-disk binary and reads only its symbol table. Function names
 //! come from `nlist_64` (the symbols `nm` prints), not from DWARF, so a normal
-//! unstripped C or C++ binary resolves without `-g`.
+//! unstripped C, C++, or Rust binary resolves without `-g`. Rust names are
+//! demangled.
 //!
 //! Addresses in the file are the linker's preferred virtual addresses. The
 //! sampler adds the ASLR slide (`runtime load address - __TEXT vmaddr`) before
@@ -24,6 +25,10 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+
+use anyprof_core::Runtime;
+
+use crate::symbol::{self, Presented};
 
 /// How far past a symbol an instruction can sit and still belong to it.
 ///
@@ -87,8 +92,10 @@ pub(crate) struct ImageSymbols {
     pub end: u64,
     /// File name (`busy`, `libsystem_kernel.dylib`, ...).
     pub module: String,
-    /// `(runtime address, display name)`, sorted by address.
-    symbols: Vec<(u64, String)>,
+    /// The file contains a Rust image marker.
+    pub(crate) rust_image: bool,
+    /// `(runtime address, display name, symbol runtime)`, sorted by address.
+    symbols: Vec<(u64, String, Runtime)>,
 }
 
 impl ImageSymbols {
@@ -101,6 +108,7 @@ impl ImageSymbols {
             start,
             end,
             module,
+            rust_image: false,
             symbols: Vec::new(),
         }
     }
@@ -140,14 +148,14 @@ impl ImageSymbols {
         addr >= self.start && addr < self.end
     }
 
-    /// Function name for `addr`, when a symbol covers it.
-    pub(crate) fn name_at(&self, addr: u64) -> Option<&str> {
-        let idx = self.symbols.partition_point(|(start, _)| *start <= addr);
-        let (start, name) = self.symbols.get(idx.checked_sub(1)?)?;
+    /// Function name and symbol runtime for `addr`, when a symbol covers it.
+    pub(crate) fn name_at(&self, addr: u64) -> Option<(&str, Runtime)> {
+        let idx = self.symbols.partition_point(|(start, _, _)| *start <= addr);
+        let (start, name, runtime) = self.symbols.get(idx.checked_sub(1)?)?;
         let next = self
             .symbols
             .get(idx)
-            .map(|(next, _)| *next)
+            .map(|(next, _, _)| *next)
             .unwrap_or(self.end.max(start.saturating_add(MAX_SYMBOL_SPAN)));
         if addr >= next {
             return None;
@@ -155,7 +163,7 @@ impl ImageSymbols {
         if addr.saturating_sub(*start) > MAX_SYMBOL_SPAN {
             return None;
         }
-        Some(name.as_str())
+        Some((name.as_str(), *runtime))
     }
 }
 
@@ -200,13 +208,13 @@ fn parse_reader<R: Read + Seek>(
     let symbols = read_symbols(&mut reader, offset, size, &symtab)?;
     let slide = load_addr.wrapping_sub(text_vmaddr);
     let mut runtime = Vec::with_capacity(symbols.len());
-    for (unslid, name) in symbols {
+    for (unslid, name, lang) in symbols {
         let addr = unslid.wrapping_add(slide);
         if !name.is_empty() {
-            runtime.push((addr, name));
+            runtime.push((addr, name, lang));
         }
     }
-    runtime.sort_by_key(|(addr, _)| *addr);
+    runtime.sort_by_key(|(addr, _, _)| *addr);
     let end = end_vmaddr.wrapping_add(slide);
     if end <= load_addr {
         return None;
@@ -215,6 +223,7 @@ fn parse_reader<R: Read + Seek>(
         start: load_addr,
         end,
         module: module.to_string(),
+        rust_image: false,
         symbols: runtime,
     })
 }
@@ -324,7 +333,7 @@ fn read_symbols<R: Read + Seek>(
     slice_offset: u64,
     slice_size: u64,
     symtab: &Symtab,
-) -> Option<Vec<(u64, String)>> {
+) -> Option<Vec<(u64, String, Runtime)>> {
     if symtab.nsyms > 2_000_000 || symtab.strsize > 64 * 1024 * 1024 {
         return None;
     }
@@ -356,7 +365,8 @@ fn read_symbols<R: Read + Seek>(
         let Some(raw_name) = cstr_at(&strings, n_strx) else {
             continue;
         };
-        symbols.push((n_value, present_symbol(raw_name)));
+        let Presented { name, runtime } = symbol::present_macho_symbol(raw_name);
+        symbols.push((n_value, name, runtime));
     }
     Some(symbols)
 }
@@ -427,92 +437,33 @@ impl<'a> Iterator for LoadCommands<'a> {
     }
 }
 
-/// Turn a Mach-O symbol into the name a profile should show.
-///
-/// Mach-O prefixes C symbols with `_`. Itanium C++ symbols therefore start
-/// with `__Z`. The extra underscore is stripped, and on macOS `__cxa_demangle`
-/// restores `namespace::function()`.
-fn present_symbol(raw: &str) -> String {
-    if let Some(pretty) = try_demangle(raw) {
-        return pretty;
-    }
-    match raw.strip_prefix('_') {
-        Some(rest) if !rest.starts_with('_') => rest.to_string(),
-        _ => raw.to_string(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn try_demangle(raw: &str) -> Option<String> {
-    let mangled = if let Some(rest) = raw.strip_prefix("__Z") {
-        format!("_Z{rest}")
-    } else if raw.starts_with("_Z") {
-        raw.to_string()
-    } else {
-        return None;
-    };
-    let c_name = std::ffi::CString::new(mangled).ok()?;
-    let mut status = 0;
-    let ptr = unsafe {
-        __cxa_demangle(
-            c_name.as_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut status,
-        )
-    };
-    if ptr.is_null() || status != 0 {
-        return None;
-    }
-    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned();
-    unsafe { free(ptr.cast::<std::ffi::c_void>()) };
-    if text.is_empty() { None } else { Some(text) }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn try_demangle(_raw: &str) -> Option<String> {
-    None
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "c++")]
-unsafe extern "C" {
-    fn __cxa_demangle(
-        mangled_name: *const std::ffi::c_char,
-        output_buffer: *mut std::ffi::c_char,
-        length: *mut usize,
-        status: *mut std::ffi::c_int,
-    ) -> *mut std::ffi::c_char;
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn free(ptr: *mut std::ffi::c_void);
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        CPU_TYPE_ARM64, FAT_MAGIC, ImageSymbols, LC_SEGMENT_64, LC_SYMTAB, MachCpu, present_symbol,
-    };
+    use super::{CPU_TYPE_ARM64, FAT_MAGIC, ImageSymbols, LC_SEGMENT_64, LC_SYMTAB, MachCpu};
 
-    #[cfg(target_os = "macos")]
+    fn symbol_name(image: &ImageSymbols, addr: u64) -> Option<&str> {
+        image.name_at(addr).map(|(name, _)| name)
+    }
+
     #[test]
     fn itanium_names_are_demangled() {
-        let pretty = present_symbol("__ZN14anyprof_native4spinEv");
+        let pretty = crate::symbol::present_macho_symbol("__ZN14anyprof_native4spinEv");
+        assert_eq!(pretty.runtime, anyprof_core::Runtime::Native);
         assert!(
-            pretty.contains("anyprof_native") && pretty.contains("spin"),
-            "{pretty}"
+            pretty.name.contains("anyprof_native") && pretty.name.contains("spin"),
+            "{}",
+            pretty.name
         );
     }
 
     #[test]
     fn c_symbols_drop_the_mach_o_underscore() {
-        assert_eq!(present_symbol("_main"), "main");
-        assert_eq!(present_symbol("main"), "main");
-        assert_eq!(present_symbol("__stack_chk_fail"), "__stack_chk_fail");
+        assert_eq!(crate::symbol::present_macho_symbol("_main").name, "main");
+        assert_eq!(crate::symbol::present_macho_symbol("main").name, "main");
+        assert_eq!(
+            crate::symbol::present_macho_symbol("__stack_chk_fail").name,
+            "__stack_chk_fail"
+        );
     }
 
     #[test]
@@ -525,10 +476,16 @@ mod tests {
             .expect("synthetic image");
         assert_eq!(image.start, 0x1040_0000);
         assert!(image.contains(0x1040_0180));
-        assert_eq!(image.name_at(0x1040_0100), Some("anyprof_native_spin"));
-        assert_eq!(image.name_at(0x1040_0180), Some("anyprof_native_spin"));
-        assert_eq!(image.name_at(0x1040_0200), Some("main"));
-        assert_eq!(image.name_at(0x1040_00f0), None);
+        assert_eq!(
+            symbol_name(&image, 0x1040_0100),
+            Some("anyprof_native_spin")
+        );
+        assert_eq!(
+            symbol_name(&image, 0x1040_0180),
+            Some("anyprof_native_spin")
+        );
+        assert_eq!(symbol_name(&image, 0x1040_0200), Some("main"));
+        assert_eq!(symbol_name(&image, 0x1040_00f0), None);
         assert!(!image.contains(0x1040_0000 + 0x2000));
     }
 
@@ -538,9 +495,12 @@ mod tests {
         let x64 = synthetic_macho(&[("_other", 0x1000_0040)]);
         let fat = fat_binary(&[(MachCpu::X86_64, &x64), (MachCpu::Arm64, &arm)]);
         let image = ImageSymbols::parse_bytes(&fat, 0x1000_0000, "busy", MachCpu::Arm64).unwrap();
-        assert_eq!(image.name_at(0x1000_0040), Some("anyprof_native_spin"));
+        assert_eq!(
+            symbol_name(&image, 0x1000_0040),
+            Some("anyprof_native_spin")
+        );
         let image = ImageSymbols::parse_bytes(&fat, 0x1000_0000, "busy", MachCpu::X86_64).unwrap();
-        assert_eq!(image.name_at(0x1000_0040), Some("other"));
+        assert_eq!(symbol_name(&image, 0x1000_0040), Some("other"));
     }
 
     #[test]
@@ -614,8 +574,8 @@ mod tests {
         let boundary = 0x1040_0200u64;
         let leaf = crate::policy::symbol_lookup_address(boundary, true);
         let ret = crate::policy::symbol_lookup_address(boundary, false);
-        assert_eq!(image.name_at(leaf), Some("callee"));
-        assert_eq!(image.name_at(ret), Some("caller"));
+        assert_eq!(symbol_name(&image, leaf), Some("callee"));
+        assert_eq!(symbol_name(&image, ret), Some("caller"));
     }
 
     #[test]
@@ -632,7 +592,10 @@ mod tests {
         drop(file);
         let image = ImageSymbols::parse_file(&path, 0x1040_0000, "huge", MachCpu::Arm64)
             .expect("large file should still parse");
-        assert_eq!(image.name_at(0x1040_0100), Some("anyprof_native_spin"));
+        assert_eq!(
+            symbol_name(&image, 0x1040_0100),
+            Some("anyprof_native_spin")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
