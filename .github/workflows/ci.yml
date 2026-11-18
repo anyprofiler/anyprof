@@ -42,6 +42,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-python@v5
+        id: py313
+        with:
+          python-version: "3.13"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -77,8 +85,12 @@ jobs:
           # after the sysctl step. Windows samples them as the same user. A
           # skip is a failure. The MSRV job does not set this and does not
           # change sysctls. musl is cargo check only, above. Go fixtures use
-          # the toolchain from setup-go.
+          # the toolchain from setup-go. Python fixtures use the two
+          # setup-python interpreters. They run inside this job, so each
+          # Go version also samples 3.12 and 3.13.
           ANYPROF_REQUIRE_NATIVE: "1"
+          ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}
       - name: Upload viewer screenshots
         if: always()
         uses: actions/upload-artifact@v4

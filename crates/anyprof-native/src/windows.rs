@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::python::{self, CountedStack, PythonVm};
 use anyprof_core::{
     Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Stack, Target, inspect,
 };
@@ -89,10 +90,11 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     ensure_x64(process.handle, target.pid)?;
     let symbols = Symbols::load(process.handle)?;
     let mut go = load_go(process.handle);
+    let python = python::attach_process(process.handle);
 
     let started = Instant::now();
     let mut next = started;
-    let mut counts: HashMap<Vec<u64>, u64> = HashMap::new();
+    let mut counts: HashMap<CountedStack, u64> = HashMap::new();
     loop {
         if opts.stop.stop_requested() {
             break;
@@ -103,10 +105,10 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         {
             break;
         }
-        match sample_addresses(process.handle, target.pid, go.as_mut()) {
+        match sample_addresses(process.handle, target.pid, go.as_mut(), python.as_ref()) {
             Ok(stacks) => {
                 for stack in stacks {
-                    if !stack.is_empty() {
+                    if stack.recordable() {
                         *counts.entry(stack).or_default() += 1;
                     }
                 }
@@ -339,11 +341,12 @@ fn sample_addresses(
     process: HANDLE,
     pid: u32,
     mut go: Option<&mut GoProc>,
-) -> Result<Vec<Vec<u64>>, SampleFault> {
+    python: Option<&PythonVm>,
+) -> Result<Vec<CountedStack>, SampleFault> {
     let running = running_threads(pid)?;
     let mut stacks = Vec::with_capacity(running.len());
     for tid in running {
-        match unwind_thread(process, tid, go.as_deref_mut()) {
+        match unwind_thread(process, tid, go.as_deref_mut(), python) {
             Ok(Some(frames)) => stacks.push(frames),
             Ok(None) => {}
             Err(err) => return Err(err),
@@ -402,7 +405,8 @@ fn unwind_thread(
     process: HANDLE,
     tid: u32,
     go: Option<&mut GoProc>,
-) -> Result<Option<Vec<u64>>, SampleFault> {
+    python: Option<&PythonVm>,
+) -> Result<Option<CountedStack>, SampleFault> {
     let access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION;
     let thread = unsafe { OpenThread(access, FALSE, tid) };
     if thread.is_null() || thread == INVALID_HANDLE_VALUE {
@@ -413,7 +417,7 @@ fn unwind_thread(
     let Some(suspended) = Suspended::new(thread.0, &mut resume_failure) else {
         return Ok(None);
     };
-    let frames = walk_suspended(process, thread.0, go);
+    let frames = walk_suspended(process, thread.0, tid, go, python);
     drop(suspended);
     if let Some(code) = resume_failure {
         return Err(SampleFault::Fatal(format!(
@@ -499,7 +503,13 @@ struct AlignedContext {
     context: CONTEXT,
 }
 
-fn walk_suspended(process: HANDLE, thread: HANDLE, go: Option<&mut GoProc>) -> Option<Vec<u64>> {
+fn walk_suspended(
+    process: HANDLE,
+    thread: HANDLE,
+    tid: u32,
+    go: Option<&mut GoProc>,
+    python: Option<&PythonVm>,
+) -> Option<CountedStack> {
     let mut aligned = AlignedContext {
         context: unsafe { std::mem::zeroed() },
     };
@@ -510,8 +520,21 @@ fn walk_suspended(process: HANDLE, thread: HANDLE, go: Option<&mut GoProc>) -> O
     if ok == FALSE {
         return None;
     }
+    if let Some(vm) = python
+        && let Some(frames) = vm.frames(u64::from(tid), aligned.context.Rip, &mut |addr, buf| {
+            read_process(process, addr, buf)
+        })
+    {
+        return Some(CountedStack::Python {
+            kernel: Vec::new(),
+            frames,
+        });
+    }
     if let Some(frames) = go_frames(process, aligned.context.Rip, aligned.context.Rsp, go) {
-        return Some(frames);
+        return Some(CountedStack::Addresses {
+            frames,
+            kernel_len: 0,
+        });
     }
     let mut frame: STACKFRAME64 = unsafe { std::mem::zeroed() };
     frame.AddrPC = flat(aligned.context.Rip);
@@ -552,7 +575,10 @@ fn walk_suspended(process: HANDLE, thread: HANDLE, go: Option<&mut GoProc>) -> O
     if frames.is_empty() {
         None
     } else {
-        Some(frames)
+        Some(CountedStack::Addresses {
+            frames,
+            kernel_len: 0,
+        })
     }
 }
 
@@ -567,7 +593,7 @@ fn flat(offset: u64) -> ADDRESS64 {
 fn finish_profile(
     pid: u32,
     comm: Option<String>,
-    counts: HashMap<Vec<u64>, u64>,
+    counts: HashMap<CountedStack, u64>,
     process: HANDLE,
     go: Option<&GoProc>,
     elapsed: Duration,
@@ -576,14 +602,17 @@ fn finish_profile(
     let mut rust_files = HashMap::<String, bool>::new();
     let mut pdbs = HashMap::<String, crate::pdb_syms::ImageSymbols>::new();
     let mut stacks = Vec::with_capacity(counts.len());
-    for (addresses, weight) in counts {
-        let frames = addresses
-            .iter()
-            .enumerate()
-            .map(|(index, addr)| {
-                frame_for(process, *addr, index == 0, go, &mut rust_files, &mut pdbs)
-            })
-            .collect();
+    for (stack, weight) in counts {
+        let frames = match stack {
+            CountedStack::Addresses { frames, .. } => frames
+                .iter()
+                .enumerate()
+                .map(|(index, addr)| {
+                    frame_for(process, *addr, index == 0, go, &mut rust_files, &mut pdbs)
+                })
+                .collect(),
+            CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
+        };
         stacks.push(Stack { frames, weight });
     }
     stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));

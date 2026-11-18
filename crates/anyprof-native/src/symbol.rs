@@ -183,7 +183,10 @@ fn demangle_rust(raw: &str) -> Option<String> {
 
 fn demangle_cpp(raw: &str) -> Option<String> {
     let symbol = cpp_demangle::Symbol::new(raw).ok()?;
-    let text = symbol.to_string();
+    // `Symbol`'s `Display` returns an error for some names it accepted.
+    // `to_string` would panic and abort the profile while loading symbols.
+    let mut text = String::new();
+    std::fmt::Write::write_fmt(&mut text, format_args!("{symbol}")).ok()?;
     if text.is_empty() || text == raw {
         None
     } else {
@@ -209,6 +212,17 @@ mod tests {
         assert_eq!(legacy.runtime, Runtime::Rust);
         assert_eq!(legacy.name, "foo::bar");
         assert!(!legacy.name.contains("0123456789abcdef"), "{}", legacy.name);
+    }
+
+    #[test]
+    fn a_symbol_whose_demangle_display_fails_keeps_the_raw_name() {
+        // CPython exports `RC4`. `cpp_demangle` accepts the name and then
+        // `Display` returns an error. `to_string` would panic while the
+        // image's symbol table is loaded, before any sample is recorded.
+        assert!(cpp_demangle::Symbol::new("RC4").is_ok());
+        let presented = present_elf_symbol("RC4");
+        assert_eq!(presented.name, "RC4");
+        assert_eq!(presented.runtime, Runtime::Native);
     }
 
     #[test]

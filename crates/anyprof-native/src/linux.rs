@@ -31,6 +31,7 @@ use crate::kallsyms::{self, Kallsym};
 use crate::maps::{self, MapSpan};
 use crate::perf_parse::{self, ParsedSample, X86_USER_REGS};
 use crate::policy::{self, LinuxDenial};
+use crate::python::{self, CountedStack, PythonVm};
 use crate::walk::{self, walk_frame_pointer};
 
 const PERF_TYPE_SOFTWARE: u32 = 1;
@@ -77,12 +78,6 @@ struct PerfEventAttr {
 }
 
 const _: () = assert!(std::mem::size_of::<PerfEventAttr>() == ATTR_SIZE as usize);
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct SampleKey {
-    frames: Vec<u64>,
-    kernel_len: u16,
-}
 
 enum AttachFail {
     /// `EINVAL` before any event existed. A smaller stack copy may be accepted.
@@ -154,6 +149,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let mut sampler = sampler;
     let images = load_images(target.pid);
     let go_images: Vec<GoImage> = images.iter().filter_map(|image| image.go.clone()).collect();
+    let python = python::attach_linux(target.pid);
     let kernel_symbols = if opts.include_kernel {
         load_kallsyms()
     } else {
@@ -168,7 +164,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
 
     let started = Instant::now();
     let mut next = started;
-    let mut counts: HashMap<SampleKey, u64> = HashMap::new();
+    let mut counts: HashMap<CountedStack, u64> = HashMap::new();
     let mut lost = 0u64;
     loop {
         if opts.stop.stop_requested() {
@@ -185,6 +181,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             target.pid,
             opts.include_kernel,
             &go_images,
+            &python,
             &mut counts,
         ));
         lost = lost.saturating_add(take_samples(
@@ -192,6 +189,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             target.pid,
             opts.include_kernel,
             &go_images,
+            &python,
             &mut counts,
         ));
         next += interval;
@@ -213,6 +211,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         target.pid,
         opts.include_kernel,
         &go_images,
+        &python,
         &mut counts,
     ));
     if lost > 0 {
@@ -468,7 +467,8 @@ fn refresh(
     pid: u32,
     include_kernel: bool,
     go_images: &[GoImage],
-    counts: &mut HashMap<SampleKey, u64>,
+    python: &Option<PythonVm>,
+    counts: &mut HashMap<CountedStack, u64>,
 ) -> u64 {
     let Ok(live) = list_threads(pid) else {
         return 0;
@@ -486,6 +486,7 @@ fn refresh(
             pid,
             include_kernel,
             go_images,
+            python,
             counts,
         ));
     }
@@ -650,10 +651,11 @@ fn take_samples(
     pid: u32,
     include_kernel: bool,
     go_images: &[GoImage],
-    counts: &mut HashMap<SampleKey, u64>,
+    python: &Option<PythonVm>,
+    counts: &mut HashMap<CountedStack, u64>,
 ) -> u64 {
     let (samples, lost) = sampler.drain();
-    record_samples(samples, pid, include_kernel, go_images, counts);
+    record_samples(samples, pid, include_kernel, go_images, python, counts);
     lost
 }
 
@@ -662,10 +664,11 @@ fn ingest_mapped(
     pid: u32,
     include_kernel: bool,
     go_images: &[GoImage],
-    counts: &mut HashMap<SampleKey, u64>,
+    python: &Option<PythonVm>,
+    counts: &mut HashMap<CountedStack, u64>,
 ) -> u64 {
     let (samples, lost) = drain_mapped(mapped);
-    record_samples(samples, pid, include_kernel, go_images, counts);
+    record_samples(samples, pid, include_kernel, go_images, python, counts);
     lost
 }
 
@@ -674,15 +677,19 @@ fn record_samples(
     pid: u32,
     include_kernel: bool,
     go_images: &[GoImage],
-    counts: &mut HashMap<SampleKey, u64>,
+    python: &Option<PythonVm>,
+    counts: &mut HashMap<CountedStack, u64>,
 ) {
     for sample in samples {
         if sample.pid != pid && sample.pid != 0 {
             continue;
         }
-        let Some(key) = assemble_addresses(&sample, include_kernel, go_images) else {
+        let Some(key) = assemble_addresses(&sample, pid, include_kernel, go_images, python) else {
             continue;
         };
+        if !key.recordable() {
+            continue;
+        }
         *counts.entry(key).or_default() += 1;
     }
 }
@@ -693,9 +700,11 @@ fn record_samples(
 /// symbol lookup subtracts one byte only from the saved frames of that section.
 fn assemble_addresses(
     sample: &ParsedSample,
+    pid: u32,
     include_kernel: bool,
     go_images: &[GoImage],
-) -> Option<SampleKey> {
+    python: &Option<PythonVm>,
+) -> Option<CountedStack> {
     let (kernel_chain, user_chain) = perf_parse::split_callchain(&sample.callchain);
     let mut kernel = if include_kernel {
         kernel_chain
@@ -712,6 +721,17 @@ fn assemble_addresses(
         .filter(|&ip| walk::plausible_user_address(ip))
         .or_else(|| walk::plausible_user_address(sample.ip).then_some(sample.ip))
         .unwrap_or(0);
+    if let Some(vm) = python
+        && let Some(frames) = vm.frames(u64::from(sample.tid), pc, &mut |addr, buf| {
+            python::read_process(pid, addr, buf)
+        })
+    {
+        // The perf sample is historical. The frame chain is the thread's
+        // current Python stack, read when the sample is consumed. A tight
+        // loop is still on that function. A leaf outside the interpreter
+        // image keeps the native walk below.
+        return Some(CountedStack::Python { kernel, frames });
+    }
     let fp = sample.user_fp.unwrap_or(0);
     let sp = sample.user_sp.unwrap_or(0);
     let stack = sample.stack.as_slice();
@@ -744,7 +764,7 @@ fn assemble_addresses(
     let kernel_len = u16::try_from(kernel.len()).unwrap_or(u16::MAX);
     let mut frames = kernel;
     frames.extend(user);
-    Some(SampleKey { frames, kernel_len })
+    Some(CountedStack::Addresses { frames, kernel_len })
 }
 
 fn read_copied_stack(stack: &[u8], sp: u64, addr: u64, buf: &mut [u8]) -> bool {
@@ -767,7 +787,7 @@ fn read_copied_stack(stack: &[u8], sp: u64, addr: u64, buf: &mut [u8]) -> bool {
 fn finish_profile(
     pid: u32,
     comm: Option<String>,
-    counts: HashMap<SampleKey, u64>,
+    counts: HashMap<CountedStack, u64>,
     images: &[UserImage],
     kernel_symbols: &[Kallsym],
     elapsed: Duration,
@@ -775,20 +795,31 @@ fn finish_profile(
 ) -> Profile {
     let mut stacks = Vec::with_capacity(counts.len());
     for (key, weight) in counts {
-        let kernel_len = key.kernel_len as usize;
-        let frames = key
-            .frames
-            .into_iter()
-            .enumerate()
-            .map(|(index, addr)| {
-                let leaf = index == 0 || (kernel_len > 0 && index == kernel_len);
-                if index < kernel_len {
-                    kernel_frame(kernel_symbols, addr, leaf)
-                } else {
-                    user_frame(images, addr, leaf)
+        let frames = match key {
+            CountedStack::Addresses { frames, kernel_len } => {
+                let kernel_len = kernel_len as usize;
+                frames
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, addr)| {
+                        let leaf = index == 0 || (kernel_len > 0 && index == kernel_len);
+                        if index < kernel_len {
+                            kernel_frame(kernel_symbols, addr, leaf)
+                        } else {
+                            user_frame(images, addr, leaf)
+                        }
+                    })
+                    .collect()
+            }
+            CountedStack::Python { kernel, frames } => {
+                let mut out = Vec::with_capacity(kernel.len() + frames.len());
+                for (index, addr) in kernel.into_iter().enumerate() {
+                    out.push(kernel_frame(kernel_symbols, addr, index == 0));
                 }
-            })
-            .collect();
+                out.extend(python::python_profile_frames(&frames));
+                out
+            }
+        };
         stacks.push(Stack { frames, weight });
     }
     stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));
@@ -1076,6 +1107,14 @@ fn wait_until(deadline: Instant, opts: &RecordOptions) {
 mod tests {
     use super::assemble_addresses;
     use crate::perf_parse::{CONTEXT_KERNEL, CONTEXT_USER, ParsedSample};
+    use crate::python::CountedStack;
+
+    fn native_stack(sample: &ParsedSample, include_kernel: bool) -> (Vec<u64>, u16) {
+        match assemble_addresses(sample, sample.pid, include_kernel, &[], &None).expect("frames") {
+            CountedStack::Addresses { frames, kernel_len } => (frames, kernel_len),
+            CountedStack::Python { .. } => panic!("a synthetic sample is not Python"),
+        }
+    }
 
     #[test]
     fn a_saved_frame_in_the_copy_is_kept() {
@@ -1095,9 +1134,9 @@ mod tests {
             user_fp: Some(sp),
             stack,
         };
-        let key = assemble_addresses(&sample, false, &[]).expect("frames");
-        assert_eq!(key.kernel_len, 0);
-        assert_eq!(key.frames, vec![0x5555_0000_1100, ret]);
+        let (frames, kernel_len) = native_stack(&sample, false);
+        assert_eq!(kernel_len, 0);
+        assert_eq!(frames, vec![0x5555_0000_1100, ret]);
     }
 
     #[test]
@@ -1118,15 +1157,15 @@ mod tests {
             user_fp: None,
             stack: Vec::new(),
         };
-        let with_kernel = assemble_addresses(&sample, true, &[]).expect("frames");
-        assert_eq!(with_kernel.kernel_len, 1);
+        let (frames, kernel_len) = native_stack(&sample, true);
+        assert_eq!(kernel_len, 1);
         assert_eq!(
-            with_kernel.frames,
+            frames,
             vec![0xffff_ffff_8100_0100, 0x5555_0000_1100, 0x5555_0000_1000]
         );
-        let user_only = assemble_addresses(&sample, false, &[]).expect("user frames");
-        assert_eq!(user_only.kernel_len, 0);
-        assert_eq!(user_only.frames, vec![0x5555_0000_1100, 0x5555_0000_1000]);
+        let (frames, kernel_len) = native_stack(&sample, false);
+        assert_eq!(kernel_len, 0);
+        assert_eq!(frames, vec![0x5555_0000_1100, 0x5555_0000_1000]);
     }
 
     #[test]
