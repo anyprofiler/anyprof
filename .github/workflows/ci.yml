@@ -68,9 +68,10 @@ jobs:
           # The runner images ship Chrome; the viewer smoke test must not skip.
           ANYPROF_REQUIRE_CHROME: "1"
           ANYPROF_SMOKE_ARTIFACTS: ${{ runner.temp }}/web-smoke
-          # macOS samples under sudo. Ubuntu samples after the sysctl step.
-          # Windows samples a same-user process. A skip is a failure.
-          # The MSRV job does not set this and does not change sysctls.
+          # macOS samples C++ and Rust under sudo. Ubuntu samples both after
+          # the sysctl step. Windows samples both as the same user. A skip
+          # is a failure. The MSRV job does not set this and does not
+          # change sysctls. musl is cargo check only, above.
           ANYPROF_REQUIRE_NATIVE: "1"
       - name: Upload viewer screenshots
         if: always()

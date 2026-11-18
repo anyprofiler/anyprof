@@ -7,6 +7,7 @@ members = [
     "crates/anyprof-node",
     "crates/anyprof-browser",
     "crates/anyprof-native",
+    "crates/anyprof-rust",
     "crates/anyprof-go",
     "crates/anyprof-web",
     "crates/anyprof-cli",
@@ -26,6 +27,7 @@ description = "Capture CPU profiles from any running process, no code changes or
 anyprof-core = { path = "crates/anyprof-core" }
 anyprof-cdp = { path = "crates/anyprof-cdp" }
 anyprof-native = { path = "crates/anyprof-native" }
+anyprof-rust = { path = "crates/anyprof-rust" }
 anyprof-node = { path = "crates/anyprof-node" }
 anyprof-browser = { path = "crates/anyprof-browser" }
 anyprof-go = { path = "crates/anyprof-go" }

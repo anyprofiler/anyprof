@@ -1,10 +1,10 @@
 //! Go CPU sampling backend.
 //!
-//! Lower priority than Node.js, browser pages, and native C++. Detection still
-//! scans the process executable for the Go build-info magic (`\xffGo buildinf:`)
-//! on Linux so a Go process is not labeled native. It does not ptrace the
-//! process. Collecting a CPU profile from an arbitrary live Go runtime is not
-//! implemented yet.
+//! Lower priority than Node.js, browser pages, and Rust. Native is the
+//! fallback after Go. Detection still scans the process executable for the
+//! Go build-info magic (`\xffGo buildinf:`) on Linux so a Go process is not
+//! labeled native. It does not ptrace the process. Collecting a CPU profile
+//! from an arbitrary live Go runtime is not implemented yet.
 
 mod binary;
 

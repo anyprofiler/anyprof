@@ -19,6 +19,7 @@ anyprof-core.workspace = true
 anyprof-export.workspace = true
 anyprof-go.workspace = true
 anyprof-native.workspace = true
+anyprof-rust.workspace = true
 anyprof-node.workspace = true
 anyprof-web.workspace = true
 anyhow.workspace = true

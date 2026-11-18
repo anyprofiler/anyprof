@@ -4,7 +4,7 @@ Capture CPU profiles from any running process, no code changes or restarts neede
 
 anyprof attaches to a live process by pid and writes a CPU profile. The process does not need a profiler baked in, and it does not need to be restarted. Runtimes sit behind one `Backend` trait, and every backend emits the same profile.
 
-**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. `anyprof view` opens any of those in a built-in, offline speedscope viewer. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling works on macOS (Mach `task_for_pid`, frame pointers, Mach-O symbols, root), on Windows x64 (suspend only threads that are running, `StackWalk64`, same user), and on Linux x86_64 (`perf_event_open` task-clock events, frame pointers, ELF symbols). Other CPU architectures compile and `start` returns not implemented. Go sampling is still a stub.
+**Status:** Node.js sampling works. Give anyprof the pid of a running `node` process; it turns the V8 inspector on, records a CPU profile, and writes collapsed stacks, speedscope, pprof, or `.cpuprofile`. `anyprof view` opens any of those in a built-in, offline speedscope viewer. Browser tabs work the same way when Chrome, Chromium, or Edge is already listening with `--remote-debugging-port`. Native C/C++ sampling works on macOS (Mach `task_for_pid`, frame pointers, Mach-O symbols, root), on Windows x64 (suspend only threads that are running, `StackWalk64`, same user), and on Linux x86_64 (`perf_event_open` task-clock events, frame pointers, ELF symbols). Rust uses that same sampler: a Rust pid is detected, Rust names are demangled, and Rust frames are labeled `[rust]`. Other CPU architectures compile and `start` returns not implemented. Go sampling is still a stub.
 
 ## Goals
 
@@ -22,15 +22,15 @@ Platform order for new samplers is **macOS, then Windows, then Linux**. Runtime 
 | Node.js | `anyprof-node` | Works | Attaches by pid. macOS and Linux send `SIGUSR1`; Windows runs `node -e "process._debugProcess(pid)"`. Samples over the V8 inspector (Chrome DevTools Protocol). |
 | Browser page | `anyprof-browser` | Works | Chrome, Chromium, or Edge started with `--remote-debugging-port`. Select a tab by URL, title, or target id. Does not match pids. |
 | C, C++ | `anyprof-native` | macOS, Windows x64, and Linux x86_64 | Fallback for any live pid. CI samples a busy C++ program and an idle program on Apple Silicon, Intel macOS, `windows-latest`, and `ubuntu-latest`. See the [support matrix](#support-matrix). |
-| Rust | `anyprof-native` | Later | No Rust-specific sampler yet. On macOS, Windows x64, and Linux x86_64 a Rust process uses the native sampler. A Rust-specific sampler comes after C++. |
-| Go | `anyprof-go` | Stub (later) | Linux detection scans the executable for the Go build-info magic so a Go process is not labeled native. Sampling is lower priority than Node, browser pages, and C++. |
+| Rust | `anyprof-rust` | macOS, Windows x64, and Linux x86_64 | Reuses the native sampler. Auto-detection reads the executable (no attach). Rust frames are demangled and prefixed `[rust]`. See the [support matrix](#support-matrix). |
+| Go | `anyprof-go` | Stub (later) | Linux detection scans the executable for the Go build-info magic so a Go process is not labeled native. Sampling is lower priority than Node, browser pages, C++, and Rust. |
 | Python | — | Planned | After Go. |
 | Java | — | Planned | |
 | Ruby | — | Planned | |
 | PHP | — | Planned | |
 | .NET | — | Planned | |
 
-Auto-detection tries `node`, then `go`, then `native`. The browser backend is only used with `--browser` (or `--backend browser`). Pass `--backend` to skip detection.
+Auto-detection tries `node`, then `rust`, then `go`, then `native`. The browser backend is only used with `--browser` (or `--backend browser`). Pass `--backend` to skip detection. `--backend native` on a Rust pid still selects the native backend (the auto-named file is `anyprof-native-...`), but Rust symbols in that profile are still labeled `[rust]`.
 
 ## Support matrix
 
@@ -41,7 +41,7 @@ Auto-detection tries `node`, then `go`, then `native`. The browser backend is on
 | Node.js | Works (CI) | Works (CI) | Works (CI) |
 | Browser page | Works (CI, headless Chrome) | Works (CI, headless Chrome) | Works (CI, headless Chrome) |
 | C, C++ | Works (CI) on Apple Silicon and Intel. Root, Mach `task_for_pid`, frame pointers, Mach-O symbols. Busy and idle programs. User frames only. | Works (CI) on x64. Same user, no administrator token. Suspends only threads whose state is Running, walks with `StackWalk64`, resolves dbghelp symbols. Busy and idle programs. Refuses this process before `OpenProcess`. 32-bit processes, ARM64 processes, and non-x64 builds are not sampled. A kernel address is not stored as a user frame. | Works (CI) on x86_64. `perf_event_open` task clock (on-CPU; the thread is not suspended). Frame-pointer walk of the user stack copy, ELF symbols. Busy, idle, and two running threads. Kernel frames with `-k` when `perf_event_paranoid` is 1 or lower. aarch64 and other architectures are not sampled and do not advertise `-k`. |
-| Rust | No Rust-specific sampler. A Rust pid uses the macOS native sampler. Stacks are frame pointers, so the binary has to keep them. | No Rust-specific sampler. A Rust pid uses the Windows x64 native sampler (`StackWalk64` unwind data). | No Rust-specific sampler. A Rust pid uses the Linux x86_64 native sampler. Stacks are frame pointers, so the binary has to keep them. |
+| Rust | Works (CI) on Apple Silicon and Intel. Same Mach sampler and root requirement as C/C++. rustc 1.99 does not emit frame pointers unless `-C force-frame-pointers=yes`. The library tests sample a busy program, an idle park, and two running threads. | Works (CI) on x64. Same user, no administrator token. `StackWalk64` uses the PE unwind data rustc emits. Names come from dbghelp, or from the PDB next to the exe when dbghelp returns none. The fixture passes `-C force-frame-pointers=yes` and `-C debuginfo=2`. Busy, idle, and two running threads. Refuses this process before `OpenProcess`. Non-x64 builds are not sampled. | Works (CI) on x86_64. Same `perf_event_open` sampler as C/C++. rustc 1.99 does not emit frame pointers at `-O0` or `-O2` unless `-C force-frame-pointers=yes`. Busy, idle, and two running threads. `-k` is the native Linux behavior. musl x86_64 is the same code and is only `cargo check`ed. aarch64 and other architectures are not sampled and do not advertise `-k`. |
 | Go | Not implemented. Detection does not run (no `/proc`). | Not implemented. | Detection works. Sampling is not implemented. |
 | Python, Java, Ruby, PHP, .NET | Not implemented | Not implemented | Not implemented |
 
@@ -62,6 +62,7 @@ anyprof-core        Backend::detect / start -> Session::stop -> Profile
         |
         +-- anyprof-node      (Node.js, checked first)
         +-- anyprof-browser   (explicit; CDP, same client as Node)
+        +-- anyprof-rust      (Rust; native sampler, Rust detection and names)
         +-- anyprof-go        (Go, more specific than native)
         +-- anyprof-native    (fallback for any live pid)
         |
@@ -157,6 +158,11 @@ sudo anyprof rec -p 1234 -d 10s
 # See Permissions for perf_event_paranoid, ptrace_scope, and SeDebugPrivilege.
 anyprof rec -p 1234 -d 10s
 
+# Rust. Same sampler and permissions as C/C++. The binary needs frame
+# pointers on macOS and Linux (`-C force-frame-pointers=yes`). Omit -o for
+# an auto-named anyprof-rust-<pid>-YYYYMMDD-HHMMSS.pb.gz.
+anyprof rec -p 1234 -d 10s
+
 # Import an existing V8 profile.
 anyprof conv -i profile.cpuprofile -o cpu.collapsed -t collapsed
 anyprof conv -i cpu.collapsed -o cpu.speedscope.json -t speedscope
@@ -181,7 +187,7 @@ anyprof rec -p 1234 -d 10s -w
 | `-F, --frequency <HZ>` | Samples per second, from 1 to 1000000 (one sample per microsecond). The default depends on the backend (see below). An explicit value wins. Cannot be combined with `--interval`. |
 | `--interval <DURATION>` | Time between samples, for example `100us`, `1ms`, or `10ms`. The same setting as `-F`, written as a period. Node and browser round it to whole microseconds. |
 | `-k, --kernel` | Ask for kernel frames when the backend supports them. Linux x86_64 records them. Other Linux architectures do not advertise kernel frames, because sampling there is not implemented. macOS and Windows x64 ignore the flag and record user frames. Node and browser profiles do not include kernel frames. |
-| `-b, --backend <node\|browser\|go\|native>` | Skip auto-detection. |
+| `-b, --backend <node\|browser\|rust\|go\|native>` | Skip auto-detection. |
 | `-w, --web` | After writing the file, open it in the built-in viewer, the same as `anyprof view <file>`. `--no-open`, `--port`, and `--web-timeout` (see [Viewing profiles](#viewing-profiles)) require `--web`. |
 | `-v`, `-vv`, `-vvv` | Log more (`info`, `debug`, `trace`). `RUST_LOG` is used when `-v` is not passed. `-h` and `-V` are help and version. |
 
@@ -190,7 +196,7 @@ Default sampling rate when neither `-F` nor `--interval` is passed:
 | Backend | Default interval | Rate |
 | --- | --- | --- |
 | `node`, `browser` | 100us | 10000 Hz, the same as a Chrome DevTools Performance recording |
-| `go`, `native` | 10101us | 99 Hz, the `perf record -F 99` convention |
+| `rust`, `go`, `native` | 10101us | 99 Hz, the `perf record -F 99` convention |
 
 At 100us a mostly idle server still records the sub-millisecond work of each request. A 10s recording holds tens of thousands of samples, and a busy process writes about 2.5 MB of `.cpuprofile` per minute. For long recordings, `--interval 1ms` keeps the file 10 times smaller. The start line names the rate in use, for example `using backend 'node' for pid 1234 (on-cpu, mixed-stacks), sampling every 100us (10000 Hz)`.
 
@@ -204,6 +210,7 @@ Default format when `-f` is omitted and `-o` is not a recognized file name:
 | --- | --- | --- | --- |
 | `node` | cpuprofile | `.cpuprofile` | Chrome DevTools Performance panel, VS Code |
 | `browser` | cpuprofile | `.cpuprofile` | Chrome DevTools Performance panel |
+| `rust` | pprof | `.pb.gz` | `go tool pprof`, pprof web UI |
 | `go` | pprof | `.pb.gz` | `go tool pprof`, pprof web UI |
 | `native` | pprof | `.pb.gz` | `go tool pprof`, pprof web UI |
 | Python, Ruby, PHP, and other scripting runtimes (planned) | speedscope | `.speedscope.json` | [speedscope.app](https://www.speedscope.app) |
@@ -296,11 +303,21 @@ What Linux allows depends on sysctls anyprof only reads:
 
 Linux builds that are not x86_64 compile and `start` returns not implemented. Those builds do not set `kernel_frames`, so `-k` is not advertised. The CLI only profiles the pid you pass it.
 
+Rust sampling is that native sampler. `anyprof-rust` does not open a second event source. It detects a Rust executable, asks the native sampler to record, and the symbol reader demangles Rust names. A stack mixes `[rust]` frames with bare C frames (`main`, libc) and, on Linux x86_64 with `-k`, `[kernel]` frames. The default is 99 Hz pprof, and an omitted `-o` writes `anyprof-rust-<pid>-YYYYMMDD-HHMMSS.pb.gz`.
+
+Detection does not attach. It reads the executable and stops at the first marker. The last read is shortened so the total does not pass 32 MiB. On Linux the path is `/proc/<pid>/exe`. On macOS it is `proc_pidpath` (same user, no root). On Windows it is `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus `QueryFullProcessImageNameW`, then the handle is closed. That is not the sampler's `OpenProcess`, and it does not enable `SeDebugPrivilege`. A missing path or a read error is "not Rust", and auto-detection falls through to native. `--backend rust` still samples a process that was not detected.
+
+The markers are the ELF `.comment` string `rustc version `, the standard-library panic text for `Option::unwrap` and `Result::unwrap`, the prefix `fatal runtime error:`, and a remapped panic path `/rustc/` plus 40 hex digits plus `/library/`. Executables do not carry the `.rustc` section; that section is for dylibs and proc-macros. On ELF, `rustc version ` is in `.comment` and survives `strip --strip-all`, including a `no_std` binary. Cross-compiled Mach-O and PE objects do not contain that string. A normal Rust binary on those platforms is recognized from the standard-library strings, which live in the binary and survive strip. A fully stripped `no_std` Mach-O or PE that contains none of the markers is not auto-detected. A non-Rust file that happens to contain one of those byte strings in the first 32 MiB is detected as Rust; the same class of false positive exists for the Go build-info scan.
+
+Names: legacy Rust mangling (`_ZN…17h<16 hex>E`) and v0 (`_R…`) are demangled with `rustc-demangle` before Itanium C++ demangling, and the legacy crate hash is omitted. Mach-O adds one extra leading underscore (`__R…`, `__ZN…`); ELF and PE do not. A C++ Itanium name demangles to `ns::fn()` and stays native even when the file is a Rust image. An MSVC `?` name stays native. On Windows, an already-undecorated `crate::function` with no parameter list is labeled Rust when the file is a Rust image. A C symbol in that image (`main`) has no `::` and stays native. dbghelp is given the executable's directory and is not pointed at a symbol server. When `SymFromAddr` returns no name, anyprof reads the PDB named by the PE CodeView record, or the `.pdb` beside the image, and demangles those procedures. Put that PDB next to the exe (`-C debuginfo=2`); without it the frames keep the address and the module name.
+
+Frame pointers are required on macOS and Linux. `rustc` 1.99 does not emit them at `-O0` or `-O2` unless the binary was built with `-C force-frame-pointers=yes`. Without that flag the leaf is recorded and the callers are not. Windows does not need the flag: `StackWalk64` uses the unwind data rustc emits. The CI fixtures pass the flag on every OS so the program is the same, and they pass `-C debuginfo=2` for the PDB. Permissions, self-pid refusal, `-k`, and the not-implemented architectures are the native ones above. Linux musl x86_64 is the same sampler; CI `cargo check`s it and does not live-sample it.
+
 ## Roadmap
 
 1. **Node.js** via the V8 inspector, on macOS, then Windows, then Linux. This is implemented.
 2. **C++ (native)** on-CPU sampling, and **browser pages** over the DevTools Protocol. Browser pages are implemented. Native sampling is implemented on macOS (Mach), Windows x64 (`StackWalk64`), and Linux x86_64 (perf events). Other architectures are not implemented.
-3. **Rust**, then **Go** (detection already exists on Linux), then Python, Java, Ruby, PHP, and .NET. Those scripting backends should default to speedscope (see the format table above). Go already defaults to pprof. Until the Rust sampler exists, a Rust process uses the native backend.
+3. **Rust** on-CPU sampling is implemented on the same platforms as native: macOS (Apple Silicon and Intel), Windows x64, and Linux x86_64. It reuses that sampler. Other architectures compile and `start` returns not implemented. **Go** is next (detection already exists on Linux), then Python, Java, Ruby, PHP, and .NET. Those scripting backends should default to speedscope (see the format table above). Go already defaults to pprof.
 
 ## Development
 
@@ -313,13 +330,13 @@ cargo build --workspace
 
 CI runs those checks on macOS, Windows, and Ubuntu, in that order, with Node.js 22 installed so the live Node profile test runs. CI also sets `ANYPROF_REQUIRE_CHROME=1`, so `crates/anyprof-cli/tests/web_smoke.rs` must find Chrome. That test drives headless Chrome over the DevTools Protocol, opens a `.cpuprofile`, a pprof `.pb.gz`, collapsed stacks, and speedscope JSON in `anyprof view`, and checks that the viewer served the profile, that speedscope used the matching importer, that the page logged no exceptions or CSP violations, and that the screenshot contains a flame graph. Locally it skips when Chrome is not found. `ANYPROF_CHROME=<path>` picks the browser, and `ANYPROF_SMOKE_ARTIFACTS=<dir>` keeps the screenshots; CI uploads them as the `web-smoke-<os>` artifact.
 
-CI sets `ANYPROF_REQUIRE_NATIVE=1` on every OS in the test matrix, so a skipped native live test is a failure there.
+CI sets `ANYPROF_REQUIRE_NATIVE=1` on every OS in the test matrix, so a skipped native or Rust live test is a failure there. The Rust fixtures are compiled with `rustc --edition 2024 -C opt-level=0 -C force-frame-pointers=yes -C debuginfo=2` and sampled by the same jobs. On Linux and Windows they take the same `anyprof-native-live.lock` as the C++ tests, so perf and dbghelp are not used by two crates at once.
 
-On `macos-latest` (arm64) and `macos-15-intel` (x86_64), `crates/anyprof-native/tests/live.rs` compiles a busy C++ program, re-executes the test under `sudo`, and checks that the Mach sampler records `anyprof_native::spin`, a caller, a sample count and duration in range for 100 Hz over 1s, and that collapsed stacks, pprof, and speedscope all still contain that symbol. A second live test compiles a process that only calls `pause()` and checks that a 500ms recording does not invent on-CPU samples. The CLI test writes the auto-named `.pb.gz` and converts it. Without sudo locally the live test skips unless `ANYPROF_REQUIRE_NATIVE=1`, in which case a missing sudo is a failure. A green arm64 job is not Intel coverage.
+On `macos-latest` (arm64) and `macos-15-intel` (x86_64), `crates/anyprof-native/tests/live.rs` compiles a busy C++ program, re-executes the test under `sudo`, and checks that the Mach sampler records `anyprof_native::spin`, a caller, a sample count and duration in range for 100 Hz over 1s, and that collapsed stacks, pprof, and speedscope all still contain that symbol. A second live test compiles a process that only calls `pause()` and checks that a 500ms recording does not invent on-CPU samples. The CLI test writes the auto-named `.pb.gz` and converts it. `crates/anyprof-rust/tests/live.rs` does the same for a Rust fixture (`anyprof_rust_spin`, an idle park, and two running threads) and checks the frames are `Runtime::Rust` and demangled. Those three tests live in `mod supported`, so the sudo re-exec passes `supported::<test> --exact` and requires `running 1 test`. The Rust CLI test checks auto-detection (`using backend 'rust'`) and `anyprof-rust-<pid>-*.pb.gz`. Without sudo locally the live tests skip unless `ANYPROF_REQUIRE_NATIVE=1`, in which case a missing sudo is a failure. A green arm64 job is not Intel coverage.
 
-On `ubuntu-latest` the workflow sets `kernel.perf_event_paranoid=1` and `kernel.kptr_restrict=0` before the tests. It does not change `kernel.yama.ptrace_scope` (the image leaves it at 1). `crates/anyprof-native/tests/linux_live.rs` then samples a busy C++ program, an idle `pause()` loop, two running threads, and an unrelated same-user process, checks that this process can be sampled, checks that pid 1 is denied with a message that names `perf_event_open`, and checks that `-k` on a tight `/dev/zero` `read` records named kernel frames. That loop stays on CPU. The CLI test writes the auto-named `.pb.gz`. A machine where `perf_event_open` is refused skips those tests unless `ANYPROF_REQUIRE_NATIVE=1`. The MSRV job does not set that variable and does not change sysctls, so on a runner with paranoid 4 the live tests skip. That job is not the Linux sampling evidence. aarch64 Linux is not a CI target.
+On `ubuntu-latest` the workflow sets `kernel.perf_event_paranoid=1` and `kernel.kptr_restrict=0` before the tests. It does not change `kernel.yama.ptrace_scope` (the image leaves it at 1). `crates/anyprof-native/tests/linux_live.rs` then samples a busy C++ program, an idle `pause()` loop, two running threads, and an unrelated same-user process, checks that this process can be sampled, checks that pid 1 is denied with a message that names `perf_event_open`, and checks that `-k` on a tight `/dev/zero` `read` records named kernel frames. That loop stays on CPU. The CLI test writes the auto-named `.pb.gz`. `crates/anyprof-rust/tests/live.rs` samples a busy Rust program, an idle `park_timeout`, and two running threads, and checks demangled `[rust]` frames. The Rust CLI test checks auto-detection. The Ubuntu job also `cargo check`s `x86_64-unknown-linux-musl`; that check does not live-sample. A machine where `perf_event_open` is refused skips those tests unless `ANYPROF_REQUIRE_NATIVE=1`. The MSRV job does not set that variable and does not change sysctls, so on a runner with paranoid 4 the live tests skip. That job is not the Linux sampling evidence. aarch64 Linux is not a CI target.
 
-On `windows-latest`, `crates/anyprof-native/tests/windows_live.rs` compiles a busy C++ program and an idle `Sleep` program with `clang++` or `cl` (`vcvars64.bat`), samples them as the same user, checks the busy program kept running, and checks that sampling this process is refused before `OpenProcess`. The CLI test writes the auto-named `.pb.gz`. No administrator token is required for those fixtures. A machine with no C++ compiler skips unless `ANYPROF_REQUIRE_NATIVE=1`.
+On `windows-latest`, `crates/anyprof-native/tests/windows_live.rs` compiles a busy C++ program and an idle `Sleep` program with `clang++` or `cl` (`vcvars64.bat`), samples them as the same user, checks the busy program kept running, and checks that sampling this process is refused before `OpenProcess`. The CLI test writes the auto-named `.pb.gz`. `crates/anyprof-rust/tests/live.rs` and `crates/anyprof-cli/tests/rust_live.rs` compile the Rust fixtures with `rustc` (`-C debuginfo=2`, which writes a PDB next to the exe) and require demangled `[rust]` frames, including `anyprof_rust_fixture::anyprof_rust_spin`, not only raw addresses. No administrator token is required for those fixtures. A machine with no C++ compiler skips the C++ tests unless `ANYPROF_REQUIRE_NATIVE=1`. The Rust tests need `rustc`, which the toolchain step installs.
 
 `rust-toolchain.toml` pins Rust 1.99.1, which is the compiler CI uses. The MSRV is Rust 1.88 (`rust-version` in `Cargo.toml`); the `msrv` CI job builds and tests the whole workspace on it. The workspace uses Rust edition 2024.
 
@@ -340,7 +357,8 @@ The live test spawns `node --inspect-port=127.0.0.1:<port>` without telling the 
 | `crates/anyprof-cdp` | DevTools Protocol client shared by Node and browser pages |
 | `crates/anyprof-node` | Node.js backend |
 | `crates/anyprof-browser` | Browser-tab backend |
-| `crates/anyprof-native` | Native backend. macOS Mach, Windows x64 `StackWalk64`, Linux x86_64 perf events |
+| `crates/anyprof-native` | Native backend. macOS Mach, Windows x64 `StackWalk64`, Linux x86_64 perf events. Also demangles Rust symbols |
+| `crates/anyprof-rust` | Rust backend. Detection and the `rust` name; sampling is the native sampler |
 | `crates/anyprof-go` | Go backend (stub; Linux build-info detection works) |
 | `crates/anyprof-export` | collapsed, speedscope, pprof, and `.cpuprofile` |
 | `crates/anyprof-web` | `anyprof view`: localhost server, embedded speedscope, browser opener |
