@@ -104,6 +104,7 @@ dependencies = [
  "anyprof-core",
  "anyprof-export",
  "anyprof-go",
+ "anyprof-java",
  "anyprof-native",
  "anyprof-node",
  "anyprof-python",
@@ -150,6 +151,17 @@ dependencies = [
  "anyprof-native",
  "tracing",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "anyprof-java"
+version = "0.1.8"
+dependencies = [
+ "anyprof-core",
+ "anyprof-export",
+ "anyprof-native",
+ "libc",
+ "tracing",
 ]
 
 [[package]]

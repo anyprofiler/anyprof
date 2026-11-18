@@ -54,6 +54,21 @@ jobs:
         id: py313
         with:
           python-version: "3.13"
+      - uses: actions/setup-java@v4
+        id: java17
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-java@v4
+        id: java21
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-java@v4
+        id: java25
+        with:
+          distribution: temurin
+          java-version: "25"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -109,7 +124,25 @@ jobs:
           fi
           echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
           cargo test -p anyprof-python --test live --locked -- --exact supported::unrelated_same_user_read_follows_ptrace_scope
-      - name: Allow per-process perf sampling and Python frame reads
+      - name: Refuse an unrelated Java read at ptrace_scope 1
+        if: matrix.os == 'ubuntu-latest'
+        # Same scope as the Python step. A HotSpot frame read is
+        # process_vm_readv. The test double-forks java so this process is
+        # not an ancestor. anyprof does not write the sysctl.
+        env:
+          ANYPROF_REQUIRE_NATIVE: "1"
+          ANYPROF_JAVA_17: ${{ steps.java17.outputs.path }}
+          ANYPROF_JAVA_21: ${{ steps.java21.outputs.path }}
+          ANYPROF_JAVA_25: ${{ steps.java25.outputs.path }}
+        run: |
+          set -eu
+          scope=$(cat /proc/sys/kernel/yama/ptrace_scope)
+          if [ "$scope" != "1" ]; then
+            sudo sysctl kernel.yama.ptrace_scope=1
+          fi
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
+          cargo test -p anyprof-java --test live --locked -- --exact supported::unrelated_same_user_read_follows_ptrace_scope
+      - name: Allow per-process perf sampling and Python and Java frame reads
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo sysctl kernel.perf_event_paranoid=1
@@ -117,8 +150,8 @@ jobs:
           # process_vm_readv uses ptrace attach. Scope 1 lets a parent read
           # its child and refuses the anyprof process, which is not the
           # parent of an already-running target. perf_event_open does not use
-          # that check. This job sets scope 0 for the Python frame reads
-          # after the denial step above. anyprof itself does not change it.
+          # that check. This job sets scope 0 for the Python and Java frame
+          # reads after the denial steps above. anyprof itself does not change it.
           sudo sysctl kernel.yama.ptrace_scope=0
           echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
           echo "kptr_restrict=$(cat /proc/sys/kernel/kptr_restrict)"
@@ -134,9 +167,16 @@ jobs:
           # skip is a failure. The MSRV job does not set this and does not
           # change sysctls. musl is cargo check only, above. Go fixtures use
           # the toolchain from setup-go. Python fixtures use the three
-          # setup-python interpreters. They run inside this job, so each
-          # Go version also samples 3.11, 3.12, and 3.13.
+          # setup-python interpreters and Temurin 17, 21, and 25. They run
+          # inside this job, so each Go version also samples 3.11, 3.12, 3.13,
+          # and those three HotSpot releases. The MSRV job does not install a
+          # JDK and does not set ANYPROF_REQUIRE_NATIVE. A JDK that happens to
+          # be on that image may skip a documented permission denial. This
+          # matrix must not.
           ANYPROF_REQUIRE_NATIVE: "1"
+          ANYPROF_JAVA_17: ${{ steps.java17.outputs.path }}
+          ANYPROF_JAVA_21: ${{ steps.java21.outputs.path }}
+          ANYPROF_JAVA_25: ${{ steps.java25.outputs.path }}
           ANYPROF_PYTHON_311: ${{ steps.py311.outputs.python-path }}
           ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
           ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}

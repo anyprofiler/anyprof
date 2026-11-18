@@ -23,11 +23,17 @@
 //! another image keeps the native walk. A leaf inside the image whose chain
 //! cannot be read keeps it too, and those frames are not labeled Python.
 //!
+//! Java sampling reuses the same on-CPU events. When the leaf is inside the
+//! HotSpot code cache, the user stack is the Java method chain
+//! ([`anyprof_core::Runtime::Java`]), not the JVM's C++ frames. A leaf
+//! outside the code cache keeps the native walk.
+//!
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
 mod elf;
 mod go_sym;
+mod java;
 mod kallsyms;
 mod macho;
 mod maps;
@@ -41,6 +47,7 @@ mod snapshot;
 mod symbol;
 mod walk;
 
+pub use java::{pid_is_hotspot, prepare_java};
 pub use python::{pid_is_cpython, prepare_python};
 pub use rust_image::file_is_rust;
 

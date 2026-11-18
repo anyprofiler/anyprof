@@ -44,7 +44,7 @@ const MAX_PY_FRAMES: usize = 64;
 const MAX_STRING: usize = 4096;
 const MAX_LINETABLE: usize = 1024 * 1024;
 
-/// One counted stack: native addresses, or a Python frame chain.
+/// One counted stack: native addresses, or a language frame chain.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum CountedStack {
     /// Leaf-first addresses. `kernel_len` leading entries are kernel PCs.
@@ -54,6 +54,14 @@ pub(crate) enum CountedStack {
         kernel: Vec<u64>,
         frames: Vec<PyName>,
     },
+    /// Java methods, optionally after kernel PCs from the same sample.
+    ///
+    /// Names are `Class.method`, leaf first. Kernel frames stay addresses
+    /// until the profile is finished.
+    Java {
+        kernel: Vec<u64>,
+        frames: Vec<String>,
+    },
 }
 
 impl CountedStack {
@@ -61,6 +69,7 @@ impl CountedStack {
         match self {
             Self::Addresses { frames, .. } => !frames.is_empty(),
             Self::Python { kernel, frames } => !kernel.is_empty() || !frames.is_empty(),
+            Self::Java { kernel, frames } => !kernel.is_empty() || !frames.is_empty(),
         }
     }
 }

@@ -144,7 +144,7 @@ pub struct RecordArgs {
     #[arg(short = 'k', long)]
     pub kernel: bool,
 
-    /// Force a backend (`node`, `browser`, `rust`, `go`, `python`, or `native`) instead of auto-detecting.
+    /// Force a backend (`node`, `browser`, `rust`, `go`, `python`, `java`, or `native`) instead of auto-detecting.
     #[arg(short = 'b', long, value_name = "NAME")]
     pub backend: Option<String>,
 

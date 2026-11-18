@@ -151,6 +151,18 @@ impl ImageSymbols {
         addr >= self.start && addr < self.end
     }
 
+    /// Runtime address of a symbol with this exact name.
+    ///
+    /// HotSpot exports `gHotSpotVMStructs` as data. [`Self::name_at`] only
+    /// answers "what function is this address".
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn address_of(&self, name: &str) -> Option<u64> {
+        self.symbols
+            .iter()
+            .find(|(_, symbol, _)| symbol == name)
+            .map(|(addr, _, _)| *addr)
+    }
+
     /// Function name and symbol runtime for `addr`, when a symbol covers it.
     pub(crate) fn name_at(&self, addr: u64) -> Option<(&str, Runtime)> {
         let idx = self.symbols.partition_point(|(start, _, _)| *start <= addr);
