@@ -57,25 +57,37 @@ Examples:
 }
 
 #[derive(Debug, Args)]
-#[command(after_help = "\
+#[command(
+    group(
+        clap::ArgGroup::new("target")
+            .required(true)
+            .multiple(true)
+            .args(["pid", "browser", "name", "command"])
+    ),
+    after_help = "\
 Examples:
   anyprof rec -p 1234 -d 10s -o cpu.cpuprofile
-  anyprof rec -p 1234
+  anyprof rec -n my-server -d 10s -w
+  anyprof rec -d 5s -- python3 script.py
   anyprof rec -p 1234 -d 30s -f collapsed -o cpu.collapsed
   anyprof rec -p 1234 -i 9229 -d 10s -f speedscope -o cpu.json
   anyprof rec -p 1234 -d 5m --interval 1ms
   anyprof rec -B -t example.com -d 10s -o page.cpuprofile
-  anyprof rec -p 1234 -d 10s -w")]
+  anyprof rec -p 1234 -d 10s -w"
+)]
 pub struct RecordArgs {
-    /// Process to profile. Required unless `--browser` is set.
+    /// Process ID to profile.
     #[arg(
         short = 'p',
         long,
         value_name = "PID",
-        value_parser = clap::value_parser!(u32).range(1..),
-        required_unless_present = "browser"
+        value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub pid: Option<u32>,
+
+    /// Running process name or command substring to match (errors if ambiguous).
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
 
     /// Profile a browser tab instead of a pid.
     ///
@@ -86,9 +98,9 @@ pub struct RecordArgs {
 
     /// How long to sample, for example `10s` or `1m30s`.
     ///
-    /// Omit to record until Ctrl+C. Ctrl+C or SIGTERM stops sampling and still
-    /// writes the profile. A second Ctrl+C while the profile is saved exits
-    /// immediately.
+    /// Omit to record until Ctrl+C (or until a spawned `-- <COMMAND>` exits).
+    /// Ctrl+C or SIGTERM stops sampling and still writes the profile. A second
+    /// Ctrl+C while the profile is saved exits immediately.
     #[arg(
         short = 'd',
         long,
@@ -177,6 +189,10 @@ pub struct RecordArgs {
 
     #[command(flatten)]
     pub viewer: ViewerArgs,
+
+    /// Launch a child command after `--` and profile it until it exits or `-d` elapses.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<std::ffi::OsString>,
 }
 
 #[derive(Debug, Args)]

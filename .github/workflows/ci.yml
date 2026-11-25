@@ -142,6 +142,22 @@ jobs:
           fi
           echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
           cargo test -p anyprof-java --test live --locked -- --exact supported::unrelated_same_user_read_follows_ptrace_scope
+      - name: Sample a spawned Python child at ptrace_scope 1
+        if: matrix.os == 'ubuntu-latest'
+        # Because anyprof spawns the child directly, Yama ptrace_scope 1 allows
+        # parent->child process_vm_readv without sudo or lowering ptrace_scope.
+        env:
+          ANYPROF_REQUIRE_NATIVE: "1"
+          ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+        run: |
+          set -eu
+          sudo sysctl kernel.perf_event_paranoid=1
+          scope=$(cat /proc/sys/kernel/yama/ptrace_scope)
+          if [ "$scope" != "1" ]; then
+            sudo sysctl kernel.yama.ptrace_scope=1
+          fi
+          echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
+          cargo test -p anyprof-cli --test spawn_live --locked -- --exact spawn_python_captures_interpreter_frames_as_parent
       - name: Allow per-process perf sampling and Python and Java frame reads
         if: matrix.os == 'ubuntu-latest'
         run: |
