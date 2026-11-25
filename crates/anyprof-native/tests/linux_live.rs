@@ -112,6 +112,66 @@ fn samples_a_busy_cpp_program() {
 }
 
 #[test]
+fn samples_an_optimized_fp_less_cpp_program() {
+    let _lock = LiveLock::acquire();
+    let dir = fixture_dir("nofp");
+    let source = dir.join("nofp.cpp");
+    let binary = dir.join("nofp");
+    std::fs::write(&source, NOFP_CPP).unwrap();
+    if !compile_with_flags(
+        &source,
+        &binary,
+        &[
+            "-std=c++17",
+            "-O2",
+            "-fomit-frame-pointer",
+            "-fno-optimize-sibling-calls",
+        ],
+    ) {
+        return;
+    }
+    let counter = dir.join("counter");
+    std::fs::write(&counter, [0u8; 4096]).unwrap();
+    let mut child = Command::new(&binary)
+        .arg(&counter)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nofp");
+    let pid = child.id();
+    wait_until_running(&counter);
+
+    let started = anyprof_native::NativeBackend.start(
+        &anyprof_core::Target { pid },
+        &anyprof_core::RecordOptions {
+            duration: Some(Duration::from_millis(800)),
+            sampling_interval: Some(Duration::from_millis(10)),
+            ..anyprof_core::RecordOptions::default()
+        },
+    );
+    let Some(session) = accept_or_skip(started) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let profile = session.stop().expect("stop nofp");
+    assert!(
+        profile.stacks.iter().any(|stack| {
+            let has_leaf = stack.frames.iter().any(|f| f.name.contains("nofp_leaf"));
+            let has_mid = stack.frames.iter().any(|f| f.name.contains("nofp_mid"));
+            let has_top = stack.frames.iter().any(|f| f.name.contains("nofp_top"));
+            has_leaf && has_mid && has_top
+        }),
+        "expected DWARF .eh_frame unwind through nofp_leaf <- nofp_mid <- nofp_top without frame pointers\n{}",
+        explain(&profile, &binary)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_idle_process_does_not_invent_on_cpu_samples() {
     let _lock = LiveLock::acquire();
     let dir = fixture_dir("idle");
@@ -535,18 +595,23 @@ fn nm_symbols(binary: &Path) -> String {
 }
 
 fn compile(source: &Path, binary: &Path, extra: &[&str]) -> bool {
+    let mut flags = vec![
+        "-std=c++17",
+        "-O0",
+        "-fno-omit-frame-pointer",
+        "-mno-omit-leaf-frame-pointer",
+        "-fno-optimize-sibling-calls",
+        "-g",
+    ];
+    flags.extend_from_slice(extra);
+    compile_with_flags(source, binary, &flags)
+}
+
+fn compile_with_flags(source: &Path, binary: &Path, flags: &[&str]) -> bool {
     let mut errors = Vec::new();
     for compiler in ["g++", "clang++"] {
         let mut command = Command::new(compiler);
-        command.args([
-            "-std=c++17",
-            "-O0",
-            "-fno-omit-frame-pointer",
-            "-mno-omit-leaf-frame-pointer",
-            "-fno-optimize-sibling-calls",
-            "-g",
-        ]);
-        command.args(extra).arg("-o").arg(binary).arg(source);
+        command.args(flags).arg("-o").arg(binary).arg(source);
         match command.output() {
             Ok(output) if output.status.success() => return true,
             Ok(output) => errors.push(format!(
@@ -776,5 +841,46 @@ int main() {
     for (;;) {
         pause();
     }
+}
+"#;
+
+const NOFP_CPP: &str = r#"
+#include <fcntl.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+namespace anyprof_native {
+__attribute__((noinline)) uint64_t nofp_leaf(volatile uint64_t *slot) {
+    volatile uint64_t scratch[16];
+    scratch[0] = 1;
+    while (slot[1] == 0) {
+        slot[0] += scratch[0];
+    }
+    return slot[0];
+}
+
+__attribute__((noinline)) uint64_t nofp_mid(volatile uint64_t *slot) {
+    volatile uint64_t scratch[16];
+    scratch[3] = 7;
+    uint64_t res = nofp_leaf(slot);
+    slot[2] = res + scratch[3];
+    return slot[2];
+}
+
+__attribute__((noinline)) uint64_t nofp_top(volatile uint64_t *slot) {
+    volatile uint64_t scratch[16];
+    scratch[5] = 11;
+    uint64_t res = nofp_mid(slot);
+    slot[3] = res + scratch[5];
+    return slot[3];
+}
+}
+
+int main(int argc, char **argv) {
+    int fd = open(argv[1], O_RDWR);
+    auto *slot = static_cast<volatile uint64_t *>(
+        mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    return static_cast<int>(anyprof_native::nofp_top(slot));
 }
 "#;

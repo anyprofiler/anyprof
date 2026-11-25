@@ -5,10 +5,11 @@
 //! target is never suspended. Each thread gets its own event and its own
 //! ring buffer. This kernel rejects `PERF_FLAG_FD_OUTPUT` across threads,
 //! because a per-task buffer cannot be shared with another task. User frames
-//! come from a frame-pointer walk of `PERF_SAMPLE_STACK_USER`,
-//! with the kernel's user call chain as a fallback. `-k` keeps kernel
-//! frames from the call chain. Nothing here writes the target's memory or
-//! registers, and `ptrace` is not used.
+//! come from offline DWARF `.eh_frame` unwinding (`framehop`) over
+//! `PERF_SAMPLE_STACK_USER`, falling back to frame-pointer walking and the
+//! kernel's user call chain. `-k` keeps kernel frames from the call chain.
+//! Nothing here writes the target's memory or registers, and `ptrace` is not
+//! used.
 //!
 //! Sampling this process is allowed. The event does not stop the sampler,
 //! which is why [`crate::policy::reject_self_sample`] is not called.
@@ -24,6 +25,7 @@ use anyprof_core::{
     Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Target, inspect,
     process_exists,
 };
+use framehop::Unwinder as _;
 
 use crate::elf::{self, UserImage};
 use crate::go_sym::{self, GoImage, GoMachine};
@@ -33,7 +35,10 @@ use crate::maps::{self, MapSpan};
 use crate::perf_parse::{self, ParsedSample};
 use crate::policy::{self, LinuxDenial, SampleCollector};
 use crate::python::{self, CountedStack, PythonVm};
-use crate::walk::{self, walk_frame_pointer};
+use crate::walk::{self, SectionBytes, walk_frame_pointer};
+
+type LinuxUnwinder = framehop::UnwinderNative<SectionBytes, framehop::MayAllocateDuringUnwind>;
+type LinuxUnwindCache = framehop::CacheNative<framehop::MayAllocateDuringUnwind>;
 
 #[cfg(target_arch = "x86_64")]
 const USER_REGS: u64 = perf_parse::X86_USER_REGS;
@@ -137,6 +142,16 @@ struct Sampler {
     unmapped: u32,
 }
 
+struct SampleContext<'a> {
+    pid: u32,
+    include_kernel: bool,
+    go_images: &'a [GoImage],
+    python: &'a Option<PythonVm>,
+    java: &'a Option<JavaVm>,
+    unwinder: &'a LinuxUnwinder,
+    unwind_cache: &'a mut LinuxUnwindCache,
+}
+
 pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
     let interval = opts.sampling_interval.unwrap_or(PERF_SAMPLING_INTERVAL);
     if interval < Duration::from_micros(1) {
@@ -162,6 +177,11 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let (sampler, _attr) = open_events(target.pid, period, opts.include_kernel)?;
     let mut sampler = sampler;
     let images = load_images(target.pid);
+    let mut unwinder = LinuxUnwinder::new();
+    for image in &images {
+        image.register_unwind_modules(&mut unwinder);
+    }
+    let mut unwind_cache = LinuxUnwindCache::new();
     let go_images: Vec<GoImage> = images.iter().filter_map(|image| image.go.clone()).collect();
     let python = python::attach_linux(target.pid);
     let java = crate::java::attach_linux(target.pid);
@@ -195,6 +215,15 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let mut collector = SampleCollector::new();
     let mut perf_origin = None;
     let mut lost = 0u64;
+    let mut ctx = SampleContext {
+        pid: target.pid,
+        include_kernel: opts.include_kernel,
+        go_images: &go_images,
+        python: &python,
+        java: &java,
+        unwinder: &unwinder,
+        unwind_cache: &mut unwind_cache,
+    };
     loop {
         if opts.stop.stop_requested() {
             break;
@@ -208,11 +237,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         if Instant::now() >= next_refresh {
             lost = lost.saturating_add(refresh(
                 &mut sampler,
-                target.pid,
-                opts.include_kernel,
-                &go_images,
-                &python,
-                &java,
+                &mut ctx,
                 started,
                 &mut perf_origin,
                 &mut collector,
@@ -225,11 +250,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         }
         lost = lost.saturating_add(take_samples(
             &sampler,
-            target.pid,
-            opts.include_kernel,
-            &go_images,
-            &python,
-            &java,
+            &mut ctx,
             started,
             &mut perf_origin,
             &mut collector,
@@ -250,11 +271,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     sampler.disable();
     lost = lost.saturating_add(take_samples(
         &sampler,
-        target.pid,
-        opts.include_kernel,
-        &go_images,
-        &python,
-        &java,
+        &mut ctx,
         started,
         &mut perf_origin,
         &mut collector,
@@ -502,19 +519,14 @@ fn map_error(errno: i32) -> String {
 /// The drain happens before the mapping is dropped, so the last samples of a
 /// short-lived thread are kept. A tid is the same thread only when its
 /// `starttime` still matches. A reused tid is drained and opened again.
-#[allow(clippy::too_many_arguments)]
 fn refresh(
     sampler: &mut Sampler,
-    pid: u32,
-    include_kernel: bool,
-    go_images: &[GoImage],
-    python: &Option<PythonVm>,
-    java: &Option<JavaVm>,
+    ctx: &mut SampleContext<'_>,
     started: Instant,
     perf_origin: &mut Option<u64>,
     collector: &mut SampleCollector,
 ) -> u64 {
-    let Ok(live) = list_threads(pid) else {
+    let Ok(live) = list_threads(ctx.pid) else {
         return 0;
     };
     let mut lost = 0u64;
@@ -525,17 +537,7 @@ fn refresh(
             continue;
         }
         let _ = ioctl_req(event.fd, IOC_DISABLE);
-        lost = lost.saturating_add(ingest_mapped(
-            &event,
-            pid,
-            include_kernel,
-            go_images,
-            python,
-            java,
-            started,
-            perf_origin,
-            collector,
-        ));
+        lost = lost.saturating_add(ingest_mapped(&event, ctx, started, perf_origin, collector));
     }
     sampler.events = retained;
     let attr = event_attr(sampler.period, sampler.stack, sampler.include_kernel);
@@ -697,79 +699,44 @@ fn read_header_u64(base: *mut u8, offset: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn take_samples(
     sampler: &Sampler,
-    pid: u32,
-    include_kernel: bool,
-    go_images: &[GoImage],
-    python: &Option<PythonVm>,
-    java: &Option<JavaVm>,
+    ctx: &mut SampleContext<'_>,
     started: Instant,
     perf_origin: &mut Option<u64>,
     collector: &mut SampleCollector,
 ) -> u64 {
     let (samples, lost) = sampler.drain();
-    record_samples(
-        samples,
-        pid,
-        include_kernel,
-        go_images,
-        python,
-        java,
-        started,
-        perf_origin,
-        collector,
-    );
+    record_samples(samples, ctx, started, perf_origin, collector);
     lost
 }
 
-#[allow(clippy::too_many_arguments)]
 fn ingest_mapped(
     mapped: &Mapped,
-    pid: u32,
-    include_kernel: bool,
-    go_images: &[GoImage],
-    python: &Option<PythonVm>,
-    java: &Option<JavaVm>,
+    ctx: &mut SampleContext<'_>,
     started: Instant,
     perf_origin: &mut Option<u64>,
     collector: &mut SampleCollector,
 ) -> u64 {
     let (samples, lost) = drain_mapped(mapped);
-    record_samples(
-        samples,
-        pid,
-        include_kernel,
-        go_images,
-        python,
-        java,
-        started,
-        perf_origin,
-        collector,
-    );
+    record_samples(samples, ctx, started, perf_origin, collector);
     lost
 }
 
-#[allow(clippy::too_many_arguments)]
 fn record_samples(
     samples: Vec<ParsedSample>,
-    pid: u32,
-    include_kernel: bool,
-    go_images: &[GoImage],
-    python: &Option<PythonVm>,
-    java: &Option<JavaVm>,
+    ctx: &mut SampleContext<'_>,
     started: Instant,
     perf_origin: &mut Option<u64>,
     collector: &mut SampleCollector,
 ) {
     let drain_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let pid = ctx.pid;
     for sample in samples {
         if sample.pid != pid && sample.pid != 0 {
             continue;
         }
-        let Some(key) = assemble_addresses(&sample, pid, include_kernel, go_images, python, java)
-        else {
+        let Some(key) = assemble_addresses(&sample, ctx) else {
             continue;
         };
         if !key.recordable() {
@@ -792,42 +759,28 @@ fn record_samples(
 ///
 /// The kernel section and the user section each have their own leaf, so
 /// symbol lookup subtracts one byte only from the saved frames of that section.
-fn assemble_addresses(
-    sample: &ParsedSample,
-    pid: u32,
-    include_kernel: bool,
-    go_images: &[GoImage],
-    python: &Option<PythonVm>,
-    java: &Option<JavaVm>,
-) -> Option<CountedStack> {
-    assemble_addresses_with(
-        sample,
-        include_kernel,
-        go_images,
-        python,
-        java,
-        &mut |addr, buf| crate::python::read_process(pid, addr, buf),
-    )
+fn assemble_addresses(sample: &ParsedSample, ctx: &mut SampleContext<'_>) -> Option<CountedStack> {
+    let pid = ctx.pid;
+    assemble_addresses_with(sample, ctx, &mut |addr, buf| {
+        crate::python::read_process(pid, addr, buf)
+    })
 }
 
 fn assemble_addresses_with<R>(
     sample: &ParsedSample,
-    include_kernel: bool,
-    go_images: &[GoImage],
-    python: &Option<PythonVm>,
-    java: &Option<JavaVm>,
+    ctx: &mut SampleContext<'_>,
     live_read: &mut R,
 ) -> Option<CountedStack>
 where
     R: FnMut(u64, &mut [u8]) -> bool,
 {
     let (kernel_chain, user_chain) = perf_parse::split_callchain(&sample.callchain);
-    let mut kernel = if include_kernel {
+    let mut kernel = if ctx.include_kernel {
         kernel_chain
     } else {
         Vec::new()
     };
-    if include_kernel && kernel.is_empty() && perf_parse::is_kernel_address(sample.ip) {
+    if ctx.include_kernel && kernel.is_empty() && perf_parse::is_kernel_address(sample.ip) {
         kernel.push(sample.ip);
     }
     kernel.truncate(walk::MAX_FRAMES);
@@ -845,7 +798,7 @@ where
     let sp = sample.user_sp.unwrap_or(0);
     let lr = sample.user_lr.map(walk::strip_pac_code).unwrap_or(0);
     let stack = sample.stack.as_slice();
-    if let Some(vm) = java {
+    if let Some(vm) = ctx.java {
         let mut read_java = |addr: u64, buf: &mut [u8]| {
             if read_copied_stack(stack, sp, addr, buf) {
                 true
@@ -861,7 +814,7 @@ where
             return Some(CountedStack::Java { kernel, frames });
         }
     }
-    if let Some(vm) = python
+    if let Some(vm) = ctx.python
         && let Some(frames) = vm.frames(u64::from(sample.tid), pc, live_read)
     {
         // `poll_events` wakes as soon as a sample is published to minimize lag
@@ -871,9 +824,9 @@ where
         return Some(CountedStack::Python { kernel, frames });
     }
     // Go's pcsp walk uses the copied user stack. A leaf that is not a Go
-    // function keeps the frame-pointer walk below.
+    // function keeps the DWARF / frame-pointer walk below.
     let go_walk = go_sym::unwind(
-        go_images,
+        ctx.go_images,
         pc,
         sp,
         lr,
@@ -884,10 +837,16 @@ where
     let mut user = if let Some(frames) = go_walk {
         frames
     } else {
-        let walked = walk_frame_pointer(pc, fp, lr, |addr, buf| {
-            read_copied_stack(stack, sp, addr, buf)
-        });
-        perf_parse::choose_user_frames(walked, user_chain)
+        unwind_user_stack(
+            ctx.unwinder,
+            ctx.unwind_cache,
+            pc,
+            sp,
+            fp,
+            lr,
+            stack,
+            user_chain,
+        )
     };
     if user.is_empty() {
         let raw_ip = walk::strip_pac_code(sample.ip);
@@ -903,6 +862,85 @@ where
     let mut frames = kernel;
     frames.extend(user);
     Some(CountedStack::Addresses { frames, kernel_len })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unwind_user_stack(
+    unwinder: &LinuxUnwinder,
+    unwind_cache: &mut LinuxUnwindCache,
+    pc: u64,
+    sp: u64,
+    fp: u64,
+    lr: u64,
+    stack: &[u8],
+    user_chain: Vec<u64>,
+) -> Vec<u64> {
+    if !walk::plausible_user_address(pc) {
+        return perf_parse::choose_user_frames(Vec::new(), user_chain);
+    }
+    #[cfg(target_arch = "x86_64")]
+    let regs = framehop::x86_64::UnwindRegsX86_64::new(pc, sp, fp);
+    #[cfg(target_arch = "aarch64")]
+    let regs = framehop::aarch64::UnwindRegsAarch64::new_with_ptr_auth_mask(
+        walk::aarch64_ptr_auth_mask(unwinder.max_known_code_address(), walk::USER_ADDR_LIMIT),
+        lr,
+        sp,
+        fp,
+    );
+    let mut read_word = |addr: u64| -> Result<u64, ()> {
+        let mut buf = [0u8; 8];
+        if read_copied_stack(stack, sp, addr, &mut buf) {
+            Ok(u64::from_le_bytes(buf))
+        } else {
+            Err(())
+        }
+    };
+    let mut walked = Vec::new();
+    let mut ended_at_root = false;
+    let mut hit_stack_end = false;
+    {
+        let mut iter = unwinder.iter_frames(pc, regs, unwind_cache, &mut read_word);
+        while walked.len() < walk::MAX_FRAMES {
+            match iter.next() {
+                Ok(Some(frame)) => {
+                    let addr = walk::strip_pac_code(frame.address());
+                    if !walk::plausible_user_address(addr) {
+                        break;
+                    }
+                    walked.push(addr);
+                }
+                Ok(None) | Err(framehop::Error::ReturnAddressIsNull) => {
+                    ended_at_root = true;
+                    break;
+                }
+                Err(framehop::Error::CouldNotReadStack(_)) => {
+                    hit_stack_end = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if walked.len() <= 1 && !ended_at_root {
+        walked = walk_frame_pointer(pc, fp, lr, |addr, buf| {
+            read_copied_stack(stack, sp, addr, buf)
+        });
+    } else if hit_stack_end
+        && walked.len() >= 2
+        && let Some(&tail) = walked.last()
+        && let Some(pos) = user_chain.iter().rposition(|&addr| addr == tail)
+    {
+        for &caller in &user_chain[pos + 1..] {
+            if walked.len() >= walk::MAX_FRAMES {
+                break;
+            }
+            let caller = walk::strip_pac_code(caller);
+            if walk::plausible_user_address(caller) {
+                walked.push(caller);
+            }
+        }
+    }
+    perf_parse::choose_user_frames(walked, user_chain)
 }
 
 fn read_copied_stack(stack: &[u8], sp: u64, addr: u64, buf: &mut [u8]) -> bool {
@@ -1090,6 +1128,14 @@ fn image_from_elf(mapped_path: &str, open_path: &Path, group: &[MapSpan]) -> Use
         return UserImage::range_only(start, end, module);
     };
     let mut image = UserImage::from_elf(start, end, module, &elf, bias);
+    let exec_spans: Vec<(u64, u64)> = group
+        .iter()
+        .filter(|span| span.executable && span.end > span.start)
+        .map(|span| (span.start, span.end))
+        .collect();
+    if !exec_spans.is_empty() {
+        image.exec_spans = exec_spans;
+    }
     image.go = go_sym::open_image_at(open_path, bias);
     image
 }
@@ -1310,15 +1356,26 @@ fn poll_events(events: &mut [Mapped], deadline: Instant, opts: &RecordOptions) {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_addresses, assemble_addresses_with};
+    use super::{
+        LinuxUnwindCache, LinuxUnwinder, SampleContext, assemble_addresses, assemble_addresses_with,
+    };
     use crate::java::tests::SyntheticJavaFixture;
     use crate::perf_parse::{CONTEXT_KERNEL, CONTEXT_USER, ParsedSample};
     use crate::python::CountedStack;
 
     fn native_stack(sample: &ParsedSample, include_kernel: bool) -> (Vec<u64>, u16) {
-        match assemble_addresses(sample, sample.pid, include_kernel, &[], &None, &None)
-            .expect("frames")
-        {
+        let unwinder = LinuxUnwinder::new();
+        let mut unwind_cache = LinuxUnwindCache::new();
+        let mut ctx = SampleContext {
+            pid: sample.pid,
+            include_kernel,
+            go_images: &[],
+            python: &None,
+            java: &None,
+            unwinder: &unwinder,
+            unwind_cache: &mut unwind_cache,
+        };
+        match assemble_addresses(sample, &mut ctx).expect("frames") {
             CountedStack::Addresses { frames, kernel_len } => (frames, kernel_len),
             CountedStack::Python { .. } => panic!("a synthetic sample is not Python"),
             CountedStack::Java { .. } => panic!("a synthetic sample is not Java"),
@@ -1349,15 +1406,19 @@ mod tests {
                 true
             }
         };
-        let got = assemble_addresses_with(
-            &sample,
-            false,
-            &[],
-            &None,
-            &fixture.vm,
-            &mut dirty_live_read,
-        )
-        .expect("java stack");
+        let unwinder = LinuxUnwinder::new();
+        let mut unwind_cache = LinuxUnwindCache::new();
+        let mut ctx = SampleContext {
+            pid: sample.pid,
+            include_kernel: false,
+            go_images: &[],
+            python: &None,
+            java: &fixture.vm,
+            unwinder: &unwinder,
+            unwind_cache: &mut unwind_cache,
+        };
+        let got =
+            assemble_addresses_with(&sample, &mut ctx, &mut dirty_live_read).expect("java stack");
         assert_eq!(
             got,
             CountedStack::Java {
@@ -1373,15 +1434,8 @@ mod tests {
             stack: Vec::new(),
             ..sample
         };
-        let truncated = assemble_addresses_with(
-            &without_snapshot,
-            false,
-            &[],
-            &None,
-            &fixture.vm,
-            &mut dirty_live_read,
-        )
-        .expect("leaf-only java stack when snapshot is absent");
+        let truncated = assemble_addresses_with(&without_snapshot, &mut ctx, &mut dirty_live_read)
+            .expect("leaf-only java stack when snapshot is absent");
         assert_eq!(
             truncated,
             CountedStack::Java {

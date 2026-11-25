@@ -16,10 +16,8 @@
 //! those builds.
 //!
 //! Symbol bytes are read with a seek, capped at 2,000,000 symbols and 64 MiB
-//! of string table. A larger on-disk binary is still parsed. A `dyld_v1`
-//! shared cache is not a Mach-O image: system libraries that live only in
-//! that cache keep an address range from the in-memory header and do not get
-//! function names.
+//! of string table. A larger on-disk binary is still parsed. System libraries
+//! inside macOS's `dyld_v1` shared cache are resolved via [`crate::dyld_cache`].
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
@@ -40,15 +38,41 @@ use crate::symbol::{self, Presented};
 const MAX_SYMBOL_SPAN: u64 = 16 * 1024 * 1024;
 
 const MH_MAGIC_64: u32 = 0xFEED_FACF;
+pub(crate) const MH_DYLIB_IN_CACHE: u32 = 0x8000_0000;
 const FAT_MAGIC: u32 = 0xCAFE_BABE;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 const CPU_TYPE_ARM64: u32 = 0x0100_000C;
 const LC_SYMTAB: u32 = 0x2;
-const LC_SEGMENT_64: u32 = 0x19;
-const S_ZEROFILL: u32 = 0x1;
-const N_STAB: u8 = 0xe0;
-const N_TYPE: u8 = 0x0e;
-const N_SECT: u8 = 0x0e;
+pub(crate) const LC_SEGMENT_64: u32 = 0x19;
+pub(crate) const S_ZEROFILL: u32 = 0x1;
+pub(crate) const N_STAB: u8 = 0xe0;
+pub(crate) const N_TYPE: u8 = 0x0e;
+pub(crate) const N_SECT: u8 = 0x0e;
+
+pub(crate) const MAX_UNWIND_INFO_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_EH_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_TEXT_UNWIND_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Link-time Mach-O Compact Unwind (`__unwind_info`) and DWARF (`__eh_frame`)
+/// sections passed to `framehop::Module`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MachoUnwind {
+    pub base_svma: u64,
+    pub text_svma: Option<std::ops::Range<u64>>,
+    pub text: Option<crate::walk::SectionBytes>,
+    pub stubs_svma: Option<std::ops::Range<u64>>,
+    pub stub_helper_svma: Option<std::ops::Range<u64>>,
+    pub got_svma: Option<std::ops::Range<u64>>,
+    pub unwind_info: Option<crate::walk::SectionBytes>,
+    pub eh_frame_svma: Option<std::ops::Range<u64>>,
+    pub eh_frame: Option<crate::walk::SectionBytes>,
+}
+
+impl MachoUnwind {
+    pub(crate) fn has_unwind_data(&self) -> bool {
+        self.unwind_info.is_some() || self.eh_frame.is_some()
+    }
+}
 
 /// CPU slice to select inside a universal (fat) binary.
 ///
@@ -95,6 +119,8 @@ pub(crate) struct ImageSymbols {
     pub start: u64,
     /// First runtime address past the image's segments.
     pub end: u64,
+    /// First runtime address past the image's executable `__TEXT` segment.
+    pub(crate) text_end: u64,
     /// File name (`busy`, `libsystem_kernel.dylib`, ...).
     pub module: String,
     /// The file contains a Rust image marker.
@@ -107,6 +133,8 @@ pub(crate) struct ImageSymbols {
     symbols: Vec<(u64, String, Runtime)>,
     /// Unslid DWARF `.debug_line` table from `__DWARF` or a sibling `.dSYM`.
     lines: Arc<LineTable>,
+    /// Unslid Mach-O Compact Unwind / `__eh_frame` sections.
+    unwind: Arc<MachoUnwind>,
 }
 
 impl ImageSymbols {
@@ -118,13 +146,92 @@ impl ImageSymbols {
         Self {
             start,
             end,
+            text_end: end,
             module,
             rust_image: false,
             go: None,
             slide: 0,
             symbols: Vec::new(),
             lines: Arc::new(LineTable::default()),
+            unwind: Arc::new(MachoUnwind::default()),
         }
+    }
+
+    /// Build [`ImageSymbols`] for a dylib extracted from `dyld_shared_cache`.
+    pub(crate) fn from_cached(
+        load_addr: u64,
+        text_vmaddr: u64,
+        text_vmsize: u64,
+        module: String,
+        unslid_symbols: Vec<(u64, String, Runtime)>,
+        unwind: MachoUnwind,
+    ) -> Option<Self> {
+        let text_end = load_addr.checked_add(text_vmsize)?;
+        if text_end <= load_addr {
+            return None;
+        }
+        let slide = load_addr.wrapping_sub(text_vmaddr);
+        let mut symbols = Vec::with_capacity(unslid_symbols.len());
+        for (unslid, name, lang) in unslid_symbols {
+            if !name.is_empty() && unslid != 0 {
+                symbols.push((unslid.wrapping_add(slide), name, lang));
+            }
+        }
+        symbols.sort_by_key(|(addr, _, _)| *addr);
+        symbols.dedup_by(|right, left| right.0 == left.0 && right.1 == left.1);
+        Some(Self {
+            start: load_addr,
+            end: text_end,
+            text_end,
+            module,
+            rust_image: false,
+            go: None,
+            slide,
+            symbols,
+            lines: Arc::new(LineTable::default()),
+            unwind: Arc::new(unwind),
+        })
+    }
+
+    /// Register this image's `__TEXT` range and unwind sections with `unwinder`.
+    pub(crate) fn register_unwind_module<U>(&self, unwinder: &mut U)
+    where
+        U: framehop::Unwinder<Module = framehop::Module<crate::walk::SectionBytes>>,
+    {
+        if !self.unwind.has_unwind_data() || self.text_end <= self.start {
+            return;
+        }
+        let info = framehop::ExplicitModuleSectionInfo {
+            base_svma: self.unwind.base_svma,
+            text_svma: self.unwind.text_svma.clone(),
+            text: self.unwind.text.clone(),
+            stubs_svma: self.unwind.stubs_svma.clone(),
+            stub_helper_svma: self.unwind.stub_helper_svma.clone(),
+            got_svma: self.unwind.got_svma.clone(),
+            unwind_info: self.unwind.unwind_info.clone(),
+            eh_frame_svma: self.unwind.eh_frame_svma.clone(),
+            eh_frame: self.unwind.eh_frame.clone(),
+            ..Default::default()
+        };
+        unwinder.add_module(framehop::Module::new(
+            self.module.clone(),
+            self.start..self.text_end,
+            self.start,
+            info,
+        ));
+    }
+
+    /// Populate runtime-relocated symbols from unslid Mach-O symbol addresses.
+    pub(crate) fn set_unslid_symbols(&mut self, unslid_symbols: Vec<(u64, String, Runtime)>) {
+        let mut symbols = Vec::with_capacity(unslid_symbols.len());
+        for (unslid, name, lang) in unslid_symbols {
+            if !name.is_empty() && unslid != 0 {
+                symbols.push((unslid.wrapping_add(self.slide), name, lang));
+            }
+        }
+        symbols.sort_by_key(|(addr, _, _)| *addr);
+        symbols.dedup_by(|right, left| right.0 == left.0 && right.1 == left.1);
+        self.symbols = symbols;
     }
 
     /// Parse `bytes` as a thin or universal Mach-O loaded at `load_addr`.
@@ -136,7 +243,28 @@ impl ImageSymbols {
         cpu: MachCpu,
     ) -> Option<Self> {
         let cursor = std::io::Cursor::new(bytes);
-        parse_reader(cursor, bytes.len() as u64, load_addr, module, cpu)
+        parse_reader(cursor, bytes.len() as u64, load_addr, module, cpu, true)
+    }
+
+    /// Read segment bounds and unwind sections of `path` without parsing symbols
+    /// or DWARF line tables yet.
+    pub(crate) fn parse_unwind_file(
+        path: &Path,
+        load_addr: u64,
+        module: &str,
+        cpu: MachCpu,
+    ) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        parse_reader(file, len, load_addr, module, cpu, false)
+    }
+
+    /// Populate symbols and DWARF / sibling `.dSYM` line tables from `path`.
+    pub(crate) fn populate_file_symbols(&mut self, path: &Path, cpu: MachCpu) {
+        if let Some(full) = Self::parse_file(path, self.start, &self.module, cpu) {
+            self.symbols = full.symbols;
+            self.lines = full.lines;
+        }
     }
 
     /// Read the symbol table of the binary at `path`.
@@ -144,8 +272,7 @@ impl ImageSymbols {
     /// `load_addr` is the header's address in the target process. The file
     /// size is not a reason to skip it: only the header, load commands, and
     /// the capped symbol table are read. A dyld shared cache (`dyld_v1`) is
-    /// rejected. The caller still keeps the in-memory segment range when this
-    /// returns `None`.
+    /// rejected here and handled by [`crate::dyld_cache`].
     pub(crate) fn parse_file(
         path: &Path,
         load_addr: u64,
@@ -154,7 +281,7 @@ impl ImageSymbols {
     ) -> Option<Self> {
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
-        let mut parsed = parse_reader(file, len, load_addr, module, cpu)?;
+        let mut parsed = parse_reader(file, len, load_addr, module, cpu, true)?;
         if parsed.lines.is_empty()
             && let Some(dsym_lines) = read_dsym_lines(path, cpu)
         {
@@ -207,14 +334,17 @@ impl ImageSymbols {
     }
 }
 
-/// Preferred `__TEXT` vmaddr and the unslid end of the last segment.
+/// Preferred `__TEXT` vmaddr and the unslid end of the image's owned address space.
 ///
-/// The sampler reads this from the target's memory so an image still has a
-/// range when its file has no symbol table (dyld shared-cache stubs).
+/// For dylibs inside `dyld_shared_cache` (`MH_DYLIB_IN_CACHE`), `__LINKEDIT` and
+/// `__DATA` sit in shared regions hundreds of MiB past `__TEXT`, so the image's
+/// span is bounded to `__TEXT` (`text_vmaddr + text_vmsize`) to prevent cached
+/// dylibs from overlapping each other.
 pub(crate) fn segment_bounds(header_and_commands: &[u8]) -> Option<(u64, u64)> {
     let header = Header64::read(header_and_commands)?;
     let commands = header_and_commands.get(32..32 + header.sizeofcmds)?;
-    let (text_vmaddr, end_vmaddr) = walk_segments(commands, header.ncmds)?;
+    let (text_vmaddr, _text_vmsize, end_vmaddr) =
+        walk_segments(commands, header.ncmds, header.flags)?;
     Some((text_vmaddr, end_vmaddr))
 }
 
@@ -224,6 +354,7 @@ fn parse_reader<R: Read + Seek>(
     load_addr: u64,
     module: &str,
     cpu: MachCpu,
+    include_symbols: bool,
 ) -> Option<ImageSymbols> {
     let mut magic = [0u8; 8];
     reader.seek(SeekFrom::Start(0)).ok()?;
@@ -243,11 +374,29 @@ fn parse_reader<R: Read + Seek>(
     }
     let mut commands = vec![0u8; header.sizeofcmds];
     reader.read_exact(&mut commands).ok()?;
-    let (text_vmaddr, end_vmaddr) = walk_segments(&commands, header.ncmds)?;
-    let symtab = find_symtab(&commands, header.ncmds)?;
-    let symbols = read_symbols(&mut reader, offset, size, &symtab)?;
-    let lines =
-        read_dwarf_lines(&mut reader, offset, size, &commands, header.ncmds).unwrap_or_default();
+    let (text_vmaddr, text_vmsize, end_vmaddr) =
+        walk_segments(&commands, header.ncmds, header.flags)?;
+    let symbols = if include_symbols {
+        match find_symtab(&commands, header.ncmds) {
+            Some(symtab) => read_symbols(&mut reader, offset, size, &symtab)?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let lines = if include_symbols {
+        read_dwarf_lines(&mut reader, offset, size, &commands, header.ncmds).unwrap_or_default()
+    } else {
+        LineTable::default()
+    };
+    let unwind = read_macho_unwind(
+        &mut reader,
+        offset,
+        size,
+        text_vmaddr,
+        &commands,
+        header.ncmds,
+    );
     let slide = load_addr.wrapping_sub(text_vmaddr);
     let mut runtime = Vec::with_capacity(symbols.len());
     for (unslid, name, lang) in symbols {
@@ -258,45 +407,54 @@ fn parse_reader<R: Read + Seek>(
     }
     runtime.sort_by_key(|(addr, _, _)| *addr);
     let end = end_vmaddr.wrapping_add(slide);
-    if end <= load_addr {
+    let text_end = load_addr.saturating_add(text_vmsize);
+    if end <= load_addr || text_end <= load_addr {
         return None;
     }
     Some(ImageSymbols {
         start: load_addr,
         end,
+        text_end,
         module: module.to_string(),
         rust_image: false,
         go: None,
         slide,
         symbols: runtime,
         lines: Arc::new(lines),
+        unwind: Arc::new(unwind),
     })
 }
 
-struct Header64 {
-    ncmds: usize,
-    sizeofcmds: usize,
+pub(crate) struct Header64 {
+    pub ncmds: usize,
+    pub sizeofcmds: usize,
+    pub flags: u32,
 }
 
 impl Header64 {
-    fn read(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn read(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 32 || u32::from_le_bytes(bytes[0..4].try_into().ok()?) != MH_MAGIC_64 {
             return None;
         }
         let ncmds = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
         let sizeofcmds = u32::from_le_bytes(bytes[20..24].try_into().ok()?) as usize;
+        let flags = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
         if ncmds > 10_000 {
             return None;
         }
-        Some(Self { ncmds, sizeofcmds })
+        Some(Self {
+            ncmds,
+            sizeofcmds,
+            flags,
+        })
     }
 }
 
-struct Symtab {
-    symoff: u64,
-    nsyms: u32,
-    stroff: u64,
-    strsize: u32,
+pub(crate) struct Symtab {
+    pub symoff: u64,
+    pub nsyms: u32,
+    pub stroff: u64,
+    pub strsize: u32,
 }
 
 fn select_slice<R: Read + Seek>(reader: &mut R, len: u64, cpu: MachCpu) -> Option<(u64, u64)> {
@@ -331,9 +489,10 @@ fn select_slice<R: Read + Seek>(reader: &mut R, len: u64, cpu: MachCpu) -> Optio
     None
 }
 
-/// `__TEXT` vmaddr plus the highest `vmaddr + vmsize` across 64-bit segments.
-fn walk_segments(commands: &[u8], ncmds: usize) -> Option<(u64, u64)> {
+/// `__TEXT` `(vmaddr, vmsize)` plus the unslid end of the image's owned segments.
+fn walk_segments(commands: &[u8], ncmds: usize, flags: u32) -> Option<(u64, u64, u64)> {
     let mut text_vmaddr = None;
+    let mut text_vmsize = 0u64;
     let mut end_vmaddr = 0u64;
     for command in LoadCommands::new(commands, ncmds) {
         // `data` starts at `segname`. A 64-bit segment command is 72 bytes,
@@ -350,16 +509,20 @@ fn walk_segments(commands: &[u8], ncmds: usize) -> Option<(u64, u64)> {
         }
         if name == "__TEXT" {
             text_vmaddr = Some(vmaddr);
+            text_vmsize = vmsize;
         }
     }
     let text_vmaddr = text_vmaddr?;
-    if end_vmaddr <= text_vmaddr {
+    if (flags & MH_DYLIB_IN_CACHE) != 0 {
+        end_vmaddr = text_vmaddr.saturating_add(text_vmsize);
+    }
+    if end_vmaddr <= text_vmaddr || text_vmsize == 0 {
         return None;
     }
-    Some((text_vmaddr, end_vmaddr))
+    Some((text_vmaddr, text_vmsize, end_vmaddr))
 }
 
-fn find_symtab(commands: &[u8], ncmds: usize) -> Option<Symtab> {
+pub(crate) fn find_symtab(commands: &[u8], ncmds: usize) -> Option<Symtab> {
     for command in LoadCommands::new(commands, ncmds) {
         if command.cmd == LC_SYMTAB && command.data.len() >= 16 {
             return Some(Symtab {
@@ -414,6 +577,92 @@ fn read_symbols<R: Read + Seek>(
         symbols.push((n_value, name, runtime));
     }
     Some(symbols)
+}
+
+fn read_macho_unwind<R: Read + Seek>(
+    reader: &mut R,
+    slice_offset: u64,
+    slice_size: u64,
+    base_svma: u64,
+    commands: &[u8],
+    ncmds: usize,
+) -> MachoUnwind {
+    let mut unwind = MachoUnwind {
+        base_svma,
+        ..Default::default()
+    };
+    let mut text_sec = None;
+    let mut unwind_sec = None;
+    let mut eh_sec = None;
+    for command in LoadCommands::new(commands, ncmds) {
+        if command.cmd != LC_SEGMENT_64 || command.data.len() < 64 {
+            continue;
+        }
+        let Ok(nsects_bytes) = command.data[56..60].try_into() else {
+            continue;
+        };
+        let nsects = u32::from_le_bytes(nsects_bytes) as usize;
+        let Some(needed) = 64usize.checked_add(nsects.saturating_mul(80)) else {
+            continue;
+        };
+        if command.data.len() < needed {
+            continue;
+        }
+        for idx in 0..nsects {
+            let sec = &command.data[64 + idx * 80..64 + (idx + 1) * 80];
+            let sect = segname(&sec[0..16]);
+            let seg = segname(&sec[16..32]);
+            let addr = u64::from_le_bytes(sec[32..40].try_into().unwrap());
+            let size = u64::from_le_bytes(sec[40..48].try_into().unwrap());
+            let offset = u64::from(u32::from_le_bytes(sec[48..52].try_into().unwrap()));
+            let flags = u32::from_le_bytes(sec[64..68].try_into().unwrap());
+            if size == 0 || (flags & 0xff) == S_ZEROFILL {
+                continue;
+            }
+            let range = addr..addr.saturating_add(size);
+            match (seg, sect) {
+                ("__TEXT", "__text") if unwind.text_svma.is_none() => {
+                    unwind.text_svma = Some(range);
+                    text_sec = Some(MachSection { offset, size });
+                }
+                ("__TEXT", "__stubs") if unwind.stubs_svma.is_none() => {
+                    unwind.stubs_svma = Some(range);
+                }
+                ("__TEXT", "__stub_helper") if unwind.stub_helper_svma.is_none() => {
+                    unwind.stub_helper_svma = Some(range);
+                }
+                ("__TEXT", "__unwind_info") if unwind_sec.is_none() => {
+                    unwind_sec = Some(MachSection { offset, size });
+                }
+                ("__TEXT", "__eh_frame") if eh_sec.is_none() => {
+                    unwind.eh_frame_svma = Some(range);
+                    eh_sec = Some(MachSection { offset, size });
+                }
+                (_, "__got") if unwind.got_svma.is_none() => {
+                    unwind.got_svma = Some(range);
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(sec) = unwind_sec {
+        unwind.unwind_info =
+            read_mach_section(reader, slice_offset, slice_size, sec, MAX_UNWIND_INFO_BYTES)
+                .map(crate::walk::SectionBytes::new);
+    }
+    if let Some(sec) = eh_sec {
+        unwind.eh_frame =
+            read_mach_section(reader, slice_offset, slice_size, sec, MAX_EH_FRAME_BYTES)
+                .map(crate::walk::SectionBytes::new);
+    }
+    if unwind.has_unwind_data()
+        && let Some(sec) = text_sec
+    {
+        unwind.text =
+            read_mach_section(reader, slice_offset, slice_size, sec, MAX_TEXT_UNWIND_BYTES)
+                .map(crate::walk::SectionBytes::new);
+    }
+    unwind
 }
 
 fn read_dsym_lines(binary_path: &Path, cpu: MachCpu) -> Option<LineTable> {
@@ -553,7 +802,7 @@ fn cstr_at(strings: &[u8], offset: usize) -> Option<&str> {
     std::str::from_utf8(bytes).ok()
 }
 
-fn segname(bytes: &[u8]) -> &str {
+pub(crate) fn segname(bytes: &[u8]) -> &str {
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
@@ -561,20 +810,20 @@ fn segname(bytes: &[u8]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
-struct Command<'a> {
-    cmd: u32,
+pub(crate) struct Command<'a> {
+    pub cmd: u32,
     /// Bytes after the 8-byte `cmd` / `cmdsize` pair.
-    data: &'a [u8],
+    pub data: &'a [u8],
 }
 
-struct LoadCommands<'a> {
+pub(crate) struct LoadCommands<'a> {
     bytes: &'a [u8],
     left: usize,
     cursor: usize,
 }
 
 impl<'a> LoadCommands<'a> {
-    fn new(bytes: &'a [u8], ncmds: usize) -> Self {
+    pub(crate) fn new(bytes: &'a [u8], ncmds: usize) -> Self {
         Self {
             bytes,
             left: ncmds,
@@ -789,6 +1038,40 @@ mod tests {
         assert_eq!(image.location_at(0x1040_0110), Some(("/src/busy.cpp", 18)));
         assert_eq!(image.location_at(0x1040_0180), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dylib_in_cache_bounds_end_to_text_segment() {
+        let mut cmds = Vec::new();
+        cmds.extend(segment_text(0x0001_8000_0000, 0x4000));
+        let mut linkedit = vec![0u8; 72];
+        linkedit[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        linkedit[4..8].copy_from_slice(&72u32.to_le_bytes());
+        linkedit[8..18].copy_from_slice(b"__LINKEDIT");
+        linkedit[24..32].copy_from_slice(&0x0001_c000_0000u64.to_le_bytes());
+        linkedit[32..40].copy_from_slice(&0x0800_0000u64.to_le_bytes());
+        cmds.extend(linkedit);
+
+        let mut uncached = vec![0u8; 32];
+        uncached[0..4].copy_from_slice(&0xFEED_FACFu32.to_le_bytes());
+        uncached[4..8].copy_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
+        uncached[12..16].copy_from_slice(&6u32.to_le_bytes()); // MH_DYLIB
+        uncached[16..20].copy_from_slice(&2u32.to_le_bytes());
+        uncached[20..24].copy_from_slice(&(cmds.len() as u32).to_le_bytes());
+        let mut uncached_full = uncached.clone();
+        uncached_full.extend_from_slice(&cmds);
+        assert_eq!(
+            super::segment_bounds(&uncached_full),
+            Some((0x0001_8000_0000, 0x0001_c000_0000 + 0x0800_0000))
+        );
+
+        let mut cached = uncached;
+        cached[24..28].copy_from_slice(&super::MH_DYLIB_IN_CACHE.to_le_bytes());
+        cached.extend_from_slice(&cmds);
+        assert_eq!(
+            super::segment_bounds(&cached),
+            Some((0x0001_8000_0000, 0x0001_8000_0000 + 0x4000))
+        );
     }
 
     fn synthetic_dsym_macho(addr: u64, len: u8, path: &str, line: u8) -> Vec<u8> {

@@ -121,12 +121,12 @@ anyprof convert -i <INPUT> -o <OUTPUT> [-f <FROM_FORMAT>] -t <TO_FORMAT>
 ## Permissions & Platform Notes
 
 - **Node.js**: Requires no root privileges. On macOS/Linux, `anyprof` verifies the target is a `node` binary before sending `SIGUSR1` (avoid signaling during the first milliseconds of startup before Node installs its signal handler). On Windows, `node` must be on `PATH`.
-- **macOS**: Native, Rust, Go, Python, and Java sampling call Mach `task_for_pid` and require `sudo` (`sudo anyprof rec -p <pid>`). Processes protected by SIP or Hardened Runtime cannot be attached. Compile C/C++ with `-fno-omit-frame-pointer` and Rust with `-C force-frame-pointers=yes` so caller chains unwind completely.
+- **macOS**: Native, Rust, Go, Python, and Java sampling call Mach `task_for_pid` and require `sudo` (`sudo anyprof rec -p <pid>`). Processes protected by SIP or Hardened Runtime cannot be attached. Unwinds standard release C/C++ and Rust binaries via Mach-O Compact Unwind (`__unwind_info`) and `__eh_frame` without requiring `-fno-omit-frame-pointer` or `-C force-frame-pointers=yes`, and resolves system framework symbols directly from `dyld_shared_cache`.
 - **Linux (`x86_64` & `aarch64`)**: Uses non-suspending `perf_event_open` (`PERF_COUNT_SW_TASK_CLOCK`) and resolves container paths via `/proc/<pid>/root`.
   - User-space sampling requires `kernel.perf_event_paranoid <= 2` (or `CAP_PERFMON` / `root`).
   - Kernel frames (`-k`) require `kernel.perf_event_paranoid <= 1` and `kernel.kptr_restrict = 0` for `/proc/kallsyms` symbol names.
   - Python and Java read VM frames via `process_vm_readv`, which checks ptrace attach permission: under `kernel.yama.ptrace_scope = 1` (Ubuntu default), attaching to an unrelated same-user PID requires `root`, `CAP_SYS_PTRACE`, or `ptrace_scope = 0` (spawning via `anyprof rec -- <cmd>` works at `ptrace_scope = 1`).
-  - Compile C/C++ with `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer` and Rust with `-C force-frame-pointers=yes`.
+  - Unwinds standard release C/C++ and Rust binaries via offline DWARF `.eh_frame` / `PT_GNU_EH_FRAME` over `PERF_SAMPLE_STACK_USER` without requiring `-fno-omit-frame-pointer` or `-C force-frame-pointers=yes` (falling back to frame pointers and kernel callchains beyond the 8 KiB stack window).
 - **Windows `x64`**: Same-user processes require no administrator privileges; cross-user or elevated processes require `SeDebugPrivilege`. `StackWalk64` uses PE unwind tables directly (no frame-pointer flag needed); keep matching `.pdb` files next to executables (`-C debuginfo=2` for Rust) for symbol names.
 
 For deep runtime ABI layouts, `pclntab` / HotSpot / CPython unwinding rules, and symbolizer limits, see [docs/internals.md](docs/internals.md).

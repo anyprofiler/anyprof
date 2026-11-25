@@ -2,16 +2,18 @@
 //!
 //! `task_for_pid` yields a Mach task port (root, or a debugger entitlement).
 //! Each tick asks `thread_info` which threads are actually running, suspends
-//! those threads, reads `ARM_THREAD_STATE64` / `x86_THREAD_STATE64`, and walks
-//! the frame-pointer chain with `mach_vm_read_overwrite`. A tick with no
-//! running thread adds no samples. Threads are resumed before their send
-//! rights are dropped. Symbols come from each image's Mach-O symbol table
-//! ([`crate::macho`]). Signed arm64 pointers are stripped with `xpaci` /
-//! `xpacd` when the thread-state flags say so; they are not authenticated.
+//! those threads, reads `ARM_THREAD_STATE64` / `x86_THREAD_STATE64`, and unwinds
+//! Compact Unwind / `__eh_frame` (`framehop`) or the frame-pointer chain over
+//! cached 4 KiB stack pages via `mach_vm_read_overwrite`. A tick with no running
+//! thread adds no samples. Threads are resumed before their send rights are
+//! dropped. Symbols come from each image's Mach-O symbol table ([`crate::macho`])
+//! and macOS's `dyld_v1` shared cache ([`crate::dyld_cache`]). Signed arm64
+//! pointers are stripped with `xpaci` / `xpacd` when the thread-state flags say
+//! so; they are not authenticated.
 //!
 //! Kernel frames are not available through this interface. `-k` is ignored and
-//! a warning is logged. Linux x86_64 records kernel frames with perf events.
-//! Windows x64 samples user frames only, the same as macOS.
+//! a warning is logged. Linux records kernel frames with perf events. Windows
+//! x64 samples user frames only, the same as macOS.
 
 use std::ffi::c_char;
 use std::path::Path;
@@ -20,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyprof_core::{
     Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Target, inspect,
 };
+use framehop::Unwinder as _;
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_types::{task_t, thread_act_array_t, thread_act_t};
 use mach2::message::mach_msg_type_number_t;
@@ -35,6 +38,10 @@ use crate::java::{self, JavaVm};
 use crate::macho::{ImageSymbols, MachCpu, segment_bounds};
 use crate::policy::{self, SampleCollector, StripKind};
 use crate::python::{self, CountedStack, PythonVm};
+use crate::walk::SectionBytes;
+
+type MachUnwinder = framehop::UnwinderNative<SectionBytes, framehop::MustNotAllocateDuringUnwind>;
+type MachUnwindCache = framehop::CacheNative<framehop::MustNotAllocateDuringUnwind>;
 
 const MAX_FRAMES: usize = 64;
 const THREAD_BASIC_INFO: u32 = 3;
@@ -81,22 +88,29 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
     }
 
     let task = Task::attach(target.pid)?;
-    let symbols = load_symbols(task.port, target.pid);
-    let images = remote_images(task.port)
-        .into_iter()
-        .map(|image| (image.path, image.load, image.end))
-        .collect::<Vec<_>>();
-    let python = python::attach_mach(&images);
-    let java = java::attach_mach(&images, &mut |addr, buf| read_task(task.port, addr, buf));
+    let mut unwinder = MachUnwinder::new();
+    let mut unwind_cache = MachUnwindCache::new_in();
+    let mut go_images = Vec::new();
+    let mut python = None;
+    let mut java = None;
+    let mut symbols = SymbolTable::new(target.pid);
+    symbols.sync_from_task(
+        task.port,
+        &mut unwinder,
+        &mut go_images,
+        &mut python,
+        &mut java,
+    );
     tracing::debug!(
         pid = target.pid,
-        images = symbols.len(),
-        "native symbol tables loaded"
+        images = symbols.images.len(),
+        "native unwind tables prepared"
     );
 
     let started = Instant::now();
     let mut next = started;
     let mut collector = SampleCollector::new();
+    let mut cache_activated = false;
     loop {
         if opts.stop.stop_requested() {
             break;
@@ -107,11 +121,20 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         {
             break;
         }
-        let go_images: Vec<_> = symbols
-            .iter()
-            .filter_map(|image| image.go.clone())
-            .collect();
-        match task.sample_addresses(&go_images, python.as_ref(), java.as_ref()) {
+        symbols.sync_from_task(
+            task.port,
+            &mut unwinder,
+            &mut go_images,
+            &mut python,
+            &mut java,
+        );
+        match task.sample_addresses(
+            &unwinder,
+            &mut unwind_cache,
+            &go_images,
+            python.as_ref(),
+            java.as_ref(),
+        ) {
             Ok(stacks) => {
                 let offset_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 for hit in stacks {
@@ -135,6 +158,10 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
                 break;
             }
         }
+        if !cache_activated && !opts.stop.stop_requested() {
+            cache_activated = true;
+            symbols.activate_shared_cache(&mut unwinder);
+        }
         next += interval;
         let now = Instant::now();
         if next < now {
@@ -155,12 +182,21 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         }
     }
 
+    symbols.sync_from_task(
+        task.port,
+        &mut unwinder,
+        &mut go_images,
+        &mut python,
+        &mut java,
+    );
+    symbols.finish_fallback_if_empty();
+
     let comm = inspect(target.pid).and_then(|snapshot| snapshot.comm);
     Ok(finish_profile(
         target.pid,
         comm,
         collector,
-        &symbols,
+        &mut symbols,
         started.elapsed(),
         interval,
     ))
@@ -183,7 +219,7 @@ fn finish_profile(
     pid: u32,
     comm: Option<String>,
     collector: SampleCollector,
-    symbols: &[ImageSymbols],
+    symbols: &mut SymbolTable,
     elapsed: Duration,
     interval: Duration,
 ) -> Profile {
@@ -207,20 +243,30 @@ fn finish_profile(
     }
 }
 
-fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
+fn frame_for(addr: u64, table: &mut SymbolTable, leaf: bool) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
-    if let Some(frame) = go_frame(symbols, lookup, addr) {
+    if let Some(frame) = go_frame(&table.images, lookup, addr) {
         return frame;
     }
     if lookup != addr
-        && let Some(frame) = go_frame(symbols, addr, addr)
+        && let Some(frame) = go_frame(&table.images, addr, addr)
     {
         return frame;
     }
-    let image = symbols
+    let idx = table
+        .images
         .iter()
-        .find(|image| image.contains(lookup))
-        .or_else(|| symbols.iter().find(|image| image.contains(addr)));
+        .position(|entry| entry.symbols.contains(lookup))
+        .or_else(|| {
+            table
+                .images
+                .iter()
+                .position(|entry| entry.symbols.contains(addr))
+        });
+    if let Some(idx) = idx {
+        table.ensure_symbols_loaded(idx);
+    }
+    let image = idx.map(|i| &table.images[i].symbols);
     let (name, runtime) = image
         .and_then(|image| {
             image
@@ -247,9 +293,9 @@ fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
     frame
 }
 
-fn go_frame(symbols: &[ImageSymbols], lookup: u64, addr: u64) -> Option<Frame> {
-    for image in symbols {
-        let Some(go) = &image.go else {
+fn go_frame(images: &[TrackedImage], lookup: u64, addr: u64) -> Option<Frame> {
+    for entry in images {
+        let Some(go) = &entry.symbols.go else {
             continue;
         };
         let Some(symbol) = go.symbol(lookup) else {
@@ -259,7 +305,7 @@ fn go_frame(symbols: &[ImageSymbols], lookup: u64, addr: u64) -> Option<Frame> {
         frame.file = symbol.file;
         frame.line = symbol.line;
         frame.address = Some(addr);
-        frame.module = Some(image.module.clone());
+        frame.module = Some(entry.symbols.module.clone());
         return Some(frame);
     }
     None
@@ -287,6 +333,8 @@ impl Task {
 
     fn sample_addresses(
         &self,
+        unwinder: &MachUnwinder,
+        unwind_cache: &mut MachUnwindCache,
         go_images: &[crate::go_sym::GoImage],
         python: Option<&PythonVm>,
         java: Option<&JavaVm>,
@@ -306,7 +354,15 @@ impl Task {
             // `threads` stays alive until this function returns, so each
             // resume in `unwind_thread` happens before `ThreadList` drops the
             // send rights.
-            match unwind_thread(self.port, *thread, go_images, python, java) {
+            match unwind_thread(
+                self.port,
+                *thread,
+                unwinder,
+                unwind_cache,
+                go_images,
+                python,
+                java,
+            ) {
                 Ok(Some(hit)) => stacks.push(hit),
                 Ok(None) => {}
                 Err(err) => return Err(err),
@@ -501,9 +557,16 @@ struct ThreadHit {
     stack: CountedStack,
 }
 
+enum PendingStack {
+    Native(usize),
+    Language(CountedStack),
+}
+
 fn unwind_thread(
     task: task_t,
     thread: thread_act_t,
+    unwinder: &MachUnwinder,
+    unwind_cache: &mut MachUnwindCache,
     go_images: &[crate::go_sym::GoImage],
     python: Option<&PythonVm>,
     java: Option<&JavaVm>,
@@ -524,39 +587,40 @@ fn unwind_thread(
             &mut count,
         )
     };
-    let hit = if kr == KERN_SUCCESS {
+    let mut raw_addrs = [0u64; MAX_FRAMES];
+    let mut tid = 0u64;
+    let pending = if kr == KERN_SUCCESS {
         let (pc, sp, fp, lr) = registers(&state);
-        let tid = thread_identifier(thread).unwrap_or(0);
-        let name = thread_name(thread);
+        tid = thread_identifier(thread).unwrap_or(0);
         // `frames` is `None` for a leaf outside the code cache and for a
         // blob whose method cannot be read. Both keep the native walk.
-        let stack = if let Some(vm) = java
+        if let Some(vm) = java
             && let Some(java_frames) =
                 vm.frames(pc, sp, fp, &mut |addr, buf| read_task(task, addr, buf))
         {
-            Some(CountedStack::Java {
+            Some(PendingStack::Language(CountedStack::Java {
                 kernel: Vec::new(),
                 frames: java_frames,
-            })
+            }))
         } else if let Some(vm) = python
             && let Some(py_frames) = vm.frames(tid, pc, &mut |addr, buf| read_task(task, addr, buf))
         {
-            Some(CountedStack::Python {
+            Some(PendingStack::Language(CountedStack::Python {
                 kernel: Vec::new(),
                 frames: py_frames,
-            })
+            }))
+        } else if !go_images.is_empty()
+            && let Some(go_frames) = walk_go_frames(task, pc, sp, lr, go_images)
+        {
+            (!go_frames.is_empty()).then_some(PendingStack::Language(CountedStack::Addresses {
+                frames: go_frames,
+                kernel_len: 0,
+            }))
         } else {
-            let frames = walk_frames(task, pc, sp, fp, lr, go_images);
-            if frames.is_empty() {
-                None
-            } else {
-                Some(CountedStack::Addresses {
-                    frames,
-                    kernel_len: 0,
-                })
-            }
-        };
-        stack.map(|stack| ThreadHit { tid, name, stack })
+            let n =
+                walk_native_frames(task, unwinder, unwind_cache, pc, sp, fp, lr, &mut raw_addrs);
+            (n > 0).then_some(PendingStack::Native(n))
+        }
     } else {
         None
     };
@@ -566,7 +630,18 @@ fn unwind_thread(
             "thread_resume failed (kern return {resume_kr}); a target thread may still be suspended"
         )));
     }
-    Ok(hit)
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    let name = thread_name(thread);
+    let stack = match pending {
+        PendingStack::Native(len) => CountedStack::Addresses {
+            frames: raw_addrs[..len].to_vec(),
+            kernel_len: 0,
+        },
+        PendingStack::Language(stack) => stack,
+    };
+    Ok(Some(ThreadHit { tid, name, stack }))
 }
 
 /// `thread_identifier_info.thread_id`, which CPython stores from `pthread_threadid_np`.
@@ -620,46 +695,106 @@ fn registers(state: &ThreadState) -> (u64, u64, u64, u64) {
     (state.__rip, state.__rsp, state.__rbp, 0)
 }
 
-fn walk_frames(
+fn walk_go_frames(
     task: task_t,
     pc: u64,
     sp: u64,
-    fp: u64,
     lr: u64,
     go_images: &[crate::go_sym::GoImage],
-) -> Vec<u64> {
+) -> Option<Vec<u64>> {
     let machine = if cfg!(target_arch = "aarch64") {
         crate::go_sym::GoMachine::Arm64
     } else {
         crate::go_sym::GoMachine::X86_64
     };
-    if let Some(frames) = crate::go_sym::unwind(
+    let mut reader = CachedTaskStackReader::new(task);
+    crate::go_sym::unwind(
         go_images,
         pc,
         sp,
         lr,
         machine,
-        |addr, buf| read_task(task, addr, buf),
+        |addr, buf| reader.read_slice(addr, buf),
         |addr| apply_strip(addr, policy::stack_strip_flags(), StripKind::Code, false),
-    ) {
-        return frames;
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_native_frames(
+    task: task_t,
+    unwinder: &MachUnwinder,
+    unwind_cache: &mut MachUnwindCache,
+    pc: u64,
+    sp: u64,
+    fp: u64,
+    lr: u64,
+    out: &mut [u64; MAX_FRAMES],
+) -> usize {
+    if !plausible_code(pc) {
+        return 0;
     }
-    let mut frames = Vec::new();
+    let mut reader = CachedTaskStackReader::new(task);
+    let stack_flags = policy::stack_strip_flags();
+    #[cfg(target_arch = "x86_64")]
+    let regs = framehop::x86_64::UnwindRegsX86_64::new(pc, sp, fp);
+    #[cfg(target_arch = "aarch64")]
+    let regs = framehop::aarch64::UnwindRegsAarch64::new_with_ptr_auth_mask(
+        crate::walk::aarch64_ptr_auth_mask(
+            unwinder.max_known_code_address(),
+            0x0000_8000_0000_0000,
+        ),
+        lr,
+        sp,
+        fp,
+    );
+    let mut len = 0usize;
+    let mut ended_at_root = false;
+    {
+        let mut read_word = |addr: u64| reader.read_u64(addr);
+        let mut iter = unwinder.iter_frames(pc, regs, unwind_cache, &mut read_word);
+        while len < MAX_FRAMES {
+            match iter.next() {
+                Ok(Some(frame)) => {
+                    let addr = apply_strip(frame.address(), stack_flags, StripKind::Code, false);
+                    if !plausible_code(addr) {
+                        break;
+                    }
+                    out[len] = addr;
+                    len += 1;
+                }
+                Ok(None) | Err(framehop::Error::ReturnAddressIsNull) => {
+                    ended_at_root = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if len <= 1 && !ended_at_root {
+        return walk_fp_into(&mut reader, pc, fp, lr, out);
+    }
+    len
+}
+
+fn walk_fp_into(
+    reader: &mut CachedTaskStackReader,
+    pc: u64,
+    mut fp: u64,
+    lr: u64,
+    out: &mut [u64; MAX_FRAMES],
+) -> usize {
+    let mut len = 0usize;
     if plausible_code(pc) {
-        frames.push(pc);
+        out[0] = pc;
+        len = 1;
     }
-    let mut fp = fp;
-    let mut guard = 0;
-    while frames.len() < MAX_FRAMES && plausible_frame(fp) {
+    let stack_flags = policy::stack_strip_flags();
+    let mut guard = 0usize;
+    while len < MAX_FRAMES && plausible_frame(fp) {
         let mut record = [0u8; 16];
-        if !read_task(task, fp, &mut record) {
+        if !reader.read_slice(fp, &mut record) {
             break;
         }
-        // `flags` applies to the registers already stripped above. A stack
-        // slot keeps its own signature: an arm64 process can be inside an
-        // arm64e callee. `stack_strip_flags` ignores `NO_PTRAUTH` so `xpacd`
-        // and `xpaci` still run. Both are the identity on an unsigned pointer.
-        let stack_flags = policy::stack_strip_flags();
         let next_fp = apply_strip(
             u64::from_le_bytes(record[0..8].try_into().unwrap()),
             stack_flags,
@@ -675,7 +810,8 @@ fn walk_frames(
         if !plausible_code(ret) {
             break;
         }
-        frames.push(ret);
+        out[len] = ret;
+        len += 1;
         if next_fp <= fp {
             break;
         }
@@ -685,10 +821,60 @@ fn walk_frames(
             break;
         }
     }
-    if frames.len() == 1 && plausible_code(lr) && lr != frames[0] {
-        frames.push(lr);
+    if len == 1 && plausible_code(lr) && lr != out[0] {
+        out[1] = lr;
+        len = 2;
     }
-    frames
+    len
+}
+
+struct CachedTaskStackReader {
+    task: task_t,
+    page_base: u64,
+    valid: bool,
+    page: [u8; 4096],
+}
+
+impl CachedTaskStackReader {
+    fn new(task: task_t) -> Self {
+        Self {
+            task,
+            page_base: u64::MAX,
+            valid: false,
+            page: [0u8; 4096],
+        }
+    }
+
+    fn read_u64(&mut self, addr: u64) -> Result<u64, ()> {
+        let mut buf = [0u8; 8];
+        if self.read_slice(addr, &mut buf) {
+            Ok(u64::from_le_bytes(buf))
+        } else {
+            Err(())
+        }
+    }
+
+    fn read_slice(&mut self, addr: u64, buf: &mut [u8]) -> bool {
+        if addr == 0 || buf.is_empty() {
+            return false;
+        }
+        let off = (addr & 0xfff) as usize;
+        if buf.len() <= 4096 - off {
+            let aligned = addr & !0xfff;
+            if !self.valid || self.page_base != aligned {
+                if read_task(self.task, aligned, &mut self.page) {
+                    self.page_base = aligned;
+                    self.valid = true;
+                } else {
+                    self.valid = false;
+                    return read_task(self.task, addr, buf);
+                }
+            }
+            buf.copy_from_slice(&self.page[off..off + buf.len()]);
+            return true;
+        }
+        read_task(self.task, addr, buf)
+    }
 }
 
 fn plausible_code(addr: u64) -> bool {
@@ -794,41 +980,252 @@ pub(crate) fn read_memory(task: task_t, addr: u64, buf: &mut [u8]) -> bool {
     read_task(task, addr, buf)
 }
 
-fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {
-    let cpu = MachCpu::host();
-    let mut images = Vec::new();
-    for remote in remote_images(task) {
+enum ImageSource {
+    File(String),
+    PendingCache(String),
+    SharedCache(String),
+    None,
+}
+
+struct TrackedImage {
+    symbols: ImageSymbols,
+    source: ImageSource,
+    symbols_loaded: bool,
+}
+
+struct SymbolTable {
+    pid: u32,
+    cpu: MachCpu,
+    shared_cache: Option<Option<&'static crate::dyld_cache::DyldSharedCache>>,
+    info_addr: Option<u64>,
+    seen_dyld_count: Option<u32>,
+    seen_loads: std::collections::HashSet<u64>,
+    raw_images: Vec<(String, u64, u64)>,
+    images: Vec<TrackedImage>,
+}
+
+impl SymbolTable {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            cpu: MachCpu::host(),
+            shared_cache: None,
+            info_addr: None,
+            seen_dyld_count: None,
+            seen_loads: std::collections::HashSet::new(),
+            raw_images: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    fn sync_from_task(
+        &mut self,
+        task: task_t,
+        unwinder: &mut MachUnwinder,
+        go_images: &mut Vec<crate::go_sym::GoImage>,
+        python: &mut Option<PythonVm>,
+        java: &mut Option<JavaVm>,
+    ) {
+        let info_addr = match self.info_addr {
+            Some(addr) => addr,
+            None => {
+                let Some(addr) = dyld_info_addr(task) else {
+                    return;
+                };
+                self.info_addr = Some(addr);
+                addr
+            }
+        };
+        let mut count_buf = [0u8; 4];
+        if !read_task(task, info_addr.saturating_add(4), &mut count_buf) {
+            return;
+        }
+        let current_count = u32::from_le_bytes(count_buf);
+        if self.seen_dyld_count == Some(current_count) {
+            return;
+        }
+        let listed = remote_images(task);
+        if listed.is_empty() && current_count == 0 {
+            return;
+        }
+        self.seen_dyld_count = Some(current_count);
+
+        let mut added_any = false;
+        for remote in listed {
+            if !self.seen_loads.insert(remote.load) {
+                continue;
+            }
+            added_any = true;
+            self.raw_images
+                .push((remote.path.clone(), remote.load, remote.end));
+            let tracked = self.load_tracked_unwind(remote);
+            if let Some(tracked) = tracked {
+                tracked.symbols.register_unwind_module(unwinder);
+                if let Some(go) = &tracked.symbols.go {
+                    go_images.push(go.clone());
+                }
+                self.images.push(tracked);
+            }
+        }
+
+        if added_any {
+            if python.is_none() {
+                *python = python::attach_mach(&self.raw_images);
+            }
+            if java.is_none() {
+                *java = java::attach_mach(&self.raw_images, &mut |addr, buf| {
+                    read_task(task, addr, buf)
+                });
+            }
+        }
+    }
+
+    fn activate_shared_cache(&mut self, unwinder: &mut MachUnwinder) {
+        let cpu = self.cpu;
+        let Some(cache) = *self
+            .shared_cache
+            .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
+        else {
+            return;
+        };
+        for entry in &mut self.images {
+            let ImageSource::PendingCache(path) = &entry.source else {
+                continue;
+            };
+            let path = path.clone();
+            if let Some(parsed) =
+                cache.load_unwind(&path, entry.symbols.start, &entry.symbols.module)
+            {
+                parsed.register_unwind_module(unwinder);
+                entry.symbols = parsed;
+                entry.source = ImageSource::SharedCache(path);
+                entry.symbols_loaded = false;
+            } else {
+                entry.source = ImageSource::None;
+                entry.symbols_loaded = true;
+            }
+        }
+    }
+
+    fn load_tracked_unwind(&self, remote: RemoteImage) -> Option<TrackedImage> {
         let module = module_name(&remote.path);
-        let file_symbols =
-            ImageSymbols::parse_file(Path::new(&remote.path), remote.load, &module, cpu);
-        let rust_image = crate::rust_image::file_is_rust(Path::new(&remote.path));
-        let go = attach_go(&remote.path, remote.load);
-        if let Some(mut parsed) = file_symbols {
-            parsed.rust_image = rust_image;
-            parsed.go = go;
-            images.push(parsed);
-            continue;
+        let path = Path::new(&remote.path);
+        if path.is_file() {
+            let file_unwind = ImageSymbols::parse_unwind_file(path, remote.load, &module, self.cpu);
+            let rust_image = crate::rust_image::file_is_rust(path);
+            let go = attach_go(&remote.path, remote.load);
+            if let Some(mut parsed) = file_unwind {
+                parsed.rust_image = rust_image;
+                parsed.go = go;
+                return Some(TrackedImage {
+                    symbols: parsed,
+                    source: ImageSource::File(remote.path),
+                    symbols_loaded: false,
+                });
+            }
+            if remote.end > remote.load {
+                let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
+                image.rust_image = rust_image;
+                image.go = go;
+                return Some(TrackedImage {
+                    symbols: image,
+                    source: ImageSource::PendingCache(remote.path),
+                    symbols_loaded: false,
+                });
+            }
+            return None;
         }
+
+        if let Some(Some(cache)) = self.shared_cache {
+            if let Some(parsed) = cache.load_unwind(&remote.path, remote.load, &module) {
+                return Some(TrackedImage {
+                    symbols: parsed,
+                    source: ImageSource::SharedCache(remote.path),
+                    symbols_loaded: false,
+                });
+            }
+            if remote.end > remote.load {
+                return Some(TrackedImage {
+                    symbols: ImageSymbols::range_only(remote.load, remote.end, module),
+                    source: ImageSource::None,
+                    symbols_loaded: true,
+                });
+            }
+            return None;
+        }
+
         if remote.end > remote.load {
-            let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
-            image.rust_image = rust_image;
-            image.go = go;
-            images.push(image);
+            return Some(TrackedImage {
+                symbols: ImageSymbols::range_only(remote.load, remote.end, module),
+                source: ImageSource::PendingCache(remote.path),
+                symbols_loaded: false,
+            });
+        }
+        None
+    }
+
+    fn finish_fallback_if_empty(&mut self) {
+        if self.images.is_empty()
+            && let Some(path) = pid_path(self.pid)
+            && let Some(mut parsed) =
+                ImageSymbols::parse_file(Path::new(&path), 0, &module_name(&path), self.cpu)
+        {
+            // No dyld list. A slide of 0 is wrong for a PIE binary, so this only
+            // helps when the image was linked at a fixed address.
+            tracing::debug!(
+                pid = self.pid,
+                path,
+                "native symbol load fell back to proc_pidpath"
+            );
+            parsed.rust_image = crate::rust_image::file_is_rust(Path::new(&path));
+            self.images.push(TrackedImage {
+                symbols: parsed,
+                source: ImageSource::None,
+                symbols_loaded: true,
+            });
         }
     }
-    if images.is_empty()
-        && let Some(path) = pid_path(pid)
-        && let Some(mut parsed) =
-            ImageSymbols::parse_file(Path::new(&path), 0, &module_name(&path), cpu)
-    {
-        // No dyld list. A slide of 0 is wrong for a PIE binary, so this only
-        // helps when the image was linked at a fixed address. The dyld path
-        // above is the one the sampler relies on.
-        tracing::debug!(pid, path, "native symbol load fell back to proc_pidpath");
-        parsed.rust_image = crate::rust_image::file_is_rust(Path::new(&path));
-        images.push(parsed);
+
+    fn ensure_symbols_loaded(&mut self, idx: usize) {
+        let cpu = self.cpu;
+        let shared_cache = &mut self.shared_cache;
+        let Some(entry) = self.images.get_mut(idx) else {
+            return;
+        };
+        if entry.symbols_loaded {
+            return;
+        }
+        entry.symbols_loaded = true;
+        match &entry.source {
+            ImageSource::File(path) => {
+                entry.symbols.populate_file_symbols(Path::new(path), cpu);
+            }
+            ImageSource::PendingCache(path) => {
+                let path = path.clone();
+                if let Some(cache) = *shared_cache
+                    .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
+                {
+                    if let Some(mut parsed) =
+                        cache.load_unwind(&path, entry.symbols.start, &entry.symbols.module)
+                    {
+                        cache.populate_symbols(&path, &mut parsed);
+                        entry.symbols = parsed;
+                        entry.source = ImageSource::SharedCache(path);
+                    } else {
+                        cache.populate_symbols(&path, &mut entry.symbols);
+                    }
+                }
+            }
+            ImageSource::SharedCache(path) => {
+                if let Some(cache) = *shared_cache
+                    .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
+                {
+                    cache.populate_symbols(path, &mut entry.symbols);
+                }
+            }
+            ImageSource::None => {}
+        }
     }
-    images
 }
 
 fn attach_go(path: &str, load_addr: u64) -> Option<crate::go_sym::GoImage> {
@@ -846,10 +1243,15 @@ fn remote_images(task: task_t) -> Vec<RemoteImage> {
     let Some(info_addr) = dyld_info_addr(task) else {
         return Vec::new();
     };
-    let mut header = [0u8; 16];
-    if !read_task(task, info_addr, &mut header) {
+    let mut header = [0u8; 40];
+    let has_dyld_slot = if read_task(task, info_addr, &mut header) {
+        true
+    } else if read_task(task, info_addr, &mut header[..16]) {
+        false
+    } else {
         return Vec::new();
-    }
+    };
+    let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let count = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
     let array = u64::from_le_bytes(header[8..16].try_into().unwrap());
     if count == 0 || count > 4096 || array == 0 {
@@ -860,7 +1262,7 @@ fn remote_images(task: task_t) -> Vec<RemoteImage> {
     if !read_remote(task, array, &mut raw) {
         return Vec::new();
     }
-    let mut images = Vec::with_capacity(count);
+    let mut images = Vec::with_capacity(count + 1);
     let (rows, _) = raw.as_chunks::<24>();
     for chunk in rows {
         let load = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
@@ -871,6 +1273,21 @@ fn remote_images(task: task_t) -> Vec<RemoteImage> {
         let path = read_remote_cstr(task, path_ptr).unwrap_or_default();
         let end = image_end(task, load).unwrap_or(load.saturating_add(0x1000));
         images.push(RemoteImage { load, end, path });
+    }
+    // `dyldImageLoadAddress` sits at offset 32 of `dyld_all_image_infos` (version >= 2)
+    // and is not listed in `infoArray`, so include `/usr/lib/dyld` (`start` above `main`).
+    if has_dyld_slot && version >= 2 {
+        let dyld_load = u64::from_le_bytes(header[32..40].try_into().unwrap());
+        if dyld_load != 0
+            && !images.iter().any(|img| img.load == dyld_load)
+            && let Some(end) = image_end(task, dyld_load)
+        {
+            images.push(RemoteImage {
+                load: dyld_load,
+                end,
+                path: "/usr/lib/dyld".to_string(),
+            });
+        }
     }
     images
 }
