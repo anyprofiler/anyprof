@@ -137,6 +137,27 @@ pub struct Stack {
     pub weight: u64,
 }
 
+/// Maximum chronological samples retained in [`Profile::samples`].
+///
+/// Recordings that exceed this bound still accumulate every hit into
+/// [`Profile::stacks`] and omit per-sample timestamps so memory stays bounded.
+pub const MAX_TIMED_SAMPLES: usize = 2_000_000;
+
+/// One timestamped sample attributed to an OS thread and deduplicated stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedSample {
+    /// Operating-system thread identifier (`0` when unknown).
+    pub tid: u64,
+    /// Thread name when known (for example from `/proc/<pid>/task/<tid>/comm`).
+    pub thread_name: Option<String>,
+    /// Elapsed nanoseconds since the start of the recording.
+    pub offset_ns: u64,
+    /// Index into [`Profile::stacks`].
+    pub stack_index: usize,
+    /// Sample count represented by this entry (usually `1`).
+    pub weight: u64,
+}
+
 /// A finished CPU profile.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Profile {
@@ -151,6 +172,9 @@ pub struct Profile {
     pub period: Option<Duration>,
     /// Observed stacks. Exporters may merge entries that look identical.
     pub stacks: Vec<Stack>,
+    /// Chronological sample series, when the backend recorded timestamps and the
+    /// sample count stayed within [`MAX_TIMED_SAMPLES`].
+    pub samples: Vec<TimedSample>,
     /// Original V8 `.cpuprofile` JSON from `Profiler.stop`, when this profile
     /// was captured from Node or a browser tab.
     ///

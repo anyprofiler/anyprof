@@ -610,6 +610,13 @@ pub fn activity(trace: &Trace, start: u64, end: u64, buckets: usize) -> Result<A
     let mut rows = vec![vec![0_u64; buckets]; trace.threads.len()];
     let span = end - start;
     for sample in &trace.samples {
+        if trace
+            .stack(sample.stack)
+            .last()
+            .is_some_and(|leaf| crate::cpuprofile::is_idle_name(&trace.frames[*leaf as usize].name))
+        {
+            continue;
+        }
         let thread = sample.thread as usize;
         if thread >= rows.len() {
             continue;
@@ -820,7 +827,10 @@ fn from_pprof(bytes: &[u8]) -> Result<Trace, Error> {
         .cloned()
         .unwrap_or_else(|| ("samples".to_string(), "count".to_string()));
     let scale = pprof::time_scale_ns(&type_pair.1);
-    let weight_kind = if type_pair.0.eq_ignore_ascii_case("cpu") && scale.is_some() {
+    let has_timed = inspected.samples.iter().any(|s| s.offset_ns.is_some());
+    let weight_kind = if has_timed {
+        WeightKind::SampledTime
+    } else if type_pair.0.eq_ignore_ascii_case("cpu") && scale.is_some() {
         WeightKind::CpuTime
     } else if scale.is_some() {
         WeightKind::Duration
@@ -835,11 +845,18 @@ fn from_pprof(bytes: &[u8]) -> Result<Trace, Error> {
     } else {
         WeightKind::Other
     };
-    let mut trace = Trace::new("pprof", weight_kind, type_pair.1.clone());
+    let unit = if has_timed {
+        "nanoseconds".to_string()
+    } else {
+        type_pair.1.clone()
+    };
+    let mut trace = Trace::new("pprof", weight_kind, unit);
     trace.notes = inspected.notes;
-    trace.timeline_disabled = Some(
-        "This pprof profile has one weight per distinct stack and no per-sample timestamps. Thread ids are shown only when a sample is labeled with one. There is no timeline.".to_string(),
-    );
+    if !has_timed {
+        trace.timeline_disabled = Some(
+            "This pprof profile has one weight per distinct stack and no per-sample timestamps. Thread ids are shown only when a sample is labeled with one. There is no timeline.".to_string(),
+        );
+    }
     if inspected.duration_ns > 0 {
         trace.wall_ns = Some(inspected.duration_ns);
     }
@@ -855,6 +872,9 @@ fn from_pprof(bytes: &[u8]) -> Result<Trace, Error> {
     let mut tracks: HashMap<(u8, String), u32> = HashMap::new();
     let mut cpu_ns = 0_u64;
     let mut saw_cpu = false;
+    let step_ns = inspected.period_ns.unwrap_or(10_000_000).max(1);
+    let mut timed_by_thread: HashMap<u32, Vec<(u64, Vec<u32>, u64)>> = HashMap::new();
+
     for sample in &inspected.samples {
         let value = sample
             .values
@@ -917,8 +937,50 @@ fn from_pprof(bytes: &[u8]) -> Result<Trace, Error> {
                 system: frame.system,
             }));
         }
-        trace.add_sample(thread, &frames, 0, weight)?;
+        if has_timed {
+            if weight == 0 || frames.is_empty() {
+                continue;
+            }
+            let offset_ns = sample.offset_ns.unwrap_or(0);
+            let nominal_ns = if scale.is_some() {
+                weight
+            } else {
+                step_ns.saturating_mul(weight).max(1)
+            };
+            timed_by_thread
+                .entry(thread)
+                .or_default()
+                .push((offset_ns, frames, nominal_ns));
+        } else {
+            trace.add_sample(thread, &frames, 0, weight)?;
+        }
     }
+
+    if has_timed {
+        let mut max_end = inspected.duration_ns;
+        for tid in 0..(trace.threads.len() as u32) {
+            let Some(mut entries) = timed_by_thread.remove(&tid) else {
+                continue;
+            };
+            entries.sort_by_key(|(offset_ns, _, _)| *offset_ns);
+            for i in 0..entries.len() {
+                let (offset_ns, ref frames, nominal_ns) = entries[i];
+                let dur = if let Some((next_offset, _, _)) = entries.get(i + 1) {
+                    if *next_offset > offset_ns {
+                        nominal_ns.min(*next_offset - offset_ns)
+                    } else {
+                        1
+                    }
+                } else {
+                    nominal_ns
+                };
+                trace.add_sample(tid, frames, offset_ns, dur)?;
+                max_end = max_end.max(offset_ns.saturating_add(dur));
+            }
+        }
+        trace.timeline = Some((0, max_end));
+    }
+
     if saw_cpu && cpu_ns > 0 {
         trace.cpu_ns = Some(cpu_ns);
     }
@@ -932,7 +994,8 @@ fn from_pprof(bytes: &[u8]) -> Result<Trace, Error> {
             "This pprof profile does not label threads. Samples stay in one track.".to_string(),
         );
     }
-    if trace.cpu_ns.is_none()
+    if !has_timed
+        && trace.cpu_ns.is_none()
         && matches!(trace.weight_kind, WeightKind::Count)
         && (trace.wall_ns.is_some() || trace.period_ns.is_some())
     {
@@ -1278,10 +1341,16 @@ fn from_speedscope(value: &Value) -> Result<Trace, Error> {
             "This speedscope profile uses unit {unit}. Stacks are weighted in file order, which is not a clock, and thread ids were not recorded."
         ));
     }
+    let anyprof_timed = timed
+        && value
+            .get("exporter")
+            .and_then(Value::as_str)
+            .is_some_and(|exp| exp.starts_with("anyprof@"));
     let mut axis_start = u64::MAX;
     let mut axis_end = 0_u64;
     let mut saw_events = false;
     let mut saw_repeat = false;
+    let mut saw_spacer = false;
     for (index, profile) in profiles.iter().enumerate() {
         let scale = match &classes[index] {
             UnitClass::Time(scale) => *scale,
@@ -1293,7 +1362,12 @@ fn from_speedscope(value: &Value) -> Result<Trace, Error> {
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("Profile {}", index + 1));
-        let thread = trace.add_thread(name, TrackKind::Profile);
+        let track_kind = if anyprof_timed && pprof::parse_tid_from_thread_label(&name).is_some() {
+            TrackKind::Thread
+        } else {
+            TrackKind::Profile
+        };
+        let thread = trace.add_thread(name, track_kind);
         let profile_kind = profile.get("type").and_then(Value::as_str).unwrap_or("");
         let start = json_f64(profile.get("startValue")).unwrap_or(0.0);
         if start < 0.0 {
@@ -1352,6 +1426,13 @@ fn from_speedscope(value: &Value) -> Result<Trace, Error> {
                         ));
                     }
                     let weight = pprof::ticks_from_f64(weight_value * scale, "speedscope")?;
+                    if stack.is_empty() {
+                        if weight > 0 {
+                            saw_spacer = true;
+                        }
+                        cursor = cursor.saturating_add(weight);
+                        continue;
+                    }
                     let mut frames = Vec::with_capacity(stack.len());
                     for frame_index in stack {
                         let frame_index = json_u64(Some(frame_index)).ok_or_else(|| {
@@ -1465,7 +1546,7 @@ fn from_speedscope(value: &Value) -> Result<Trace, Error> {
         axis_start = axis_start.min(start_ticks);
         axis_end = axis_end.max(end_ticks.max(cursor));
     }
-    if timed && (saw_events || saw_repeat) {
+    if timed && (saw_events || saw_repeat || saw_spacer || anyprof_timed) {
         if axis_start == u64::MAX {
             axis_start = 0;
         }
@@ -1473,22 +1554,25 @@ fn from_speedscope(value: &Value) -> Result<Trace, Error> {
     } else if timed {
         // A time unit with one row per stack is an aggregate. Laying those
         // rows out in file order would invent a chronology the recorder folded
-        // away. anyprof's own speedscope uses unit `none` and never gets here.
+        // away. anyprof's aggregate speedscope uses unit `none` and never gets here.
         trace.weight_kind = WeightKind::Duration;
         trace.timeline = None;
         trace.timeline_disabled = Some(
             "Each stack is stored once. Sample order is the file order of folded weights, not a clock, so there is no timeline.".to_string(),
         );
     }
-    if profiles.len() > 1 {
-        trace.notes.push(
-            "Tracks are the profiles listed in the file. They are not thread ids recovered from sample order.".to_string(),
-        );
-    } else if trace.threads.len() == 1 {
-        trace.notes.push(
-            "This speedscope file does not record thread ids. Samples stay in one track."
-                .to_string(),
-        );
+    let has_named_threads = trace.threads.iter().any(|t| t.kind == TrackKind::Thread);
+    if !has_named_threads {
+        if profiles.len() > 1 {
+            trace.notes.push(
+                "Tracks are the profiles listed in the file. They are not thread ids recovered from sample order.".to_string(),
+            );
+        } else if trace.threads.len() == 1 {
+            trace.notes.push(
+                "This speedscope file does not record thread ids. Samples stay in one track."
+                    .to_string(),
+            );
+        }
     }
     Ok(trace)
 }
@@ -1504,6 +1588,12 @@ fn speed_frame(trace: &mut Trace, frames: &[Value], index: u64) -> Result<u32, E
         .and_then(Value::as_str)
         .filter(|file| !file.is_empty())
         .map(str::to_string);
+    let module = frame
+        .get("module")
+        .and_then(Value::as_str)
+        .filter(|module| !module.is_empty())
+        .map(str::to_string);
+    let system = module.as_deref().is_some_and(pprof::is_system_library);
     let line = json_u64(frame.get("line")).and_then(|line| u32::try_from(line).ok());
     let column = json_u64(frame.get("col")).and_then(|column| u32::try_from(column).ok());
     Ok(trace.intern_normalized(ViewFrame {
@@ -1512,9 +1602,9 @@ fn speed_frame(trace: &mut Trace, frames: &[Value], index: u64) -> Result<u32, E
         line,
         column,
         runtime,
-        module: None,
+        module,
         address: None,
-        system: false,
+        system,
     }))
 }
 
@@ -2372,5 +2462,123 @@ mod tests {
         writer.field_packed_varints(2, values);
         writer.field_message(3, label);
         writer
+    }
+
+    #[test]
+    fn v8_idle_samples_do_not_flatten_timeline_activity() {
+        let raw = r#"{
+          "nodes": [
+            {"id": 1, "callFrame": {"functionName": "(root)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": [2, 3, 4]},
+            {"id": 2, "callFrame": {"functionName": "(idle)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": []},
+            {"id": 3, "callFrame": {"functionName": "(program)", "scriptId": "0", "url": "", "lineNumber": -1, "columnNumber": -1}, "children": []},
+            {"id": 4, "callFrame": {"functionName": "handleRequest", "scriptId": "7", "url": "server.js", "lineNumber": 14, "columnNumber": 2}, "children": []}
+          ],
+          "startTime": 1000,
+          "endTime": 5000,
+          "samples": [4, 2, 3, 4],
+          "timeDeltas": [1000, 1000, 1000, 1000]
+        }"#;
+        let trace = load_trace(raw.as_bytes()).unwrap();
+        assert_eq!(trace.timeline, Some((0, 4_000_000)));
+        let buckets = activity(&trace, 0, 4_000_000, 4).unwrap();
+        assert_eq!(buckets.rows[0], vec![1_000_000, 0, 0, 1_000_000]);
+    }
+
+    #[test]
+    fn timed_pprof_and_speedscope_preserve_threads_timeline_and_system_modules() {
+        use anyprof_core::TimedSample;
+        use std::time::Duration;
+
+        let mut app = Frame::new(Runtime::Rust, "demo::compute");
+        app.module = Some("demo".to_string());
+        app.file = Some("src/lib.rs".to_string());
+        app.line = Some(88);
+
+        let mut sys = Frame::new(Runtime::Native, "__GI___libc_write");
+        sys.module = Some("libc.so.6".to_string());
+
+        let profile = Profile {
+            pid: 314,
+            comm: Some("demo".to_string()),
+            duration: Duration::from_millis(40),
+            period: Some(Duration::from_millis(10)),
+            stacks: vec![
+                Stack {
+                    frames: vec![app.clone()],
+                    weight: 2,
+                },
+                Stack {
+                    frames: vec![sys, app],
+                    weight: 1,
+                },
+            ],
+            samples: vec![
+                TimedSample {
+                    tid: 101,
+                    thread_name: Some("worker-a".to_string()),
+                    offset_ns: 0,
+                    stack_index: 0,
+                    weight: 1,
+                },
+                TimedSample {
+                    tid: 102,
+                    thread_name: Some("worker-b".to_string()),
+                    offset_ns: 20_000_000,
+                    stack_index: 1,
+                    weight: 1,
+                },
+                TimedSample {
+                    tid: 101,
+                    thread_name: Some("worker-a".to_string()),
+                    offset_ns: 30_000_000,
+                    stack_index: 0,
+                    weight: 1,
+                },
+            ],
+            raw_cpuprofile: None,
+        };
+
+        for format in [Format::Pprof, Format::Speedscope] {
+            let bytes = export(&profile, format).unwrap();
+            let trace = load_trace(&bytes).unwrap();
+            assert_eq!(trace.weight_kind, WeightKind::SampledTime, "{format:?}");
+            assert_eq!(trace.timeline, Some((0, 40_000_000)), "{format:?}");
+            assert_eq!(trace.threads.len(), 2, "{format:?}");
+            assert_eq!(
+                trace.threads[0].kind,
+                super::TrackKind::Thread,
+                "{format:?}"
+            );
+            assert_eq!(trace.threads[0].name, "worker-a (101)", "{format:?}");
+            assert_eq!(trace.threads[1].name, "worker-b (102)", "{format:?}");
+            assert!(
+                frame_named(&trace, "__GI___libc_write").system,
+                "{format:?}"
+            );
+            assert!(!frame_named(&trace, "demo::compute").system, "{format:?}");
+
+            let buckets = activity(&trace, 0, 40_000_000, 4).unwrap();
+            assert_eq!(
+                buckets.rows[0],
+                vec![10_000_000, 0, 0, 10_000_000],
+                "{format:?}"
+            );
+            assert_eq!(buckets.rows[1], vec![0, 0, 10_000_000, 0], "{format:?}");
+
+            let hidden = aggregate(
+                &trace,
+                &Query {
+                    hide_system: true,
+                    ..Query::default()
+                },
+            );
+            assert!(
+                hidden
+                    .nodes
+                    .iter()
+                    .all(|n| trace.frames[n.frame as usize].name != "__GI___libc_write"),
+                "{format:?}"
+            );
+        }
     }
 }

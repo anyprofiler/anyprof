@@ -62,6 +62,8 @@ pub(crate) struct ParsedSample {
     pub pid: u32,
     /// Target tid.
     pub tid: u32,
+    /// `PERF_SAMPLE_TIME` (`local_clock()` nanoseconds), when requested.
+    pub time: Option<u64>,
     /// Raw call-chain values, including context markers.
     pub callchain: Vec<u64>,
     /// User instruction pointer from `PERF_SAMPLE_REGS_USER`, when saved.
@@ -149,11 +151,21 @@ pub(crate) fn choose_user_frames(walked: Vec<u64>, callchain: Vec<u64>) -> Vec<u
     }
 }
 
+/// Parse the body of a `PERF_RECORD_SAMPLE` without `PERF_SAMPLE_TIME`.
+#[cfg(test)]
+pub(crate) fn parse_sample(record: &[u8], regs_mask: u64) -> Option<ParsedSample> {
+    parse_sample_timed(record, regs_mask, false)
+}
+
 /// Parse the body of a `PERF_RECORD_SAMPLE`, including its 8-byte header.
 ///
-/// `regs_mask` is `sample_regs_user`. Returns `None` when the record is
-/// shorter than the fields it claims to hold.
-pub(crate) fn parse_sample(record: &[u8], regs_mask: u64) -> Option<ParsedSample> {
+/// `regs_mask` is `sample_regs_user`. When `include_time` is `true`, reads the
+/// 8-byte `PERF_SAMPLE_TIME` word immediately following `pid`/`tid`.
+pub(crate) fn parse_sample_timed(
+    record: &[u8],
+    regs_mask: u64,
+    include_time: bool,
+) -> Option<ParsedSample> {
     if record.len() < 8 {
         return None;
     }
@@ -166,6 +178,11 @@ pub(crate) fn parse_sample(record: &[u8], regs_mask: u64) -> Option<ParsedSample
     let ip = read_u64(record, &mut cursor)?;
     let pid = read_u32(record, &mut cursor)?;
     let tid = read_u32(record, &mut cursor)?;
+    let time = if include_time {
+        Some(read_u64(record, &mut cursor)?)
+    } else {
+        None
+    };
     let nr = read_u64(record, &mut cursor)?;
     if nr > 1024 {
         return None;
@@ -204,6 +221,7 @@ pub(crate) fn parse_sample(record: &[u8], regs_mask: u64) -> Option<ParsedSample
         ip,
         pid,
         tid,
+        time,
         callchain,
         user_ip,
         user_sp,
@@ -365,5 +383,30 @@ mod tests {
         let data = b"abcdefgh";
         let got = read_ring(data, 6, 4).unwrap();
         assert_eq!(got, b"ghab");
+    }
+
+    #[test]
+    fn timed_sample_reads_the_timestamp_after_tid() {
+        let mut record = Vec::new();
+        record.extend_from_slice(&9u32.to_le_bytes());
+        record.extend_from_slice(&0u16.to_le_bytes());
+        let size_at = record.len();
+        record.extend_from_slice(&0u16.to_le_bytes());
+        record.extend_from_slice(&0x5555_0000_1000u64.to_le_bytes());
+        record.extend_from_slice(&42u32.to_le_bytes());
+        record.extend_from_slice(&99u32.to_le_bytes());
+        record.extend_from_slice(&123_456_789u64.to_le_bytes());
+        record.extend_from_slice(&1u64.to_le_bytes());
+        record.extend_from_slice(&0x5555_0000_1000u64.to_le_bytes());
+        record.extend_from_slice(&0u64.to_le_bytes()); // abi none
+        record.extend_from_slice(&0u64.to_le_bytes()); // stack size 0
+        let size = record.len() as u16;
+        record[size_at..size_at + 2].copy_from_slice(&size.to_le_bytes());
+
+        let parsed = super::parse_sample_timed(&record, X86_USER_REGS, true).unwrap();
+        assert_eq!(parsed.pid, 42);
+        assert_eq!(parsed.tid, 99);
+        assert_eq!(parsed.time, Some(123_456_789));
+        assert_eq!(parsed.callchain, vec![0x5555_0000_1000]);
     }
 }

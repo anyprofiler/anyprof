@@ -405,16 +405,141 @@ pub(crate) fn windows_open_denied(
     )
 }
 
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64"),
+    )),
+    allow(dead_code)
+)]
+pub(crate) struct SampleCollector {
+    unique: Vec<(crate::python::CountedStack, u64)>,
+    index: std::collections::HashMap<crate::python::CountedStack, u32>,
+    timed: Vec<(u64, u64, u32)>,
+    thread_names: std::collections::HashMap<u64, Option<String>>,
+    cap: usize,
+    capped: bool,
+}
+
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(windows, target_arch = "x86_64"),
+    )),
+    allow(dead_code)
+)]
+impl SampleCollector {
+    pub(crate) fn new() -> Self {
+        Self::with_cap(anyprof_core::MAX_TIMED_SAMPLES)
+    }
+
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self {
+            unique: Vec::new(),
+            index: std::collections::HashMap::new(),
+            timed: Vec::new(),
+            thread_names: std::collections::HashMap::new(),
+            cap,
+            capped: false,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.unique.is_empty()
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        tid: u64,
+        offset_ns: u64,
+        key: crate::python::CountedStack,
+        lookup_name: impl FnOnce(u64) -> Option<String>,
+    ) {
+        let uid = if let Some(&id) = self.index.get(&key) {
+            self.unique[id as usize].1 = self.unique[id as usize].1.saturating_add(1);
+            id
+        } else {
+            let id = self.unique.len() as u32;
+            self.index.insert(key.clone(), id);
+            self.unique.push((key, 1));
+            id
+        };
+        if self.capped {
+            return;
+        }
+        if self.timed.len() < self.cap {
+            if tid != 0 && !self.thread_names.contains_key(&tid) {
+                let cleaned = lookup_name(tid)
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty());
+                self.thread_names.insert(tid, cleaned);
+            }
+            self.timed.push((tid, offset_ns, uid));
+        } else {
+            self.capped = true;
+            self.timed.clear();
+            self.thread_names.clear();
+        }
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        mut to_frames: impl FnMut(crate::python::CountedStack) -> Vec<anyprof_core::Frame>,
+    ) -> (Vec<anyprof_core::Stack>, Vec<anyprof_core::TimedSample>) {
+        let count = self.unique.len();
+        let mut indexed: Vec<(usize, anyprof_core::Stack)> = self
+            .unique
+            .into_iter()
+            .enumerate()
+            .map(|(uid, (key, weight))| {
+                (
+                    uid,
+                    anyprof_core::Stack {
+                        frames: to_frames(key),
+                        weight,
+                    },
+                )
+            })
+            .collect();
+        indexed.sort_by_key(|(_, stack)| std::cmp::Reverse(stack.weight));
+        let mut remap = vec![0usize; count];
+        let mut stacks = Vec::with_capacity(count);
+        for (new_idx, (old_uid, stack)) in indexed.into_iter().enumerate() {
+            remap[old_uid] = new_idx;
+            stacks.push(stack);
+        }
+        if self.capped || self.timed.is_empty() {
+            return (stacks, Vec::new());
+        }
+        self.timed.sort_by_key(|(_, offset_ns, _)| *offset_ns);
+        let samples = self
+            .timed
+            .into_iter()
+            .map(|(tid, offset_ns, uid)| anyprof_core::TimedSample {
+                tid,
+                thread_name: self.thread_names.get(&tid).cloned().flatten(),
+                offset_ns,
+                stack_index: remap[uid as usize],
+                weight: 1,
+            })
+            .collect();
+        (stacks, samples)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DebugPrivilege, IB_SIGNED_LR, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
         IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
         KERNEL_SIGNED_LR, KERNEL_SIGNED_PC, LinuxDenial, NO_PTRAUTH, PROTECTION_LEVEL_NONE,
-        StripKind, ThreadArrayPlan, is_dyld_shared_cache, linux_perf_denied, on_cpu_threads,
-        plan_thread_array, reject_self_sample, retry_until_success, should_deallocate_send_right,
-        should_strip, stack_strip_flags, strip_pointer, symbol_lookup_address, task_for_pid_denied,
-        too_many_threads, windows_open_denied, windows_process_is_x64, windows_target_kind,
+        SampleCollector, StripKind, ThreadArrayPlan, is_dyld_shared_cache, linux_perf_denied,
+        on_cpu_threads, plan_thread_array, reject_self_sample, retry_until_success,
+        should_deallocate_send_right, should_strip, stack_strip_flags, strip_pointer,
+        symbol_lookup_address, task_for_pid_denied, too_many_threads, windows_open_denied,
+        windows_process_is_x64, windows_target_kind,
     };
 
     #[test]
@@ -702,5 +827,52 @@ mod tests {
         let gone = windows_open_denied(9, 87, None, DebugPrivilege::NotHeld);
         assert!(gone.contains("not running"), "{gone}");
         assert!(!gone.contains("SeDebugPrivilege"), "{gone}");
+    }
+
+    #[test]
+    fn sample_collector_orders_by_time_and_degrades_past_cap() {
+        use crate::python::CountedStack;
+        use anyprof_core::{Frame, Runtime};
+
+        let mut collector = SampleCollector::with_cap(3);
+        let stack_a = CountedStack::Addresses {
+            frames: vec![0x1000],
+            kernel_len: 0,
+        };
+        let stack_b = CountedStack::Addresses {
+            frames: vec![0x2000],
+            kernel_len: 0,
+        };
+        collector.record(11, 200, stack_b.clone(), |_| Some("worker\n".to_string()));
+        collector.record(10, 50, stack_a, |_| Some("main".to_string()));
+        collector.record(11, 300, stack_b.clone(), |_| panic!("cached"));
+
+        let (stacks, samples) = collector.finish(|key| match key {
+            CountedStack::Addresses { frames, .. } => {
+                vec![Frame::new(Runtime::Native, format!("0x{:x}", frames[0]))]
+            }
+            _ => unreachable!(),
+        });
+        assert_eq!(stacks.len(), 2);
+        assert_eq!(stacks[0].weight, 2);
+        assert_eq!(stacks[0].frames[0].name, "0x2000");
+        assert_eq!(stacks[1].weight, 1);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[0].offset_ns, 50);
+        assert_eq!(samples[0].tid, 10);
+        assert_eq!(samples[0].thread_name.as_deref(), Some("main"));
+        assert_eq!(samples[0].stack_index, 1);
+        assert_eq!(samples[1].offset_ns, 200);
+        assert_eq!(samples[1].thread_name.as_deref(), Some("worker"));
+        assert_eq!(samples[1].stack_index, 0);
+
+        // Exceeding cap drops timed series while keeping all aggregate stack weights.
+        let mut capped = SampleCollector::with_cap(2);
+        for t in [10, 20, 30] {
+            capped.record(1, t, stack_b.clone(), |_| None);
+        }
+        let (stacks, samples) = capped.finish(|_| vec![Frame::new(Runtime::Native, "f")]);
+        assert_eq!(stacks[0].weight, 3);
+        assert!(samples.is_empty());
     }
 }
