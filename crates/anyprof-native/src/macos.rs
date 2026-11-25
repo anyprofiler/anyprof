@@ -88,26 +88,23 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
     }
 
     let task = Task::attach(target.pid)?;
-    let symbols = load_symbols(task.port, target.pid);
     let mut unwinder = MachUnwinder::new();
-    for image in &symbols {
-        image.register_unwind_module(&mut unwinder);
-    }
     let mut unwind_cache = MachUnwindCache::new_in();
-    let go_images: Vec<_> = symbols
-        .iter()
-        .filter_map(|image| image.go.clone())
-        .collect();
-    let images = remote_images(task.port)
-        .into_iter()
-        .map(|image| (image.path, image.load, image.end))
-        .collect::<Vec<_>>();
-    let python = python::attach_mach(&images);
-    let java = java::attach_mach(&images, &mut |addr, buf| read_task(task.port, addr, buf));
+    let mut go_images = Vec::new();
+    let mut python = None;
+    let mut java = None;
+    let mut symbols = SymbolTable::new(target.pid);
+    symbols.sync_from_task(
+        task.port,
+        &mut unwinder,
+        &mut go_images,
+        &mut python,
+        &mut java,
+    );
     tracing::debug!(
         pid = target.pid,
-        images = symbols.len(),
-        "native symbol tables loaded"
+        images = symbols.images.len(),
+        "native unwind tables prepared"
     );
 
     let started = Instant::now();
@@ -123,6 +120,13 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         {
             break;
         }
+        symbols.sync_from_task(
+            task.port,
+            &mut unwinder,
+            &mut go_images,
+            &mut python,
+            &mut java,
+        );
         match task.sample_addresses(
             &unwinder,
             &mut unwind_cache,
@@ -173,12 +177,21 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         }
     }
 
+    symbols.sync_from_task(
+        task.port,
+        &mut unwinder,
+        &mut go_images,
+        &mut python,
+        &mut java,
+    );
+    symbols.finish_fallback_if_empty();
+
     let comm = inspect(target.pid).and_then(|snapshot| snapshot.comm);
     Ok(finish_profile(
         target.pid,
         comm,
         collector,
-        &symbols,
+        &mut symbols,
         started.elapsed(),
         interval,
     ))
@@ -201,7 +214,7 @@ fn finish_profile(
     pid: u32,
     comm: Option<String>,
     collector: SampleCollector,
-    symbols: &[ImageSymbols],
+    symbols: &mut SymbolTable,
     elapsed: Duration,
     interval: Duration,
 ) -> Profile {
@@ -225,20 +238,30 @@ fn finish_profile(
     }
 }
 
-fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
+fn frame_for(addr: u64, table: &mut SymbolTable, leaf: bool) -> Frame {
     let lookup = policy::symbol_lookup_address(addr, leaf);
-    if let Some(frame) = go_frame(symbols, lookup, addr) {
+    if let Some(frame) = go_frame(&table.images, lookup, addr) {
         return frame;
     }
     if lookup != addr
-        && let Some(frame) = go_frame(symbols, addr, addr)
+        && let Some(frame) = go_frame(&table.images, addr, addr)
     {
         return frame;
     }
-    let image = symbols
+    let idx = table
+        .images
         .iter()
-        .find(|image| image.contains(lookup))
-        .or_else(|| symbols.iter().find(|image| image.contains(addr)));
+        .position(|entry| entry.symbols.contains(lookup))
+        .or_else(|| {
+            table
+                .images
+                .iter()
+                .position(|entry| entry.symbols.contains(addr))
+        });
+    if let Some(idx) = idx {
+        table.ensure_symbols_loaded(idx);
+    }
+    let image = idx.map(|i| &table.images[i].symbols);
     let (name, runtime) = image
         .and_then(|image| {
             image
@@ -265,9 +288,9 @@ fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
     frame
 }
 
-fn go_frame(symbols: &[ImageSymbols], lookup: u64, addr: u64) -> Option<Frame> {
-    for image in symbols {
-        let Some(go) = &image.go else {
+fn go_frame(images: &[TrackedImage], lookup: u64, addr: u64) -> Option<Frame> {
+    for entry in images {
+        let Some(go) = &entry.symbols.go else {
             continue;
         };
         let Some(symbol) = go.symbol(lookup) else {
@@ -277,7 +300,7 @@ fn go_frame(symbols: &[ImageSymbols], lookup: u64, addr: u64) -> Option<Frame> {
         frame.file = symbol.file;
         frame.line = symbol.line;
         frame.address = Some(addr);
-        frame.module = Some(image.module.clone());
+        frame.module = Some(entry.symbols.module.clone());
         return Some(frame);
     }
     None
@@ -952,50 +975,215 @@ pub(crate) fn read_memory(task: task_t, addr: u64, buf: &mut [u8]) -> bool {
     read_task(task, addr, buf)
 }
 
-fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {
-    let cpu = MachCpu::host();
-    let mut shared_cache: Option<Option<crate::dyld_cache::DyldSharedCache>> = None;
-    let mut images = Vec::new();
-    for remote in remote_images(task) {
-        let module = module_name(&remote.path);
-        let file_symbols =
-            ImageSymbols::parse_file(Path::new(&remote.path), remote.load, &module, cpu);
-        let rust_image = crate::rust_image::file_is_rust(Path::new(&remote.path));
-        let go = attach_go(&remote.path, remote.load);
-        if let Some(mut parsed) = file_symbols {
-            parsed.rust_image = rust_image;
-            parsed.go = go;
-            images.push(parsed);
-            continue;
+enum ImageSource {
+    File(String),
+    SharedCache(String),
+    None,
+}
+
+struct TrackedImage {
+    symbols: ImageSymbols,
+    source: ImageSource,
+    symbols_loaded: bool,
+}
+
+struct SymbolTable {
+    pid: u32,
+    cpu: MachCpu,
+    shared_cache: Option<&'static crate::dyld_cache::DyldSharedCache>,
+    info_addr: Option<u64>,
+    seen_dyld_count: Option<u32>,
+    seen_loads: std::collections::HashSet<u64>,
+    raw_images: Vec<(String, u64, u64)>,
+    images: Vec<TrackedImage>,
+}
+
+impl SymbolTable {
+    fn new(pid: u32) -> Self {
+        let cpu = MachCpu::host();
+        let shared_cache = crate::dyld_cache::DyldSharedCache::host(cpu);
+        Self {
+            pid,
+            cpu,
+            shared_cache,
+            info_addr: None,
+            seen_dyld_count: None,
+            seen_loads: std::collections::HashSet::new(),
+            raw_images: Vec::new(),
+            images: Vec::new(),
         }
-        let cached_symbols = shared_cache
-            .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::open_host(cpu))
-            .as_ref()
-            .and_then(|cache| cache.load_image(&remote.path, remote.load, &module));
-        if let Some(parsed) = cached_symbols {
-            images.push(parsed);
-            continue;
+    }
+
+    fn sync_from_task(
+        &mut self,
+        task: task_t,
+        unwinder: &mut MachUnwinder,
+        go_images: &mut Vec<crate::go_sym::GoImage>,
+        python: &mut Option<PythonVm>,
+        java: &mut Option<JavaVm>,
+    ) {
+        let info_addr = match self.info_addr {
+            Some(addr) => addr,
+            None => {
+                let Some(addr) = dyld_info_addr(task) else {
+                    return;
+                };
+                self.info_addr = Some(addr);
+                addr
+            }
+        };
+        let mut count_buf = [0u8; 4];
+        if !read_task(task, info_addr.saturating_add(4), &mut count_buf) {
+            return;
+        }
+        let current_count = u32::from_le_bytes(count_buf);
+        if self.seen_dyld_count == Some(current_count) {
+            return;
+        }
+        let listed = remote_images(task);
+        if listed.is_empty() && current_count == 0 {
+            return;
+        }
+        self.seen_dyld_count = Some(current_count);
+
+        let mut added_any = false;
+        for remote in listed {
+            if !self.seen_loads.insert(remote.load) {
+                continue;
+            }
+            added_any = true;
+            self.raw_images
+                .push((remote.path.clone(), remote.load, remote.end));
+            let tracked = self.load_tracked_unwind(remote);
+            if let Some(tracked) = tracked {
+                tracked.symbols.register_unwind_module(unwinder);
+                if let Some(go) = &tracked.symbols.go {
+                    go_images.push(go.clone());
+                }
+                self.images.push(tracked);
+            }
+        }
+
+        if added_any {
+            if python.is_none() {
+                *python = python::attach_mach(&self.raw_images);
+            }
+            if java.is_none() {
+                *java = java::attach_mach(&self.raw_images, &mut |addr, buf| {
+                    read_task(task, addr, buf)
+                });
+            }
+        }
+    }
+
+    fn load_tracked_unwind(&self, remote: RemoteImage) -> Option<TrackedImage> {
+        let module = module_name(&remote.path);
+        let in_cache_only = self
+            .shared_cache
+            .is_some_and(|cache| cache.contains_image(&remote.path))
+            && !Path::new(&remote.path).is_file();
+
+        if !in_cache_only {
+            let path = Path::new(&remote.path);
+            let file_unwind = ImageSymbols::parse_unwind_file(path, remote.load, &module, self.cpu);
+            let rust_image = crate::rust_image::file_is_rust(path);
+            let go = attach_go(&remote.path, remote.load);
+            if let Some(mut parsed) = file_unwind {
+                parsed.rust_image = rust_image;
+                parsed.go = go;
+                return Some(TrackedImage {
+                    symbols: parsed,
+                    source: ImageSource::File(remote.path),
+                    symbols_loaded: false,
+                });
+            }
+            if let Some(parsed) = self
+                .shared_cache
+                .and_then(|cache| cache.load_unwind(&remote.path, remote.load, &module))
+            {
+                return Some(TrackedImage {
+                    symbols: parsed,
+                    source: ImageSource::SharedCache(remote.path),
+                    symbols_loaded: false,
+                });
+            }
+            if remote.end > remote.load {
+                let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
+                image.rust_image = rust_image;
+                image.go = go;
+                return Some(TrackedImage {
+                    symbols: image,
+                    source: ImageSource::None,
+                    symbols_loaded: true,
+                });
+            }
+            return None;
+        }
+
+        if let Some(parsed) = self
+            .shared_cache
+            .and_then(|cache| cache.load_unwind(&remote.path, remote.load, &module))
+        {
+            return Some(TrackedImage {
+                symbols: parsed,
+                source: ImageSource::SharedCache(remote.path),
+                symbols_loaded: false,
+            });
         }
         if remote.end > remote.load {
-            let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
-            image.rust_image = rust_image;
-            image.go = go;
-            images.push(image);
+            return Some(TrackedImage {
+                symbols: ImageSymbols::range_only(remote.load, remote.end, module),
+                source: ImageSource::None,
+                symbols_loaded: true,
+            });
+        }
+        None
+    }
+
+    fn finish_fallback_if_empty(&mut self) {
+        if self.images.is_empty()
+            && let Some(path) = pid_path(self.pid)
+            && let Some(mut parsed) =
+                ImageSymbols::parse_file(Path::new(&path), 0, &module_name(&path), self.cpu)
+        {
+            // No dyld list. A slide of 0 is wrong for a PIE binary, so this only
+            // helps when the image was linked at a fixed address.
+            tracing::debug!(
+                pid = self.pid,
+                path,
+                "native symbol load fell back to proc_pidpath"
+            );
+            parsed.rust_image = crate::rust_image::file_is_rust(Path::new(&path));
+            self.images.push(TrackedImage {
+                symbols: parsed,
+                source: ImageSource::None,
+                symbols_loaded: true,
+            });
         }
     }
-    if images.is_empty()
-        && let Some(path) = pid_path(pid)
-        && let Some(mut parsed) =
-            ImageSymbols::parse_file(Path::new(&path), 0, &module_name(&path), cpu)
-    {
-        // No dyld list. A slide of 0 is wrong for a PIE binary, so this only
-        // helps when the image was linked at a fixed address. The dyld path
-        // above is the one the sampler relies on.
-        tracing::debug!(pid, path, "native symbol load fell back to proc_pidpath");
-        parsed.rust_image = crate::rust_image::file_is_rust(Path::new(&path));
-        images.push(parsed);
+
+    fn ensure_symbols_loaded(&mut self, idx: usize) {
+        let Some(entry) = self.images.get_mut(idx) else {
+            return;
+        };
+        if entry.symbols_loaded {
+            return;
+        }
+        entry.symbols_loaded = true;
+        match &entry.source {
+            ImageSource::File(path) => {
+                entry
+                    .symbols
+                    .populate_file_symbols(Path::new(path), self.cpu);
+            }
+            ImageSource::SharedCache(path) => {
+                if let Some(cache) = self.shared_cache {
+                    cache.populate_symbols(path, &mut entry.symbols);
+                }
+            }
+            ImageSource::None => {}
+        }
     }
-    images
 }
 
 fn attach_go(path: &str, load_addr: u64) -> Option<crate::go_sym::GoImage> {

@@ -221,6 +221,19 @@ impl ImageSymbols {
         ));
     }
 
+    /// Populate runtime-relocated symbols from unslid Mach-O symbol addresses.
+    pub(crate) fn set_unslid_symbols(&mut self, unslid_symbols: Vec<(u64, String, Runtime)>) {
+        let mut symbols = Vec::with_capacity(unslid_symbols.len());
+        for (unslid, name, lang) in unslid_symbols {
+            if !name.is_empty() && unslid != 0 {
+                symbols.push((unslid.wrapping_add(self.slide), name, lang));
+            }
+        }
+        symbols.sort_by_key(|(addr, _, _)| *addr);
+        symbols.dedup_by(|right, left| right.0 == left.0 && right.1 == left.1);
+        self.symbols = symbols;
+    }
+
     /// Parse `bytes` as a thin or universal Mach-O loaded at `load_addr`.
     #[cfg(test)]
     pub(crate) fn parse_bytes(
@@ -230,7 +243,28 @@ impl ImageSymbols {
         cpu: MachCpu,
     ) -> Option<Self> {
         let cursor = std::io::Cursor::new(bytes);
-        parse_reader(cursor, bytes.len() as u64, load_addr, module, cpu)
+        parse_reader(cursor, bytes.len() as u64, load_addr, module, cpu, true)
+    }
+
+    /// Read segment bounds and unwind sections of `path` without parsing symbols
+    /// or DWARF line tables yet.
+    pub(crate) fn parse_unwind_file(
+        path: &Path,
+        load_addr: u64,
+        module: &str,
+        cpu: MachCpu,
+    ) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        parse_reader(file, len, load_addr, module, cpu, false)
+    }
+
+    /// Populate symbols and DWARF / sibling `.dSYM` line tables from `path`.
+    pub(crate) fn populate_file_symbols(&mut self, path: &Path, cpu: MachCpu) {
+        if let Some(full) = Self::parse_file(path, self.start, &self.module, cpu) {
+            self.symbols = full.symbols;
+            self.lines = full.lines;
+        }
     }
 
     /// Read the symbol table of the binary at `path`.
@@ -247,7 +281,7 @@ impl ImageSymbols {
     ) -> Option<Self> {
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
-        let mut parsed = parse_reader(file, len, load_addr, module, cpu)?;
+        let mut parsed = parse_reader(file, len, load_addr, module, cpu, true)?;
         if parsed.lines.is_empty()
             && let Some(dsym_lines) = read_dsym_lines(path, cpu)
         {
@@ -320,6 +354,7 @@ fn parse_reader<R: Read + Seek>(
     load_addr: u64,
     module: &str,
     cpu: MachCpu,
+    include_symbols: bool,
 ) -> Option<ImageSymbols> {
     let mut magic = [0u8; 8];
     reader.seek(SeekFrom::Start(0)).ok()?;
@@ -341,12 +376,19 @@ fn parse_reader<R: Read + Seek>(
     reader.read_exact(&mut commands).ok()?;
     let (text_vmaddr, text_vmsize, end_vmaddr) =
         walk_segments(&commands, header.ncmds, header.flags)?;
-    let symbols = match find_symtab(&commands, header.ncmds) {
-        Some(symtab) => read_symbols(&mut reader, offset, size, &symtab)?,
-        None => Vec::new(),
+    let symbols = if include_symbols {
+        match find_symtab(&commands, header.ncmds) {
+            Some(symtab) => read_symbols(&mut reader, offset, size, &symtab)?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
     };
-    let lines =
-        read_dwarf_lines(&mut reader, offset, size, &commands, header.ncmds).unwrap_or_default();
+    let lines = if include_symbols {
+        read_dwarf_lines(&mut reader, offset, size, &commands, header.ncmds).unwrap_or_default()
+    } else {
+        LineTable::default()
+    };
     let unwind = read_macho_unwind(
         &mut reader,
         offset,

@@ -18,13 +18,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyprof_core::Runtime;
 
 use crate::macho::{
-    Header64, ImageSymbols, LC_SEGMENT_64, LoadCommands, MAX_EH_FRAME_BYTES, MAX_TEXT_UNWIND_BYTES,
-    MAX_UNWIND_INFO_BYTES, MachCpu, MachoUnwind, N_SECT, N_STAB, N_TYPE, S_ZEROFILL, find_symtab,
-    segname,
+    Header64, ImageSymbols, LC_SEGMENT_64, LoadCommands, MAX_EH_FRAME_BYTES, MAX_UNWIND_INFO_BYTES,
+    MachCpu, MachoUnwind, N_SECT, N_STAB, N_TYPE, S_ZEROFILL, find_symtab, segname,
 };
 use crate::symbol::{self, Presented};
 use crate::walk::SectionBytes;
@@ -41,6 +41,7 @@ const MAX_LOCAL_ENTRIES: u32 = 32_768;
 const MAX_NSYMS: u32 = 2_000_000;
 const MAX_EXPORT_TRIE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TRIE_NODES: usize = 200_000;
+const MAX_CACHED_TEXT_UNWIND_BYTES: u64 = 640 * 1024;
 
 const LC_DYLD_INFO: u32 = 0x22;
 const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
@@ -155,6 +156,14 @@ struct CachedImageEntry {
     header_vmaddr: u64,
 }
 
+struct DeferredLocalSymbols {
+    main_path: PathBuf,
+    local_symbols_offset: u64,
+    local_symbols_size: u64,
+    symbol_file_uuid: [u8; 16],
+    uses_64bit_dylib_offset: bool,
+}
+
 struct LocalSymbols {
     source: CacheSource,
     nlist_offset: u64,
@@ -171,7 +180,8 @@ pub(crate) struct DyldSharedCache {
     mappings: Vec<CacheMapping>,
     shared_region_start: u64,
     images_by_path: HashMap<String, CachedImageEntry>,
-    local_symbols: Option<LocalSymbols>,
+    local_spec: Option<DeferredLocalSymbols>,
+    local_symbols: OnceLock<Option<LocalSymbols>>,
 }
 
 struct ParsedCacheHeader {
@@ -188,7 +198,25 @@ struct ParsedCacheHeader {
     symbol_file_uuid: [u8; 16],
 }
 
+struct CachedMachoCommands {
+    hdr_file_off: u64,
+    header_vmaddr: u64,
+    ncmds: usize,
+    commands: Vec<u8>,
+    text_vmaddr: u64,
+    text_vmsize: u64,
+    linkedit_vmaddr: Option<u64>,
+    export_loc: Option<(u64, u64)>,
+}
+
 impl DyldSharedCache {
+    /// Process-wide singleton for the active host `dyld_shared_cache` on macOS.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn host(cpu: MachCpu) -> Option<&'static Self> {
+        static HOST_CACHE: OnceLock<Option<DyldSharedCache>> = OnceLock::new();
+        HOST_CACHE.get_or_init(|| Self::open_host(cpu)).as_ref()
+    }
+
     /// Open the active host `dyld_shared_cache` on macOS.
     #[cfg(target_os = "macos")]
     pub(crate) fn open_host(cpu: MachCpu) -> Option<Self> {
@@ -234,14 +262,21 @@ impl DyldSharedCache {
             mappings.first().map(|m| m.vmaddr).unwrap_or(0)
         };
         let images_by_path = read_image_index(&files[0], &main_hdr)?;
-        let local_symbols = open_local_symbols(main_path, &files[0], &main_hdr);
+        let local_spec = Some(DeferredLocalSymbols {
+            main_path: main_path.to_path_buf(),
+            local_symbols_offset: main_hdr.local_symbols_offset,
+            local_symbols_size: main_hdr.local_symbols_size,
+            symbol_file_uuid: main_hdr.symbol_file_uuid,
+            uses_64bit_dylib_offset: main_hdr.mapping_offset >= MIN_HEADER_SUBCACHES_V1,
+        });
 
         Some(Self {
             files,
             mappings,
             shared_region_start,
             images_by_path,
-            local_symbols,
+            local_spec,
+            local_symbols: OnceLock::new(),
         })
     }
 
@@ -285,7 +320,7 @@ impl DyldSharedCache {
             mappings.first().map(|m| m.vmaddr).unwrap_or(0)
         };
         let images_by_path = read_image_index(&files[0], &main_hdr)?;
-        let local_symbols = symbols_bytes.and_then(|bytes| {
+        let parsed_local = symbols_bytes.and_then(|bytes| {
             let sym_src = CacheSource::Memory(bytes);
             let sym_hdr = parse_cache_header(&sym_src, None)?;
             if main_hdr.symbol_file_uuid == [0; 16] || sym_hdr.uuid != main_hdr.symbol_file_uuid {
@@ -298,23 +333,121 @@ impl DyldSharedCache {
                 main_hdr.mapping_offset >= MIN_HEADER_SUBCACHES_V1,
             )
         });
+        let local_symbols = OnceLock::new();
+        let _ = local_symbols.set(parsed_local);
         Some(Self {
             files,
             mappings,
             shared_region_start,
             images_by_path,
+            local_spec: None,
             local_symbols,
         })
     }
 
+    /// Whether `dylib_path` is indexed in this shared cache.
+    pub(crate) fn contains_image(&self, dylib_path: &str) -> bool {
+        self.images_by_path.contains_key(dylib_path)
+    }
+
+    /// Read only `__TEXT` bounds and Compact Unwind / `__eh_frame` sections for
+    /// `dylib_path`, deferring symbol table and `.symbols` parsing until needed.
+    pub(crate) fn load_unwind(
+        &self,
+        dylib_path: &str,
+        runtime_load_addr: u64,
+        module: &str,
+    ) -> Option<ImageSymbols> {
+        let meta = self.read_cached_macho_commands(dylib_path)?;
+        let unwind = self.read_cached_unwind(meta.text_vmaddr, &meta.commands, meta.ncmds);
+        ImageSymbols::from_cached(
+            runtime_load_addr,
+            meta.text_vmaddr,
+            meta.text_vmsize,
+            module.to_string(),
+            Vec::new(),
+            unwind,
+        )
+    }
+
+    /// Populate symbols (`LC_SYMTAB`, `LC_DYLD_EXPORTS_TRIE`, and `.symbols`)
+    /// onto an [`ImageSymbols`] previously created via [`Self::load_unwind`].
+    pub(crate) fn populate_symbols(&self, dylib_path: &str, image: &mut ImageSymbols) {
+        let Some(meta) = self.read_cached_macho_commands(dylib_path) else {
+            return;
+        };
+        let mut symbols = Vec::new();
+        if let Some(le_vmaddr) = meta.linkedit_vmaddr
+            && let Some((le_file_idx, _, _)) = self.resolve_vmaddr(le_vmaddr)
+            && let Some(le_file) = self.files.get(le_file_idx)
+        {
+            if let Some(symtab) = find_symtab(&meta.commands, meta.ncmds) {
+                read_nlist_symbols(
+                    le_file,
+                    symtab.symoff,
+                    symtab.nsyms,
+                    symtab.stroff,
+                    u64::from(symtab.strsize),
+                    &mut symbols,
+                );
+            }
+            if let Some((exp_off, exp_size)) = meta.export_loc
+                && let Some(trie) = le_file.read_vec_at(exp_off, exp_size, MAX_EXPORT_TRIE_BYTES)
+            {
+                parse_exports_trie(&trie, meta.text_vmaddr, meta.text_vmsize, &mut symbols);
+            }
+        }
+
+        if let Some(local) = self.local_symbols() {
+            let key = if local.uses_64bit_dylib_offset {
+                meta.header_vmaddr.checked_sub(self.shared_region_start)
+            } else {
+                Some(meta.hdr_file_off)
+            };
+            if let Some(key) = key
+                && let Some(&(start_idx, count)) = local.by_dylib_key.get(&key)
+                && start_idx.saturating_add(count) <= local.nlist_count
+            {
+                let sym_off = local
+                    .nlist_offset
+                    .saturating_add(u64::from(start_idx).saturating_mul(16));
+                read_nlist_symbols(
+                    &local.source,
+                    sym_off,
+                    count,
+                    local.strings_offset,
+                    local.strings_size,
+                    &mut symbols,
+                );
+            }
+        }
+        image.set_unslid_symbols(symbols);
+    }
+
     /// Parse symbols and Compact Unwind / `__eh_frame` sections for `dylib_path`
     /// loaded at `runtime_load_addr` in the target task.
+    #[cfg(test)]
     pub(crate) fn load_image(
         &self,
         dylib_path: &str,
         runtime_load_addr: u64,
         module: &str,
     ) -> Option<ImageSymbols> {
+        let mut image = self.load_unwind(dylib_path, runtime_load_addr, module)?;
+        self.populate_symbols(dylib_path, &mut image);
+        Some(image)
+    }
+
+    fn local_symbols(&self) -> Option<&LocalSymbols> {
+        self.local_symbols
+            .get_or_init(|| {
+                let spec = self.local_spec.as_ref()?;
+                open_local_symbols(spec)
+            })
+            .as_ref()
+    }
+
+    fn read_cached_macho_commands(&self, dylib_path: &str) -> Option<CachedMachoCommands> {
         let entry = self.images_by_path.get(dylib_path)?;
         let (hdr_file_idx, hdr_file_off, hdr_avail) = self.resolve_vmaddr(entry.header_vmaddr)?;
         if hdr_avail < 32 {
@@ -379,62 +512,16 @@ impl DyldSharedCache {
         if text_vmsize == 0 {
             return None;
         }
-
-        let mut symbols = Vec::new();
-        if let Some(le_vmaddr) = linkedit_vmaddr
-            && let Some((le_file_idx, _, _)) = self.resolve_vmaddr(le_vmaddr)
-            && let Some(le_file) = self.files.get(le_file_idx)
-        {
-            if let Some(symtab) = find_symtab(&commands, header.ncmds) {
-                read_nlist_symbols(
-                    le_file,
-                    symtab.symoff,
-                    symtab.nsyms,
-                    symtab.stroff,
-                    u64::from(symtab.strsize),
-                    &mut symbols,
-                );
-            }
-            if let Some((exp_off, exp_size)) = export_loc
-                && let Some(trie) = le_file.read_vec_at(exp_off, exp_size, MAX_EXPORT_TRIE_BYTES)
-            {
-                parse_exports_trie(&trie, text_vmaddr, text_vmsize, &mut symbols);
-            }
-        }
-
-        if let Some(local) = &self.local_symbols {
-            let key = if local.uses_64bit_dylib_offset {
-                entry.header_vmaddr.checked_sub(self.shared_region_start)
-            } else {
-                Some(hdr_file_off)
-            };
-            if let Some(key) = key
-                && let Some(&(start_idx, count)) = local.by_dylib_key.get(&key)
-                && start_idx.saturating_add(count) <= local.nlist_count
-            {
-                let sym_off = local
-                    .nlist_offset
-                    .saturating_add(u64::from(start_idx).saturating_mul(16));
-                read_nlist_symbols(
-                    &local.source,
-                    sym_off,
-                    count,
-                    local.strings_offset,
-                    local.strings_size,
-                    &mut symbols,
-                );
-            }
-        }
-
-        let unwind = self.read_cached_unwind(text_vmaddr, &commands, header.ncmds);
-        ImageSymbols::from_cached(
-            runtime_load_addr,
+        Some(CachedMachoCommands {
+            hdr_file_off,
+            header_vmaddr: entry.header_vmaddr,
+            ncmds: header.ncmds,
+            commands,
             text_vmaddr,
             text_vmsize,
-            module.to_string(),
-            symbols,
-            unwind,
-        )
+            linkedit_vmaddr,
+            export_loc,
+        })
     }
 
     fn read_cached_unwind(&self, base_svma: u64, commands: &[u8], ncmds: usize) -> MachoUnwind {
@@ -511,7 +598,7 @@ impl DyldSharedCache {
             && let Some((addr, size)) = text_range
         {
             unwind.text = self
-                .read_vm_bytes(addr, size, MAX_TEXT_UNWIND_BYTES)
+                .read_vm_bytes(addr, size, MAX_CACHED_TEXT_UNWIND_BYTES)
                 .map(SectionBytes::new);
         }
         unwind
@@ -745,15 +832,19 @@ fn read_image_index(
         total,
         u64::from(MAX_IMAGES) * 32,
     )?;
-    let mut map = HashMap::with_capacity(hdr.images_count as usize);
-    let mut str_reader = PagedStringReader::new(main_source, 0, main_source.len());
     let (rows, _) = raw.as_chunks::<32>();
+    let mut pending = Vec::with_capacity(rows.len());
     for row in rows {
         let header_vmaddr = u64::from_le_bytes(row[0..8].try_into().ok()?);
         let path_off = u64::from(u32::from_le_bytes(row[24..28].try_into().ok()?));
-        if header_vmaddr == 0 || path_off == 0 {
-            continue;
+        if header_vmaddr != 0 && path_off != 0 {
+            pending.push((path_off, header_vmaddr));
         }
+    }
+    pending.sort_unstable_by_key(|&(path_off, _)| path_off);
+    let mut map = HashMap::with_capacity(pending.len());
+    let mut str_reader = PagedStringReader::new(main_source, 0, main_source.len());
+    for (path_off, header_vmaddr) in pending {
         if let Some(path) = str_reader.read_cstr(path_off, 1024) {
             map.insert(path, CachedImageEntry { header_vmaddr });
         }
@@ -761,35 +852,30 @@ fn read_image_index(
     Some(map)
 }
 
-fn open_local_symbols(
-    main_path: &Path,
-    main_source: &CacheSource,
-    main_hdr: &ParsedCacheHeader,
-) -> Option<LocalSymbols> {
-    if main_hdr.symbol_file_uuid != [0; 16] {
-        let sym_path = append_suffix(main_path, ".symbols");
+fn open_local_symbols(spec: &DeferredLocalSymbols) -> Option<LocalSymbols> {
+    if spec.symbol_file_uuid != [0; 16] {
+        let sym_path = append_suffix(&spec.main_path, ".symbols");
         if let Ok(Some((sym_src, sym_hdr))) =
-            open_verified_subcache(&sym_path, main_hdr.symbol_file_uuid)
+            open_verified_subcache(&sym_path, spec.symbol_file_uuid)
             && let Some(parsed) = parse_local_symbols(
                 sym_src,
                 sym_hdr.local_symbols_offset,
                 sym_hdr.local_symbols_size,
-                main_hdr.mapping_offset >= MIN_HEADER_SUBCACHES_V1,
+                spec.uses_64bit_dylib_offset,
             )
         {
             return Some(parsed);
         }
     }
-    if main_hdr.local_symbols_offset != 0
-        && main_hdr.local_symbols_size >= 24
-        && let Some(dup_src) = CacheSource::open(main_path)
+    if spec.local_symbols_offset != 0
+        && spec.local_symbols_size >= 24
+        && let Some(dup_src) = CacheSource::open(&spec.main_path)
     {
-        let _ = main_source;
         return parse_local_symbols(
             dup_src,
-            main_hdr.local_symbols_offset,
-            main_hdr.local_symbols_size,
-            main_hdr.mapping_offset >= MIN_HEADER_SUBCACHES_V1,
+            spec.local_symbols_offset,
+            spec.local_symbols_size,
+            spec.uses_64bit_dylib_offset,
         );
     }
     None
@@ -877,8 +963,8 @@ fn read_nlist_symbols(
     let Some(raw) = source.read_vec_at(symoff, sym_bytes, u64::from(MAX_NSYMS) * 16) else {
         return;
     };
-    let mut str_reader = PagedStringReader::new(source, stroff, strsize);
     let (entries, _) = raw.as_chunks::<16>();
+    let mut pending = Vec::with_capacity(entries.len());
     for entry in entries {
         let n_strx = u64::from(u32::from_le_bytes(entry[0..4].try_into().unwrap()));
         let n_type = entry[4];
@@ -887,6 +973,11 @@ fn read_nlist_symbols(
         if n_sect == 0 || n_value == 0 || n_type & N_STAB != 0 || n_type & N_TYPE != N_SECT {
             continue;
         }
+        pending.push((n_strx, n_value));
+    }
+    pending.sort_unstable_by_key(|&(n_strx, _)| n_strx);
+    let mut str_reader = PagedStringReader::new(source, stroff, strsize);
+    for (n_strx, n_value) in pending {
         let Some(raw_name) = str_reader.read_cstr(n_strx, 2048) else {
             continue;
         };
@@ -991,13 +1082,16 @@ fn read_cstr_slice<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a str> {
     std::str::from_utf8(&rest[..nul]).ok()
 }
 
+const STRING_PAGE_SIZE: usize = 64 * 1024;
+const STRING_PAGE_MASK: u64 = (STRING_PAGE_SIZE as u64) - 1;
+
 struct PagedStringReader<'a> {
     source: &'a CacheSource,
     base_offset: u64,
     limit: u64,
     page_base: u64,
     page_len: usize,
-    page: [u8; 4096],
+    page: Vec<u8>,
 }
 
 impl<'a> PagedStringReader<'a> {
@@ -1008,23 +1102,39 @@ impl<'a> PagedStringReader<'a> {
             limit,
             page_base: u64::MAX,
             page_len: 0,
-            page: [0u8; 4096],
+            page: vec![0u8; STRING_PAGE_SIZE],
         }
     }
 
     fn read_cstr(&mut self, rel_offset: u64, max_len: usize) -> Option<String> {
-        if rel_offset >= self.limit {
+        if rel_offset >= self.limit || max_len == 0 {
             return None;
         }
-        let mut out = Vec::new();
-        let mut cur = rel_offset;
+        let slice = self.slice_from(rel_offset)?;
+        let cap = slice.len().min(max_len);
+        if let Some(nul) = slice[..cap].iter().position(|&b| b == 0) {
+            if nul == 0 {
+                return None;
+            }
+            return std::str::from_utf8(&slice[..nul]).ok().map(str::to_owned);
+        }
+        if cap == max_len {
+            return std::str::from_utf8(&slice[..max_len])
+                .ok()
+                .map(str::to_owned);
+        }
+        let mut out = Vec::with_capacity(cap.saturating_mul(2).min(max_len));
+        out.extend_from_slice(&slice[..cap]);
+        let mut cur = rel_offset.saturating_add(cap as u64);
         while out.len() < max_len && cur < self.limit {
-            let byte = self.byte_at(cur)?;
-            if byte == 0 {
+            let next = self.slice_from(cur)?;
+            let rem = (max_len - out.len()).min(next.len());
+            if let Some(nul) = next[..rem].iter().position(|&b| b == 0) {
+                out.extend_from_slice(&next[..nul]);
                 break;
             }
-            out.push(byte);
-            cur += 1;
+            out.extend_from_slice(&next[..rem]);
+            cur = cur.saturating_add(rem as u64);
         }
         if out.is_empty() {
             return None;
@@ -1032,15 +1142,15 @@ impl<'a> PagedStringReader<'a> {
         String::from_utf8(out).ok()
     }
 
-    fn byte_at(&mut self, rel_offset: u64) -> Option<u8> {
-        let aligned = rel_offset & !4095;
+    fn slice_from(&mut self, rel_offset: u64) -> Option<&[u8]> {
+        let aligned = rel_offset & !STRING_PAGE_MASK;
         if aligned != self.page_base {
             let abs = self.base_offset.checked_add(aligned)?;
             let rem = self
                 .limit
                 .checked_sub(aligned)?
                 .min(self.source.len().checked_sub(abs)?)
-                .min(4096) as usize;
+                .min(STRING_PAGE_SIZE as u64) as usize;
             if rem == 0 || !self.source.read_exact_at(abs, &mut self.page[..rem]) {
                 self.page_base = u64::MAX;
                 self.page_len = 0;
@@ -1050,7 +1160,7 @@ impl<'a> PagedStringReader<'a> {
             self.page_len = rem;
         }
         let idx = (rel_offset - aligned) as usize;
-        (idx < self.page_len).then(|| self.page[idx])
+        (idx < self.page_len).then(|| &self.page[idx..self.page_len])
     }
 }
 

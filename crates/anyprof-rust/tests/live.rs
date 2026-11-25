@@ -164,17 +164,25 @@ mod supported {
         }
         let counter = dir.join("counter");
         std::fs::write(&counter, [0u8; 8]).unwrap();
-        let mut child = Command::new(&binary)
-            .arg(&counter)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn release nofp rust");
-        let pid = child.id();
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = ChildGuard(
+            Command::new(&binary)
+                .arg(&counter)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn release nofp rust"),
+        );
+        let pid = child.0.id();
         if !wait_for_counter(&counter) {
-            let _ = child.kill();
-            let _ = child.wait();
+            drop(child);
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
@@ -187,13 +195,11 @@ mod supported {
             },
         );
         let Some(session) = accept_or_skip(started) else {
-            let _ = child.kill();
-            let _ = child.wait();
+            drop(child);
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
         let profile = session.stop().expect("stop release nofp");
         assert!(
             profile.stacks.iter().any(|stack| {

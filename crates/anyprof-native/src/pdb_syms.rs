@@ -371,6 +371,17 @@ pub(crate) fn load(image: &Path) -> ImageSymbols {
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn read_pdb(path: &Path, codeview: Option<&CodeView>) -> Option<ImageSymbols> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_pdb_inner(path, codeview)
+    }))
+    .unwrap_or_else(|_| {
+        tracing::debug!(pdb = %path.display(), "PDB parser panicked; skipping PDB");
+        None
+    })
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn read_pdb_inner(path: &Path, codeview: Option<&CodeView>) -> Option<ImageSymbols> {
     use std::fs::File;
 
     let file = File::open(path).ok()?;
@@ -433,49 +444,62 @@ fn collect_lines(
     let mut spans: Vec<LineSpan> = Vec::new();
 
     while let Ok(Some(module)) = modules.next() {
-        let Ok(Some(info)) = pdb.module_info(&module) else {
-            continue;
-        };
-        let Ok(program) = info.line_program() else {
-            continue;
-        };
-        let mut module_files: HashMap<u32, Option<u32>> = HashMap::new();
-        let mut iter = program.lines();
-        while let Ok(Some(line)) = iter.next() {
-            if line.line_start == 0 || line.line_start >= 0x00ef_feff {
-                continue;
-            }
-            let Some(rva) = line.offset.to_rva(map) else {
-                continue;
+        // `pdb 0.8` can trip internal bounds assertions on C13 line subsections
+        // emitted by newer LLVM/MSVC linkers for `-O2` Rust code; isolate each
+        // module so remaining modules and symbol tables still resolve.
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(Some(info)) = pdb.module_info(&module) else {
+                return false;
             };
-            let len = line.length.unwrap_or(64).clamp(1, 64 * 1024);
-            let end = rva.0.saturating_add(len);
-            let file_id = *module_files.entry(line.file_index.0).or_insert_with(|| {
-                let info = program.get_file_info(line.file_index).ok()?;
-                let name = info.name.to_string_lossy(&strings).ok()?;
-                let trimmed = name.trim();
-                if trimmed.is_empty() {
-                    return None;
+            let Ok(program) = info.line_program() else {
+                return false;
+            };
+            let mut module_files: HashMap<u32, Option<u32>> = HashMap::new();
+            let mut iter = program.lines();
+            while let Ok(Some(line)) = iter.next() {
+                if line.line_start == 0 || line.line_start >= 0x00ef_feff {
+                    continue;
                 }
-                if let Some(&existing) = file_ids.get(trimmed) {
-                    return Some(existing);
-                }
-                let id = u32::try_from(files.len()).ok()?;
-                let owned = trimmed.to_string();
-                files.push(owned.clone());
-                file_ids.insert(owned, id);
-                Some(id)
-            });
-            if let Some(file) = file_id {
-                spans.push(LineSpan {
-                    rva: rva.0,
-                    end,
-                    file,
-                    line: line.line_start,
+                let Some(rva) = line.offset.to_rva(map) else {
+                    continue;
+                };
+                let len = line.length.unwrap_or(64).clamp(1, 64 * 1024);
+                let end = rva.0.saturating_add(len);
+                let file_id = *module_files.entry(line.file_index.0).or_insert_with(|| {
+                    let info = program.get_file_info(line.file_index).ok()?;
+                    let name = info.name.to_string_lossy(&strings).ok()?;
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    if let Some(&existing) = file_ids.get(trimmed) {
+                        return Some(existing);
+                    }
+                    let id = u32::try_from(files.len()).ok()?;
+                    let owned = trimmed.to_string();
+                    files.push(owned.clone());
+                    file_ids.insert(owned, id);
+                    Some(id)
                 });
-                if spans.len() >= 4_000_000 {
-                    return (files, index_lines(spans));
+                if let Some(file) = file_id {
+                    spans.push(LineSpan {
+                        rva: rva.0,
+                        end,
+                        file,
+                        line: line.line_start,
+                    });
+                    if spans.len() >= 4_000_000 {
+                        return true;
+                    }
                 }
+            }
+            false
+        }));
+        match step {
+            Ok(true) => return (files, index_lines(spans)),
+            Ok(false) => {}
+            Err(_) => {
+                tracing::debug!("skipping PDB module line program after parser panic");
             }
         }
     }
@@ -517,41 +541,53 @@ fn collect_raw(pdb: &mut pdb::PDB<'_, std::fs::File>) -> Vec<RawSym> {
         && let Ok(mut modules) = dbi.modules()
     {
         while let Ok(Some(module)) = modules.next() {
-            let Ok(Some(info)) = pdb.module_info(&module) else {
-                continue;
-            };
-            let Ok(mut symbols) = info.symbols() else {
-                continue;
-            };
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(Some(info)) = pdb.module_info(&module) else {
+                    return false;
+                };
+                let Ok(mut symbols) = info.symbols() else {
+                    return false;
+                };
+                while let Ok(Some(symbol)) = symbols.next() {
+                    match symbol.parse() {
+                        Ok(pdb::SymbolData::Procedure(proc)) => {
+                            push_raw(&mut raw, proc.offset, proc.len, &proc.name.to_string());
+                        }
+                        Ok(pdb::SymbolData::Public(public)) if public.function || public.code => {
+                            push_raw(&mut raw, public.offset, 0, &public.name.to_string());
+                        }
+                        _ => {}
+                    }
+                    if raw.len() == 2_000_000 {
+                        return true;
+                    }
+                }
+                false
+            }));
+            match step {
+                Ok(true) => return raw,
+                Ok(false) => {}
+                Err(_) => {
+                    tracing::debug!("skipping PDB module symbols after parser panic");
+                }
+            }
+        }
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(globals) = pdb.global_symbols() {
+            let mut symbols = globals.iter();
             while let Ok(Some(symbol)) = symbols.next() {
-                match symbol.parse() {
-                    Ok(pdb::SymbolData::Procedure(proc)) => {
-                        push_raw(&mut raw, proc.offset, proc.len, &proc.name.to_string());
-                    }
-                    Ok(pdb::SymbolData::Public(public)) if public.function || public.code => {
-                        push_raw(&mut raw, public.offset, 0, &public.name.to_string());
-                    }
-                    _ => {}
+                if let Ok(pdb::SymbolData::Public(public)) = symbol.parse()
+                    && (public.function || public.code)
+                {
+                    push_raw(&mut raw, public.offset, 0, &public.name.to_string());
                 }
                 if raw.len() == 2_000_000 {
-                    return raw;
+                    break;
                 }
             }
         }
-    }
-    if let Ok(globals) = pdb.global_symbols() {
-        let mut symbols = globals.iter();
-        while let Ok(Some(symbol)) = symbols.next() {
-            if let Ok(pdb::SymbolData::Public(public)) = symbol.parse()
-                && (public.function || public.code)
-            {
-                push_raw(&mut raw, public.offset, 0, &public.name.to_string());
-            }
-            if raw.len() == 2_000_000 {
-                break;
-            }
-        }
-    }
+    }));
     raw
 }
 
