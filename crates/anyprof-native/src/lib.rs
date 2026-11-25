@@ -1,9 +1,11 @@
 //! Native (C and C++) CPU sampling backend.
 //!
-//! macOS samples on-CPU stacks through Mach (`task_for_pid`, frame pointers,
-//! Mach-O symbols) and needs root. Linux `x86_64` and `aarch64` sample through
-//! `perf_event_open` task-clock events and can include kernel frames. Windows
-//! x64 suspends threads that are actually running and walks them with
+//! macOS samples on-CPU stacks through Mach (`task_for_pid`, Compact Unwind +
+//! DWARF `__eh_frame`, Mach-O and `dyld_shared_cache` symbols) and needs root.
+//! Linux `x86_64` and `aarch64` sample through `perf_event_open` task-clock
+//! events (unwinding `PERF_SAMPLE_STACK_USER` via DWARF `.eh_frame` with frame
+//! pointer and kernel callchain fallbacks) and can include kernel frames.
+//! Windows x64 suspends threads that are actually running and walks them with
 //! `StackWalk64`. Other architectures compile and `start` returns not
 //! implemented.
 //!
@@ -15,7 +17,7 @@
 //! Go sampling reuses the same on-CPU events. When the executable has a Go
 //! pclntab, stacks are unwound from that table’s pcsp values instead of from
 //! frame pointers, and the frames are [`anyprof_core::Runtime::Go`]. A leaf
-//! that is not a Go function still uses the frame-pointer or `StackWalk64` walk.
+//! that is not a Go function still uses the native unwinder.
 //!
 //! Python sampling reuses the same on-CPU events. When the leaf is inside
 //! the CPython image and the frame chain can be read, the user stack is that
@@ -32,6 +34,7 @@
 //! pid so it acts as the fallback when no language runtime matched.
 
 mod dwarf_line;
+mod dyld_cache;
 mod elf;
 mod go_sym;
 mod java;

@@ -88,6 +88,15 @@ fn an_idle_process_does_not_invent_on_cpu_samples() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn samples_an_optimized_fp_less_cpp_program_and_dyld_cache_symbols() {
+    with_root(
+        "samples_an_optimized_fp_less_cpp_program_and_dyld_cache_symbols",
+        sample_nofp_and_dyld_cache,
+    );
+}
+
+#[cfg(target_os = "macos")]
 fn with_root(test_name: &str, body: fn()) {
     if std::env::var_os("ANYPROF_NATIVE_WORKER").is_none() && unsafe { geteuid() } != 0 {
         relaunch_under_sudo(test_name);
@@ -334,6 +343,84 @@ fn sample_idle_program() {
 }
 
 #[cfg(target_os = "macos")]
+fn sample_nofp_and_dyld_cache() {
+    let dir = std::env::temp_dir().join(format!("anyprof-native-nofp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let source = dir.join("nofp.cpp");
+    let binary = dir.join("nofp");
+    std::fs::write(&source, NOFP_MACOS_CPP).expect("write fixture");
+    let compile = Command::new("clang++")
+        .args([
+            "-std=c++17",
+            "-O2",
+            "-fomit-frame-pointer",
+            "-fno-optimize-sibling-calls",
+            "-o",
+        ])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .unwrap_or_else(|err| panic!("clang++ failed to launch: {err}"));
+    if !compile.status.success() {
+        panic!(
+            "clang++ failed to build the nofp fixture\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let mut child = Command::new(&binary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nofp C++ process");
+    let pid = child.id();
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = anyprof_native::NativeBackend.start(
+        &anyprof_core::Target { pid },
+        &anyprof_core::RecordOptions {
+            duration: Some(Duration::from_millis(800)),
+            sampling_interval: Some(Duration::from_millis(10)),
+            ..anyprof_core::RecordOptions::default()
+        },
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let session = started.unwrap_or_else(|err| panic!("nofp profile failed: {err}"));
+    let profile = session
+        .stop()
+        .unwrap_or_else(|err| panic!("stop failed: {err}"));
+
+    assert!(
+        profile.stacks.iter().any(|stack| {
+            let has_leaf = stack.frames.iter().any(|f| f.name.contains("nofp_leaf"));
+            let has_mid = stack.frames.iter().any(|f| f.name.contains("nofp_mid"));
+            let has_top = stack.frames.iter().any(|f| f.name.contains("nofp_top"));
+            has_leaf && has_mid && has_top
+        }),
+        "expected Compact Unwind / __eh_frame chain through nofp_leaf <- nofp_mid <- nofp_top\n{}",
+        explain(&profile, &binary)
+    );
+    assert!(
+        profile
+            .stacks
+            .iter()
+            .flat_map(|stack| stack.frames.iter())
+            .any(|frame| {
+                !frame.name.is_empty()
+                    && frame.module.as_deref().is_some_and(|m| {
+                        m.starts_with("libsystem_") || m == "dyld" || m == "libdyld.dylib"
+                    })
+            }),
+        "expected dyld_shared_cache / dyld system symbols to resolve non-empty function names\n{}",
+        explain(&profile, &binary)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "macos")]
 fn is_spin(name: &str) -> bool {
     name.contains("anyprof_native") && name.contains("spin")
 }
@@ -392,6 +479,7 @@ fn nm_symbols(binary: &std::path::Path) -> String {
             text.lines()
                 .filter(|line| {
                     line.contains("spin")
+                        || line.contains("nofp")
                         || line.contains("anyprof_native")
                         || line.contains(" main")
                 })
@@ -426,6 +514,44 @@ __attribute__((noinline, optnone)) void spin() {
 int main() {
     anyprof_native::spin();
     return 0;
+}
+"#;
+
+#[cfg(target_os = "macos")]
+const NOFP_MACOS_CPP: &str = r#"
+#include <stdint.h>
+#include <stdio.h>
+
+static volatile uint64_t keep_running = 1;
+
+namespace anyprof_native {
+__attribute__((noinline)) uint64_t nofp_leaf(uint64_t seed) {
+    char buf[64];
+    uint64_t acc = seed;
+    while (keep_running) {
+        int n = snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(acc));
+        acc += static_cast<uint64_t>(n);
+    }
+    return acc;
+}
+
+__attribute__((noinline)) uint64_t nofp_mid(uint64_t seed) {
+    volatile uint64_t scratch[8];
+    scratch[0] = 3;
+    uint64_t res = nofp_leaf(seed + scratch[0]);
+    return res + scratch[0];
+}
+
+__attribute__((noinline)) uint64_t nofp_top(uint64_t seed) {
+    volatile uint64_t scratch[8];
+    scratch[1] = 5;
+    uint64_t res = nofp_mid(seed + scratch[1]);
+    return res + scratch[1];
+}
+}
+
+int main() {
+    return static_cast<int>(anyprof_native::nofp_top(1));
 }
 "#;
 

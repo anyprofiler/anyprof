@@ -48,6 +48,7 @@ pub(crate) const HOST_ELF_MACHINE: u16 = EM_X86_64;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
+const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_NOBITS: u32 = 8;
@@ -56,6 +57,29 @@ const SHF_COMPRESSED: u64 = 0x800;
 const STT_FUNC: u8 = 2;
 const STT_GNU_IFUNC: u8 = 10;
 const SHN_UNDEF: u16 = 0;
+
+const MAX_EH_FRAME_HDR_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EH_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Link-time DWARF CFI sections used by `framehop` to unwind without frame pointers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ElfUnwind {
+    /// Minimum `PT_LOAD.vaddr` (`0` for `ET_DYN`, e.g. `0x400000` for `ET_EXEC`).
+    pub base_svma: u64,
+    pub text_svma: Option<std::ops::Range<u64>>,
+    pub got_svma: Option<std::ops::Range<u64>>,
+    pub eh_frame_hdr_svma: Option<std::ops::Range<u64>>,
+    pub eh_frame_hdr: Option<crate::walk::SectionBytes>,
+    pub eh_frame_svma: Option<std::ops::Range<u64>>,
+    pub eh_frame: Option<crate::walk::SectionBytes>,
+    pub debug_frame: Option<crate::walk::SectionBytes>,
+}
+
+impl ElfUnwind {
+    pub(crate) fn has_unwind_data(&self) -> bool {
+        self.eh_frame.is_some() || self.debug_frame.is_some()
+    }
+}
 
 /// One `PT_LOAD` segment, before ASLR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +116,8 @@ pub(crate) struct ElfFile {
     pub funcs: Vec<ElfFunc>,
     /// DWARF `.debug_line` address-to-line table at link-time addresses.
     pub lines: Arc<LineTable>,
+    /// DWARF `.eh_frame` / `.eh_frame_hdr` / `.debug_frame` unwind tables.
+    pub unwind: Arc<ElfUnwind>,
 }
 
 /// One loaded image and the symbols we could read for it.
@@ -103,6 +129,8 @@ pub(crate) struct UserImage {
     pub end: u64,
     /// File name (`busy`, `libc.so.6`, ...).
     pub module: String,
+    /// Executable `(start, end)` VMA spans from `/proc/<pid>/maps`.
+    pub(crate) exec_spans: Vec<(u64, u64)>,
     /// The file contains a Rust image marker. Demangled `::` paths in it are
     /// Rust frames when the mangled name is no longer available.
     pub(crate) rust_image: bool,
@@ -115,6 +143,8 @@ pub(crate) struct UserImage {
     symbols: Vec<(u64, u64, String, Runtime)>,
     /// Unslid DWARF line table shared with [`ElfFile`].
     lines: Arc<LineTable>,
+    /// Unslid DWARF CFI unwind sections shared with [`ElfFile`].
+    unwind: Arc<ElfUnwind>,
 }
 
 impl UserImage {
@@ -124,11 +154,13 @@ impl UserImage {
             start,
             end,
             module,
+            exec_spans: Vec::new(),
             rust_image: false,
             go: None,
             bias: 0,
             symbols: Vec::new(),
             lines: Arc::new(LineTable::default()),
+            unwind: Arc::new(ElfUnwind::default()),
         }
     }
 
@@ -152,11 +184,47 @@ impl UserImage {
             start,
             end,
             module,
+            exec_spans: vec![(start, end)],
             rust_image: false,
             go: None,
             bias,
             symbols,
             lines: Arc::clone(&elf.lines),
+            unwind: Arc::clone(&elf.unwind),
+        }
+    }
+
+    /// Register each executable VMA span with `unwinder` when `.eh_frame` or
+    /// `.debug_frame` is available.
+    pub(crate) fn register_unwind_modules<U>(&self, unwinder: &mut U)
+    where
+        U: framehop::Unwinder<Module = framehop::Module<crate::walk::SectionBytes>>,
+    {
+        if !self.unwind.has_unwind_data() {
+            return;
+        }
+        let base_avma = self.unwind.base_svma.wrapping_add(self.bias);
+        for &(span_start, span_end) in &self.exec_spans {
+            if span_end <= span_start || span_start < base_avma {
+                continue;
+            }
+            let info = framehop::ExplicitModuleSectionInfo {
+                base_svma: self.unwind.base_svma,
+                text_svma: self.unwind.text_svma.clone(),
+                got_svma: self.unwind.got_svma.clone(),
+                eh_frame_hdr_svma: self.unwind.eh_frame_hdr_svma.clone(),
+                eh_frame_hdr: self.unwind.eh_frame_hdr.clone(),
+                eh_frame_svma: self.unwind.eh_frame_svma.clone(),
+                eh_frame: self.unwind.eh_frame.clone(),
+                debug_frame: self.unwind.debug_frame.clone(),
+                ..Default::default()
+            };
+            unwinder.add_module(framehop::Module::new(
+                self.module.clone(),
+                span_start..span_end,
+                base_avma,
+                info,
+            ));
         }
     }
 
@@ -323,13 +391,20 @@ fn parse_reader<R: Read + Seek>(mut reader: R, len: u64) -> Option<ElfFile> {
     if phentsize < 56 || shentsize < 64 {
         return None;
     }
-    let loads = read_loads(&mut reader, len, phoff, phentsize, phnum)?;
+    let (loads, gnu_eh_frame) = read_loads(&mut reader, len, phoff, phentsize, phnum)?;
     if shoff == 0 {
+        let unwind = Arc::new(read_elf_unwind_from_phdr(
+            &mut reader,
+            len,
+            &loads,
+            gnu_eh_frame,
+        ));
         return Some(ElfFile {
             machine,
             loads,
             funcs: Vec::new(),
             lines: Arc::new(LineTable::default()),
+            unwind,
         });
     }
     if shnum == 0 {
@@ -345,11 +420,20 @@ fn parse_reader<R: Read + Seek>(mut reader: R, len: u64) -> Option<ElfFile> {
     let sections = read_sections(&mut reader, len, shoff, shentsize, shnum)?;
     let funcs = read_funcs(&mut reader, len, &sections);
     let lines = read_dwarf_lines(&mut reader, len, &sections, shstrndx);
+    let unwind = Arc::new(read_elf_unwind(
+        &mut reader,
+        len,
+        &loads,
+        gnu_eh_frame,
+        &sections,
+        shstrndx,
+    ));
     Some(ElfFile {
         machine,
         loads,
         funcs,
         lines,
+        unwind,
     })
 }
 
@@ -358,6 +442,7 @@ struct Section {
     name: u32,
     kind: u32,
     flags: u64,
+    addr: u64,
     offset: u64,
     size: u64,
     link: u32,
@@ -370,31 +455,35 @@ fn read_loads<R: Read + Seek>(
     phoff: u64,
     entsize: u64,
     phnum: u64,
-) -> Option<Vec<LoadSegment>> {
+) -> Option<(Vec<LoadSegment>, Option<LoadSegment>)> {
     if phnum > 1000 || phoff.saturating_add(phnum.saturating_mul(entsize)) > len {
         return None;
     }
     let mut loads = Vec::new();
+    let mut gnu_eh_frame = None;
     for index in 0..phnum {
         let mut buf = vec![0u8; entsize as usize];
         reader.seek(SeekFrom::Start(phoff + index * entsize)).ok()?;
         reader.read_exact(&mut buf).ok()?;
         let kind = u32::from_le_bytes(buf[0..4].try_into().ok()?);
-        if kind != PT_LOAD {
+        if kind != PT_LOAD && kind != PT_GNU_EH_FRAME {
             continue;
         }
-        let flags = u32::from_le_bytes(buf[4..8].try_into().ok()?);
         let offset = u64::from_le_bytes(buf[8..16].try_into().ok()?);
         let vaddr = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let filesz = u64::from_le_bytes(buf[32..40].try_into().ok()?);
-        let _ = flags;
-        loads.push(LoadSegment {
+        let seg = LoadSegment {
             offset,
             vaddr,
             filesz,
-        });
+        };
+        if kind == PT_LOAD {
+            loads.push(seg);
+        } else if gnu_eh_frame.is_none() && filesz > 0 {
+            gnu_eh_frame = Some(seg);
+        }
     }
-    Some(loads)
+    Some((loads, gnu_eh_frame))
 }
 
 fn read_sections<R: Read + Seek>(
@@ -442,6 +531,7 @@ fn parse_section_bytes(buf: &[u8]) -> Option<Section> {
         name: u32::from_le_bytes(buf[0..4].try_into().ok()?),
         kind: u32::from_le_bytes(buf[4..8].try_into().ok()?),
         flags: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+        addr: u64::from_le_bytes(buf[16..24].try_into().ok()?),
         offset: u64::from_le_bytes(buf[24..32].try_into().ok()?),
         size: u64::from_le_bytes(buf[32..40].try_into().ok()?),
         link: u32::from_le_bytes(buf[40..44].try_into().ok()?),
@@ -576,18 +666,196 @@ fn read_dwarf_lines<R: Read + Seek>(
     ))
 }
 
+fn read_elf_unwind<R: Read + Seek>(
+    reader: &mut R,
+    len: u64,
+    loads: &[LoadSegment],
+    gnu_eh_frame: Option<LoadSegment>,
+    sections: &[Section],
+    shstrndx: u64,
+) -> ElfUnwind {
+    let base_svma = loads.iter().map(|load| load.vaddr).min().unwrap_or(0);
+    let shstr = usize::try_from(shstrndx)
+        .ok()
+        .and_then(|idx| sections.get(idx).copied())
+        .and_then(|sec| read_section_bytes(reader, len, sec, MAX_STRINGS));
+    let mut text_svma = None;
+    let mut got_svma = None;
+    let mut got_plt_svma = None;
+    let mut eh_hdr_sec = None;
+    let mut eh_sec = None;
+    let mut debug_frame_sec = None;
+    if let Some(shstr) = shstr.as_deref() {
+        for section in sections {
+            if section.kind == SHT_NOBITS
+                || (section.flags & SHF_COMPRESSED) != 0
+                || section.size == 0
+            {
+                continue;
+            }
+            let Some(name) = cstr_at(shstr, section.name as usize) else {
+                continue;
+            };
+            let range = section.addr..section.addr.saturating_add(section.size);
+            match name {
+                ".text" if text_svma.is_none() => text_svma = Some(range),
+                ".got" if got_svma.is_none() => got_svma = Some(range),
+                ".got.plt" if got_plt_svma.is_none() => got_plt_svma = Some(range),
+                ".eh_frame_hdr" if eh_hdr_sec.is_none() => eh_hdr_sec = Some(*section),
+                ".eh_frame" if eh_sec.is_none() => eh_sec = Some(*section),
+                ".debug_frame" if debug_frame_sec.is_none() => debug_frame_sec = Some(*section),
+                _ => {}
+            }
+        }
+    }
+    let mut eh_frame_hdr_svma = None;
+    let mut eh_frame_hdr = None;
+    if let Some(sec) = eh_hdr_sec
+        && let Some(bytes) = read_section_bytes(reader, len, sec, MAX_EH_FRAME_HDR_BYTES)
+    {
+        eh_frame_hdr_svma = Some(sec.addr..sec.addr.saturating_add(sec.size));
+        eh_frame_hdr = Some(crate::walk::SectionBytes::new(bytes));
+    }
+    let mut eh_frame_svma = None;
+    let mut eh_frame = None;
+    if let Some(sec) = eh_sec
+        && let Some(bytes) = read_section_bytes(reader, len, sec, MAX_EH_FRAME_BYTES)
+    {
+        eh_frame_svma = Some(sec.addr..sec.addr.saturating_add(sec.size));
+        eh_frame = Some(crate::walk::SectionBytes::new(bytes));
+    }
+    if eh_frame.is_none() {
+        let fallback = read_elf_unwind_from_phdr(reader, len, loads, gnu_eh_frame);
+        if fallback.eh_frame.is_some() {
+            eh_frame_hdr_svma = fallback.eh_frame_hdr_svma;
+            eh_frame_hdr = fallback.eh_frame_hdr;
+            eh_frame_svma = fallback.eh_frame_svma;
+            eh_frame = fallback.eh_frame;
+        }
+    }
+    let debug_frame = if eh_frame.is_none() {
+        debug_frame_sec
+            .and_then(|sec| read_section_bytes(reader, len, sec, MAX_EH_FRAME_BYTES))
+            .map(crate::walk::SectionBytes::new)
+    } else {
+        None
+    };
+    ElfUnwind {
+        base_svma,
+        text_svma,
+        got_svma: got_svma.or(got_plt_svma),
+        eh_frame_hdr_svma,
+        eh_frame_hdr,
+        eh_frame_svma,
+        eh_frame,
+        debug_frame,
+    }
+}
+
+fn read_elf_unwind_from_phdr<R: Read + Seek>(
+    reader: &mut R,
+    len: u64,
+    loads: &[LoadSegment],
+    gnu_eh_frame: Option<LoadSegment>,
+) -> ElfUnwind {
+    let base_svma = loads.iter().map(|load| load.vaddr).min().unwrap_or(0);
+    let Some(hdr_seg) = gnu_eh_frame else {
+        return ElfUnwind {
+            base_svma,
+            ..Default::default()
+        };
+    };
+    let Some(hdr_bytes) = read_range_bytes(
+        reader,
+        len,
+        hdr_seg.offset,
+        hdr_seg.filesz,
+        MAX_EH_FRAME_HDR_BYTES,
+    ) else {
+        return ElfUnwind {
+            base_svma,
+            ..Default::default()
+        };
+    };
+    let Some(eh_vaddr) = decode_eh_frame_hdr_ptr(&hdr_bytes, hdr_seg.vaddr) else {
+        return ElfUnwind {
+            base_svma,
+            ..Default::default()
+        };
+    };
+    let Some(load) = loads
+        .iter()
+        .find(|load| eh_vaddr >= load.vaddr && eh_vaddr < load.vaddr.saturating_add(load.filesz))
+    else {
+        return ElfUnwind {
+            base_svma,
+            ..Default::default()
+        };
+    };
+    let off_in_load = eh_vaddr - load.vaddr;
+    let eh_offset = load.offset.saturating_add(off_in_load);
+    let eh_size = (load.filesz - off_in_load).min(MAX_EH_FRAME_BYTES);
+    let Some(eh_bytes) = read_range_bytes(reader, len, eh_offset, eh_size, MAX_EH_FRAME_BYTES)
+    else {
+        return ElfUnwind {
+            base_svma,
+            ..Default::default()
+        };
+    };
+    ElfUnwind {
+        base_svma,
+        eh_frame_hdr_svma: Some(hdr_seg.vaddr..hdr_seg.vaddr.saturating_add(hdr_seg.filesz)),
+        eh_frame_hdr: Some(crate::walk::SectionBytes::new(hdr_bytes)),
+        eh_frame_svma: Some(eh_vaddr..eh_vaddr.saturating_add(eh_size)),
+        eh_frame: Some(crate::walk::SectionBytes::new(eh_bytes)),
+        ..Default::default()
+    }
+}
+
+fn decode_eh_frame_hdr_ptr(hdr: &[u8], hdr_vaddr: u64) -> Option<u64> {
+    if hdr.len() < 8 || hdr[0] != 1 {
+        return None;
+    }
+    let enc = hdr[1];
+    if enc == 0xff || (enc & 0x80) != 0 {
+        return None;
+    }
+    let raw = match enc & 0x0f {
+        0x00 | 0x04 => u64::from_le_bytes(hdr.get(4..12)?.try_into().ok()?),
+        0x03 => u32::from_le_bytes(hdr.get(4..8)?.try_into().ok()?) as u64,
+        0x0b => (i32::from_le_bytes(hdr.get(4..8)?.try_into().ok()?) as i64) as u64,
+        0x0c => i64::from_le_bytes(hdr.get(4..12)?.try_into().ok()?) as u64,
+        _ => return None,
+    };
+    match enc & 0x70 {
+        0x00 => Some(raw),
+        0x10 => Some(hdr_vaddr.wrapping_add(4).wrapping_add(raw)),
+        0x30 => Some(hdr_vaddr.wrapping_add(raw)),
+        _ => None,
+    }
+}
+
 fn read_section_bytes<R: Read + Seek>(
     reader: &mut R,
     len: u64,
     section: Section,
     cap: u64,
 ) -> Option<Vec<u8>> {
-    if section.size == 0 || section.size > cap || section.offset.saturating_add(section.size) > len
-    {
+    read_range_bytes(reader, len, section.offset, section.size, cap)
+}
+
+fn read_range_bytes<R: Read + Seek>(
+    reader: &mut R,
+    len: u64,
+    offset: u64,
+    size: u64,
+    cap: u64,
+) -> Option<Vec<u8>> {
+    if size == 0 || size > cap || offset.saturating_add(size) > len {
         return None;
     }
-    let mut buf = vec![0u8; section.size as usize];
-    reader.seek(SeekFrom::Start(section.offset)).ok()?;
+    let mut buf = vec![0u8; size as usize];
+    reader.seek(SeekFrom::Start(offset)).ok()?;
     reader.read_exact(&mut buf).ok()?;
     Some(buf)
 }
@@ -768,6 +1036,68 @@ mod tests {
                 .expect("dwarf location for target_fn");
         assert!(file.ends_with("sample.cpp"), "unexpected file: {file}");
         assert!((1..=3).contains(&line), "unexpected line: {line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn compiled_fp_less_elf_exposes_eh_frame_and_phdr_fallback() {
+        use framehop::Unwinder as _;
+        let dir = std::env::temp_dir().join(format!("anyprof-elf-ehframe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("nofp.cpp");
+        let bin = dir.join("nofp");
+        std::fs::write(
+            &src,
+            "__attribute__((noinline)) int leaf_fn(int x) {\n    volatile int y = x + 3;\n    return y;\n}\n__attribute__((noinline)) int mid_fn(int x) {\n    return leaf_fn(x) + 1;\n}\nint main() {\n    return mid_fn(4);\n}\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("g++")
+            .args([
+                "-O2",
+                "-fomit-frame-pointer",
+                "-fno-optimize-sibling-calls",
+                "-o",
+            ])
+            .arg(&bin)
+            .arg(&src)
+            .status();
+        let Ok(status) = status else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let elf = super::parse_path(&bin).expect("parse compiled nofp elf");
+        assert!(elf.unwind.has_unwind_data());
+        assert!(elf.unwind.eh_frame.is_some());
+        assert!(elf.unwind.eh_frame_hdr.is_some());
+        let bias = 0x5555_0000_0000u64;
+        let image = UserImage::from_elf(bias, bias + 0x10_0000, "nofp".to_string(), &elf, bias);
+        let mut unwinder = framehop::UnwinderNative::<
+            crate::walk::SectionBytes,
+            framehop::MayAllocateDuringUnwind,
+        >::new();
+        image.register_unwind_modules(&mut unwinder);
+        assert!(unwinder.max_known_code_address() > bias);
+
+        // Strip section headers (`e_shoff = 0`) to verify PT_GNU_EH_FRAME fallback.
+        let mut raw = std::fs::read(&bin).unwrap();
+        raw[40..48].copy_from_slice(&0u64.to_le_bytes());
+        let stripped = super::parse_bytes(&raw).expect("parse sectionless elf");
+        assert!(stripped.unwind.has_unwind_data());
+        assert!(stripped.unwind.eh_frame.is_some());
+        assert!(stripped.unwind.eh_frame_hdr.is_some());
+        assert_eq!(
+            stripped.unwind.eh_frame_svma.as_ref().map(|r| r.start),
+            elf.unwind.eh_frame_svma.as_ref().map(|r| r.start)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

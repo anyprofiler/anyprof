@@ -2,16 +2,18 @@
 //!
 //! `task_for_pid` yields a Mach task port (root, or a debugger entitlement).
 //! Each tick asks `thread_info` which threads are actually running, suspends
-//! those threads, reads `ARM_THREAD_STATE64` / `x86_THREAD_STATE64`, and walks
-//! the frame-pointer chain with `mach_vm_read_overwrite`. A tick with no
-//! running thread adds no samples. Threads are resumed before their send
-//! rights are dropped. Symbols come from each image's Mach-O symbol table
-//! ([`crate::macho`]). Signed arm64 pointers are stripped with `xpaci` /
-//! `xpacd` when the thread-state flags say so; they are not authenticated.
+//! those threads, reads `ARM_THREAD_STATE64` / `x86_THREAD_STATE64`, and unwinds
+//! Compact Unwind / `__eh_frame` (`framehop`) or the frame-pointer chain over
+//! cached 4 KiB stack pages via `mach_vm_read_overwrite`. A tick with no running
+//! thread adds no samples. Threads are resumed before their send rights are
+//! dropped. Symbols come from each image's Mach-O symbol table ([`crate::macho`])
+//! and macOS's `dyld_v1` shared cache ([`crate::dyld_cache`]). Signed arm64
+//! pointers are stripped with `xpaci` / `xpacd` when the thread-state flags say
+//! so; they are not authenticated.
 //!
 //! Kernel frames are not available through this interface. `-k` is ignored and
-//! a warning is logged. Linux x86_64 records kernel frames with perf events.
-//! Windows x64 samples user frames only, the same as macOS.
+//! a warning is logged. Linux records kernel frames with perf events. Windows
+//! x64 samples user frames only, the same as macOS.
 
 use std::ffi::c_char;
 use std::path::Path;
@@ -20,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyprof_core::{
     Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Target, inspect,
 };
+use framehop::Unwinder as _;
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_types::{task_t, thread_act_array_t, thread_act_t};
 use mach2::message::mach_msg_type_number_t;
@@ -35,6 +38,10 @@ use crate::java::{self, JavaVm};
 use crate::macho::{ImageSymbols, MachCpu, segment_bounds};
 use crate::policy::{self, SampleCollector, StripKind};
 use crate::python::{self, CountedStack, PythonVm};
+use crate::walk::SectionBytes;
+
+type MachUnwinder = framehop::UnwinderNative<SectionBytes, framehop::MustNotAllocateDuringUnwind>;
+type MachUnwindCache = framehop::CacheNative<framehop::MustNotAllocateDuringUnwind>;
 
 const MAX_FRAMES: usize = 64;
 const THREAD_BASIC_INFO: u32 = 3;
@@ -82,6 +89,15 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
 
     let task = Task::attach(target.pid)?;
     let symbols = load_symbols(task.port, target.pid);
+    let mut unwinder = MachUnwinder::new();
+    for image in &symbols {
+        image.register_unwind_module(&mut unwinder);
+    }
+    let mut unwind_cache = MachUnwindCache::new_in();
+    let go_images: Vec<_> = symbols
+        .iter()
+        .filter_map(|image| image.go.clone())
+        .collect();
     let images = remote_images(task.port)
         .into_iter()
         .map(|image| (image.path, image.load, image.end))
@@ -107,11 +123,13 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         {
             break;
         }
-        let go_images: Vec<_> = symbols
-            .iter()
-            .filter_map(|image| image.go.clone())
-            .collect();
-        match task.sample_addresses(&go_images, python.as_ref(), java.as_ref()) {
+        match task.sample_addresses(
+            &unwinder,
+            &mut unwind_cache,
+            &go_images,
+            python.as_ref(),
+            java.as_ref(),
+        ) {
             Ok(stacks) => {
                 let offset_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 for hit in stacks {
@@ -287,6 +305,8 @@ impl Task {
 
     fn sample_addresses(
         &self,
+        unwinder: &MachUnwinder,
+        unwind_cache: &mut MachUnwindCache,
         go_images: &[crate::go_sym::GoImage],
         python: Option<&PythonVm>,
         java: Option<&JavaVm>,
@@ -306,7 +326,15 @@ impl Task {
             // `threads` stays alive until this function returns, so each
             // resume in `unwind_thread` happens before `ThreadList` drops the
             // send rights.
-            match unwind_thread(self.port, *thread, go_images, python, java) {
+            match unwind_thread(
+                self.port,
+                *thread,
+                unwinder,
+                unwind_cache,
+                go_images,
+                python,
+                java,
+            ) {
                 Ok(Some(hit)) => stacks.push(hit),
                 Ok(None) => {}
                 Err(err) => return Err(err),
@@ -501,9 +529,16 @@ struct ThreadHit {
     stack: CountedStack,
 }
 
+enum PendingStack {
+    Native(usize),
+    Language(CountedStack),
+}
+
 fn unwind_thread(
     task: task_t,
     thread: thread_act_t,
+    unwinder: &MachUnwinder,
+    unwind_cache: &mut MachUnwindCache,
     go_images: &[crate::go_sym::GoImage],
     python: Option<&PythonVm>,
     java: Option<&JavaVm>,
@@ -524,39 +559,40 @@ fn unwind_thread(
             &mut count,
         )
     };
-    let hit = if kr == KERN_SUCCESS {
+    let mut raw_addrs = [0u64; MAX_FRAMES];
+    let mut tid = 0u64;
+    let pending = if kr == KERN_SUCCESS {
         let (pc, sp, fp, lr) = registers(&state);
-        let tid = thread_identifier(thread).unwrap_or(0);
-        let name = thread_name(thread);
+        tid = thread_identifier(thread).unwrap_or(0);
         // `frames` is `None` for a leaf outside the code cache and for a
         // blob whose method cannot be read. Both keep the native walk.
-        let stack = if let Some(vm) = java
+        if let Some(vm) = java
             && let Some(java_frames) =
                 vm.frames(pc, sp, fp, &mut |addr, buf| read_task(task, addr, buf))
         {
-            Some(CountedStack::Java {
+            Some(PendingStack::Language(CountedStack::Java {
                 kernel: Vec::new(),
                 frames: java_frames,
-            })
+            }))
         } else if let Some(vm) = python
             && let Some(py_frames) = vm.frames(tid, pc, &mut |addr, buf| read_task(task, addr, buf))
         {
-            Some(CountedStack::Python {
+            Some(PendingStack::Language(CountedStack::Python {
                 kernel: Vec::new(),
                 frames: py_frames,
-            })
+            }))
+        } else if !go_images.is_empty()
+            && let Some(go_frames) = walk_go_frames(task, pc, sp, lr, go_images)
+        {
+            (!go_frames.is_empty()).then_some(PendingStack::Language(CountedStack::Addresses {
+                frames: go_frames,
+                kernel_len: 0,
+            }))
         } else {
-            let frames = walk_frames(task, pc, sp, fp, lr, go_images);
-            if frames.is_empty() {
-                None
-            } else {
-                Some(CountedStack::Addresses {
-                    frames,
-                    kernel_len: 0,
-                })
-            }
-        };
-        stack.map(|stack| ThreadHit { tid, name, stack })
+            let n =
+                walk_native_frames(task, unwinder, unwind_cache, pc, sp, fp, lr, &mut raw_addrs);
+            (n > 0).then_some(PendingStack::Native(n))
+        }
     } else {
         None
     };
@@ -566,7 +602,18 @@ fn unwind_thread(
             "thread_resume failed (kern return {resume_kr}); a target thread may still be suspended"
         )));
     }
-    Ok(hit)
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    let name = thread_name(thread);
+    let stack = match pending {
+        PendingStack::Native(len) => CountedStack::Addresses {
+            frames: raw_addrs[..len].to_vec(),
+            kernel_len: 0,
+        },
+        PendingStack::Language(stack) => stack,
+    };
+    Ok(Some(ThreadHit { tid, name, stack }))
 }
 
 /// `thread_identifier_info.thread_id`, which CPython stores from `pthread_threadid_np`.
@@ -620,46 +667,106 @@ fn registers(state: &ThreadState) -> (u64, u64, u64, u64) {
     (state.__rip, state.__rsp, state.__rbp, 0)
 }
 
-fn walk_frames(
+fn walk_go_frames(
     task: task_t,
     pc: u64,
     sp: u64,
-    fp: u64,
     lr: u64,
     go_images: &[crate::go_sym::GoImage],
-) -> Vec<u64> {
+) -> Option<Vec<u64>> {
     let machine = if cfg!(target_arch = "aarch64") {
         crate::go_sym::GoMachine::Arm64
     } else {
         crate::go_sym::GoMachine::X86_64
     };
-    if let Some(frames) = crate::go_sym::unwind(
+    let mut reader = CachedTaskStackReader::new(task);
+    crate::go_sym::unwind(
         go_images,
         pc,
         sp,
         lr,
         machine,
-        |addr, buf| read_task(task, addr, buf),
+        |addr, buf| reader.read_slice(addr, buf),
         |addr| apply_strip(addr, policy::stack_strip_flags(), StripKind::Code, false),
-    ) {
-        return frames;
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_native_frames(
+    task: task_t,
+    unwinder: &MachUnwinder,
+    unwind_cache: &mut MachUnwindCache,
+    pc: u64,
+    sp: u64,
+    fp: u64,
+    lr: u64,
+    out: &mut [u64; MAX_FRAMES],
+) -> usize {
+    if !plausible_code(pc) {
+        return 0;
     }
-    let mut frames = Vec::new();
+    let mut reader = CachedTaskStackReader::new(task);
+    let stack_flags = policy::stack_strip_flags();
+    #[cfg(target_arch = "x86_64")]
+    let regs = framehop::x86_64::UnwindRegsX86_64::new(pc, sp, fp);
+    #[cfg(target_arch = "aarch64")]
+    let regs = framehop::aarch64::UnwindRegsAarch64::new_with_ptr_auth_mask(
+        crate::walk::aarch64_ptr_auth_mask(
+            unwinder.max_known_code_address(),
+            0x0000_8000_0000_0000,
+        ),
+        lr,
+        sp,
+        fp,
+    );
+    let mut len = 0usize;
+    let mut ended_at_root = false;
+    {
+        let mut read_word = |addr: u64| reader.read_u64(addr);
+        let mut iter = unwinder.iter_frames(pc, regs, unwind_cache, &mut read_word);
+        while len < MAX_FRAMES {
+            match iter.next() {
+                Ok(Some(frame)) => {
+                    let addr = apply_strip(frame.address(), stack_flags, StripKind::Code, false);
+                    if !plausible_code(addr) {
+                        break;
+                    }
+                    out[len] = addr;
+                    len += 1;
+                }
+                Ok(None) | Err(framehop::Error::ReturnAddressIsNull) => {
+                    ended_at_root = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    if len <= 1 && !ended_at_root {
+        return walk_fp_into(&mut reader, pc, fp, lr, out);
+    }
+    len
+}
+
+fn walk_fp_into(
+    reader: &mut CachedTaskStackReader,
+    pc: u64,
+    mut fp: u64,
+    lr: u64,
+    out: &mut [u64; MAX_FRAMES],
+) -> usize {
+    let mut len = 0usize;
     if plausible_code(pc) {
-        frames.push(pc);
+        out[0] = pc;
+        len = 1;
     }
-    let mut fp = fp;
-    let mut guard = 0;
-    while frames.len() < MAX_FRAMES && plausible_frame(fp) {
+    let stack_flags = policy::stack_strip_flags();
+    let mut guard = 0usize;
+    while len < MAX_FRAMES && plausible_frame(fp) {
         let mut record = [0u8; 16];
-        if !read_task(task, fp, &mut record) {
+        if !reader.read_slice(fp, &mut record) {
             break;
         }
-        // `flags` applies to the registers already stripped above. A stack
-        // slot keeps its own signature: an arm64 process can be inside an
-        // arm64e callee. `stack_strip_flags` ignores `NO_PTRAUTH` so `xpacd`
-        // and `xpaci` still run. Both are the identity on an unsigned pointer.
-        let stack_flags = policy::stack_strip_flags();
         let next_fp = apply_strip(
             u64::from_le_bytes(record[0..8].try_into().unwrap()),
             stack_flags,
@@ -675,7 +782,8 @@ fn walk_frames(
         if !plausible_code(ret) {
             break;
         }
-        frames.push(ret);
+        out[len] = ret;
+        len += 1;
         if next_fp <= fp {
             break;
         }
@@ -685,10 +793,60 @@ fn walk_frames(
             break;
         }
     }
-    if frames.len() == 1 && plausible_code(lr) && lr != frames[0] {
-        frames.push(lr);
+    if len == 1 && plausible_code(lr) && lr != out[0] {
+        out[1] = lr;
+        len = 2;
     }
-    frames
+    len
+}
+
+struct CachedTaskStackReader {
+    task: task_t,
+    page_base: u64,
+    valid: bool,
+    page: [u8; 4096],
+}
+
+impl CachedTaskStackReader {
+    fn new(task: task_t) -> Self {
+        Self {
+            task,
+            page_base: u64::MAX,
+            valid: false,
+            page: [0u8; 4096],
+        }
+    }
+
+    fn read_u64(&mut self, addr: u64) -> Result<u64, ()> {
+        let mut buf = [0u8; 8];
+        if self.read_slice(addr, &mut buf) {
+            Ok(u64::from_le_bytes(buf))
+        } else {
+            Err(())
+        }
+    }
+
+    fn read_slice(&mut self, addr: u64, buf: &mut [u8]) -> bool {
+        if addr == 0 || buf.is_empty() {
+            return false;
+        }
+        let off = (addr & 0xfff) as usize;
+        if buf.len() <= 4096 - off {
+            let aligned = addr & !0xfff;
+            if !self.valid || self.page_base != aligned {
+                if read_task(self.task, aligned, &mut self.page) {
+                    self.page_base = aligned;
+                    self.valid = true;
+                } else {
+                    self.valid = false;
+                    return read_task(self.task, addr, buf);
+                }
+            }
+            buf.copy_from_slice(&self.page[off..off + buf.len()]);
+            return true;
+        }
+        read_task(self.task, addr, buf)
+    }
 }
 
 fn plausible_code(addr: u64) -> bool {
@@ -796,6 +954,7 @@ pub(crate) fn read_memory(task: task_t, addr: u64, buf: &mut [u8]) -> bool {
 
 fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {
     let cpu = MachCpu::host();
+    let mut shared_cache: Option<Option<crate::dyld_cache::DyldSharedCache>> = None;
     let mut images = Vec::new();
     for remote in remote_images(task) {
         let module = module_name(&remote.path);
@@ -806,6 +965,14 @@ fn load_symbols(task: task_t, pid: u32) -> Vec<ImageSymbols> {
         if let Some(mut parsed) = file_symbols {
             parsed.rust_image = rust_image;
             parsed.go = go;
+            images.push(parsed);
+            continue;
+        }
+        let cached_symbols = shared_cache
+            .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::open_host(cpu))
+            .as_ref()
+            .and_then(|cache| cache.load_image(&remote.path, remote.load, &module));
+        if let Some(parsed) = cached_symbols {
             images.push(parsed);
             continue;
         }
@@ -846,10 +1013,15 @@ fn remote_images(task: task_t) -> Vec<RemoteImage> {
     let Some(info_addr) = dyld_info_addr(task) else {
         return Vec::new();
     };
-    let mut header = [0u8; 16];
-    if !read_task(task, info_addr, &mut header) {
+    let mut header = [0u8; 40];
+    let has_dyld_slot = if read_task(task, info_addr, &mut header) {
+        true
+    } else if read_task(task, info_addr, &mut header[..16]) {
+        false
+    } else {
         return Vec::new();
-    }
+    };
+    let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let count = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
     let array = u64::from_le_bytes(header[8..16].try_into().unwrap());
     if count == 0 || count > 4096 || array == 0 {
@@ -860,7 +1032,7 @@ fn remote_images(task: task_t) -> Vec<RemoteImage> {
     if !read_remote(task, array, &mut raw) {
         return Vec::new();
     }
-    let mut images = Vec::with_capacity(count);
+    let mut images = Vec::with_capacity(count + 1);
     let (rows, _) = raw.as_chunks::<24>();
     for chunk in rows {
         let load = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
@@ -871,6 +1043,21 @@ fn remote_images(task: task_t) -> Vec<RemoteImage> {
         let path = read_remote_cstr(task, path_ptr).unwrap_or_default();
         let end = image_end(task, load).unwrap_or(load.saturating_add(0x1000));
         images.push(RemoteImage { load, end, path });
+    }
+    // `dyldImageLoadAddress` sits at offset 32 of `dyld_all_image_infos` (version >= 2)
+    // and is not listed in `infoArray`, so include `/usr/lib/dyld` (`start` above `main`).
+    if has_dyld_slot && version >= 2 {
+        let dyld_load = u64::from_le_bytes(header[32..40].try_into().unwrap());
+        if dyld_load != 0
+            && !images.iter().any(|img| img.load == dyld_load)
+            && let Some(end) = image_end(task, dyld_load)
+        {
+            images.push(RemoteImage {
+                load: dyld_load,
+                end,
+                path: "/usr/lib/dyld".to_string(),
+            });
+        }
     }
     images
 }

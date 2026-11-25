@@ -13,6 +13,42 @@
     allow(dead_code)
 )]
 
+use std::ops::Deref;
+use std::sync::Arc;
+
+/// Reference-counted unwind or code section bytes passed to `framehop::Module`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SectionBytes(pub(crate) Arc<Vec<u8>>);
+
+impl SectionBytes {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(bytes))
+    }
+}
+
+impl Deref for SectionBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+/// Build an `aarch64` `framehop::aarch64::PtrAuthMask` without panicking on
+/// `max_known_code == 0` (`0u64.leading_zeros() == 64` overflows `u64::MAX >> 64`
+/// in debug builds when an unwinder has zero loaded modules).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn aarch64_ptr_auth_mask(
+    max_known_code: u64,
+    fallback_limit: u64,
+) -> framehop::aarch64::PtrAuthMask {
+    if max_known_code == 0 {
+        framehop::aarch64::PtrAuthMask(fallback_limit.saturating_sub(1))
+    } else {
+        framehop::aarch64::PtrAuthMask::from_max_known_address(max_known_code)
+    }
+}
+
 /// Most frames recorded for one sample.
 pub(crate) const MAX_FRAMES: usize = 64;
 

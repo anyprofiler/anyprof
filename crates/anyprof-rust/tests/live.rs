@@ -1,10 +1,9 @@
 //! Live samples of a Rust process on the platforms that have a native sampler.
 //!
-//! The fixture is compiled with `-C force-frame-pointers=yes`. rustc 1.99 does
-//! not keep frame pointers at `-O0` or `-O2` unless that flag is set, so macOS
-//! and Linux would otherwise symbolize the leaf and lose the caller. Windows
-//! x64 walks `.pdata` unwind data, which rustc emits without the flag; the
-//! flag is still set so the fixture is the same everywhere.
+//! Covers both frame-pointer builds (`-C force-frame-pointers=yes`) and standard
+//! optimized release builds (`-C opt-level=2 -C force-frame-pointers=no`) unwound
+//! via DWARF `.eh_frame` (Linux), Compact Unwind / `__eh_frame` (macOS), and
+//! PE `.pdata` (Windows x64).
 //!
 //! `ANYPROF_REQUIRE_NATIVE=1` (set by CI on the sampling jobs) turns a skip
 //! into a failure. Linux musl is not a separate live run.
@@ -33,6 +32,15 @@ mod supported {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn samples_a_release_rust_program_without_frame_pointers() {
+        with_root(
+            "supported::samples_a_release_rust_program_without_frame_pointers",
+            sample_release_nofp,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn an_idle_rust_process_does_not_invent_on_cpu_samples() {
         with_root(
             "supported::an_idle_rust_process_does_not_invent_on_cpu_samples",
@@ -54,6 +62,13 @@ mod supported {
     fn samples_a_busy_rust_program() {
         let _lock = LiveLock::acquire();
         sample_busy();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn samples_a_release_rust_program_without_frame_pointers() {
+        let _lock = LiveLock::acquire();
+        sample_release_nofp();
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -126,6 +141,79 @@ mod supported {
             "anyprof_rust_caller",
         );
         assert_exports(&profile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_release_nofp() {
+        let dir = fixture_dir("nofp");
+        let binary = dir.join(exe("rust-nofp"));
+        if !compile_with_flags(
+            &dir.join("nofp.rs"),
+            &binary,
+            NOFP_RS,
+            &[
+                "-C",
+                "opt-level=2",
+                "-C",
+                "force-frame-pointers=no",
+                "-C",
+                "debuginfo=2",
+            ],
+        ) {
+            return;
+        }
+        let counter = dir.join("counter");
+        std::fs::write(&counter, [0u8; 8]).unwrap();
+        let mut child = Command::new(&binary)
+            .arg(&counter)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn release nofp rust");
+        let pid = child.id();
+        if !wait_for_counter(&counter) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let started = RustBackend.start(
+            &anyprof_core::Target { pid },
+            &anyprof_core::RecordOptions {
+                duration: Some(Duration::from_millis(800)),
+                sampling_interval: Some(Duration::from_millis(10)),
+                ..anyprof_core::RecordOptions::default()
+            },
+        );
+        let Some(session) = accept_or_skip(started) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let profile = session.stop().expect("stop release nofp");
+        assert!(
+            profile.stacks.iter().any(|stack| {
+                let has_leaf = stack
+                    .frames
+                    .iter()
+                    .any(|f| f.name.contains("anyprof_rust_nofp_leaf"));
+                let has_mid = stack
+                    .frames
+                    .iter()
+                    .any(|f| f.name.contains("anyprof_rust_nofp_mid"));
+                let has_top = stack
+                    .frames
+                    .iter()
+                    .any(|f| f.name.contains("anyprof_rust_nofp_top"));
+                has_leaf && has_mid && has_top
+            }),
+            "expected release -O2 -C force-frame-pointers=no stack to unwind through nofp_leaf <- nofp_mid <- nofp_top\n{}",
+            explain(&profile)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -390,29 +478,34 @@ mod supported {
     }
 
     fn compile(source: &Path, binary: &Path, body: &str) -> bool {
-        if let Some(parent) = source.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(source, body).expect("write fixture");
-        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-        match Command::new(&rustc)
-            .args([
-                "--edition",
-                "2024",
-                "--crate-name",
-                "anyprof_rust_fixture",
+        compile_with_flags(
+            source,
+            binary,
+            body,
+            &[
                 "-C",
                 "opt-level=0",
                 "-C",
                 "force-frame-pointers=yes",
                 "-C",
                 "debuginfo=2",
-                "-o",
-            ])
+            ],
+        )
+    }
+
+    fn compile_with_flags(source: &Path, binary: &Path, body: &str, flags: &[&str]) -> bool {
+        if let Some(parent) = source.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(source, body).expect("write fixture");
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let mut cmd = Command::new(&rustc);
+        cmd.args(["--edition", "2024", "--crate-name", "anyprof_rust_fixture"])
+            .args(flags)
+            .arg("-o")
             .arg(binary)
-            .arg(source)
-            .output()
-        {
+            .arg(source);
+        match cmd.output() {
             Ok(output) if output.status.success() => true,
             Ok(output) => {
                 let message = format!(
@@ -648,6 +741,49 @@ fn main() {
     let b = std::thread::spawn(anyprof_rust_spin_b);
     let _ = a.join();
     let _ = b.join();
+}
+"#;
+
+    const NOFP_RS: &str = r#"
+use std::io::{Seek, SeekFrom, Write};
+
+#[inline(never)]
+fn anyprof_rust_nofp_leaf(slot: &mut std::fs::File) -> u64 {
+    let mut scratch = [1u64; 8];
+    let mut acc: u64 = 0;
+    while std::hint::black_box(true) {
+        acc = acc.wrapping_add(std::hint::black_box(scratch[0]));
+        if acc % 1_000_000 == 0 {
+            let _ = slot.seek(SeekFrom::Start(0));
+            let _ = slot.write_all(&acc.to_le_bytes());
+        }
+        scratch[1] = acc;
+        std::hint::black_box(&scratch);
+    }
+    acc
+}
+
+#[inline(never)]
+fn anyprof_rust_nofp_mid(slot: &mut std::fs::File) -> u64 {
+    let scratch = std::hint::black_box([7u64; 8]);
+    let res = anyprof_rust_nofp_leaf(slot);
+    std::hint::black_box(res.wrapping_add(scratch[3]))
+}
+
+#[inline(never)]
+fn anyprof_rust_nofp_top(slot: &mut std::fs::File) -> u64 {
+    let scratch = std::hint::black_box([11u64; 8]);
+    let res = anyprof_rust_nofp_mid(slot);
+    std::hint::black_box(res.wrapping_add(scratch[5]))
+}
+
+fn main() {
+    let mut slot = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(std::env::args().nth(1).expect("counter path"))
+        .expect("open counter");
+    let _ = anyprof_rust_nofp_top(&mut slot);
 }
 "#;
 }
