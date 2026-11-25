@@ -110,7 +110,6 @@ pub fn record(
     let started = Instant::now();
     let mut next = started;
     let mut collector = SampleCollector::new();
-    let mut cache_activated = false;
     loop {
         if stop_requested(opts, session_stop) {
             break;
@@ -136,6 +135,9 @@ pub fn record(
             java.as_ref(),
         ) {
             Ok(stacks) => {
+                if !stop_requested(opts, session_stop) {
+                    symbols.activate_shared_cache_for_hits(&mut unwinder, &stacks);
+                }
                 let offset_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 for hit in stacks {
                     if hit.stack.recordable() {
@@ -157,10 +159,6 @@ pub fn record(
                 }
                 break;
             }
-        }
-        if !cache_activated && !stop_requested(opts, session_stop) {
-            cache_activated = true;
-            symbols.activate_shared_cache(&mut unwinder);
         }
         next += interval;
         let now = Instant::now();
@@ -1087,15 +1085,39 @@ impl SymbolTable {
         }
     }
 
-    fn activate_shared_cache(&mut self, unwinder: &mut MachUnwinder) {
+    fn activate_shared_cache_for_hits(&mut self, unwinder: &mut MachUnwinder, hits: &[ThreadHit]) {
+        let mut hit_indices = Vec::new();
+        for hit in hits {
+            let CountedStack::Addresses { frames, .. } = &hit.stack else {
+                continue;
+            };
+            for (frame_idx, &addr) in frames.iter().enumerate() {
+                let probe = policy::symbol_lookup_address(addr, frame_idx == 0);
+                if let Some(img_idx) = self.images.iter().position(|entry| {
+                    matches!(entry.source, ImageSource::PendingCache(_))
+                        && (entry.symbols.contains(probe) || entry.symbols.contains(addr))
+                }) && !hit_indices.contains(&img_idx)
+                {
+                    hit_indices.push(img_idx);
+                }
+            }
+        }
+        if hit_indices.is_empty() {
+            return;
+        }
         let cpu = self.cpu;
         let Some(cache) = *self
             .shared_cache
             .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
         else {
+            for idx in hit_indices {
+                self.images[idx].source = ImageSource::None;
+                self.images[idx].symbols_loaded = true;
+            }
             return;
         };
-        for entry in &mut self.images {
+        for idx in hit_indices {
+            let entry = &mut self.images[idx];
             let ImageSource::PendingCache(path) = &entry.source else {
                 continue;
             };
@@ -1142,24 +1164,6 @@ impl SymbolTable {
                     symbols: image,
                     source: ImageSource::PendingCache(remote.path),
                     symbols_loaded: false,
-                });
-            }
-            return None;
-        }
-
-        if let Some(Some(cache)) = self.shared_cache {
-            if let Some(parsed) = cache.load_unwind(&remote.path, remote.load, &module) {
-                return Some(TrackedImage {
-                    symbols: parsed,
-                    source: ImageSource::SharedCache(remote.path),
-                    symbols_loaded: false,
-                });
-            }
-            if remote.end > remote.load {
-                return Some(TrackedImage {
-                    symbols: ImageSymbols::range_only(remote.load, remote.end, module),
-                    source: ImageSource::None,
-                    symbols_loaded: true,
                 });
             }
             return None;
