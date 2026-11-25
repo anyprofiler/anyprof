@@ -16,9 +16,13 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyprof_core::Runtime;
 
+use crate::dwarf_line::{
+    DwarfLineSections, LineTable, MAX_LINE_SECTION_BYTES, MAX_STR_SECTION_BYTES,
+};
 use crate::policy::symbol_lookup_address;
 use crate::symbol::{self, frame_runtime};
 
@@ -36,7 +40,9 @@ const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
+const SHT_NOBITS: u32 = 8;
 const SHT_DYNSYM: u32 = 11;
+const SHF_COMPRESSED: u64 = 0x800;
 const STT_FUNC: u8 = 2;
 const STT_GNU_IFUNC: u8 = 10;
 const SHN_UNDEF: u16 = 0;
@@ -74,6 +80,8 @@ pub(crate) struct ElfFile {
     pub loads: Vec<LoadSegment>,
     /// Function symbols. Not sorted; [`UserImage`] sorts them after the slide.
     pub funcs: Vec<ElfFunc>,
+    /// DWARF `.debug_line` address-to-line table at link-time addresses.
+    pub lines: Arc<LineTable>,
 }
 
 /// One loaded image and the symbols we could read for it.
@@ -91,8 +99,12 @@ pub(crate) struct UserImage {
     /// Go pclntab for this file, relocated to the mapped address. `None` when
     /// the file is not a Go executable.
     pub(crate) go: Option<crate::go_sym::GoImage>,
+    /// Runtime load bias (`runtime - link address`).
+    bias: u64,
     /// `(runtime address, size, name, symbol runtime)`, sorted by address.
     symbols: Vec<(u64, u64, String, Runtime)>,
+    /// Unslid DWARF line table shared with [`ElfFile`].
+    lines: Arc<LineTable>,
 }
 
 impl UserImage {
@@ -104,7 +116,9 @@ impl UserImage {
             module,
             rust_image: false,
             go: None,
+            bias: 0,
             symbols: Vec::new(),
+            lines: Arc::new(LineTable::default()),
         }
     }
 
@@ -130,7 +144,9 @@ impl UserImage {
             module,
             rust_image: false,
             go: None,
+            bias,
             symbols,
+            lines: Arc::clone(&elf.lines),
         }
     }
 
@@ -161,6 +177,14 @@ impl UserImage {
         }
         Some((name.as_str(), *runtime))
     }
+
+    /// Source file path and 1-based line number for `addr`, when `.debug_line` covers it.
+    pub(crate) fn location_at(&self, addr: u64) -> Option<(&str, u32)> {
+        if !self.contains(addr) {
+            return None;
+        }
+        self.lines.lookup(addr.wrapping_sub(self.bias))
+    }
 }
 
 /// Resolve `addr` for a leaf or a saved return address.
@@ -185,6 +209,17 @@ fn find(images: &[UserImage], addr: u64) -> Option<(&str, &str, Runtime)> {
     let (name, runtime) = image.name_at(addr)?;
     let runtime = frame_runtime(runtime, name, false, image.rust_image);
     Some((name, image.module.as_str(), runtime))
+}
+
+/// Resolve DWARF `(file, line)` for `addr` across loaded ELF images.
+pub(crate) fn location_for(images: &[UserImage], addr: u64, leaf: bool) -> Option<(&str, u32)> {
+    let lookup = symbol_lookup_address(addr, leaf);
+    find_location(images, lookup).or_else(|| find_location(images, addr))
+}
+
+fn find_location(images: &[UserImage], addr: u64) -> Option<(&str, u32)> {
+    let image = images.iter().find(|image| image.contains(addr))?;
+    image.location_at(addr)
 }
 
 /// Linux x86_64 page size. The kernel maps each `PT_LOAD` from the page that
@@ -263,6 +298,7 @@ fn parse_reader<R: Read + Seek>(mut reader: R, len: u64) -> Option<ElfFile> {
             machine,
             loads,
             funcs: Vec::new(),
+            lines: Arc::new(LineTable::default()),
         });
     }
     if shnum == 0 {
@@ -276,17 +312,21 @@ fn parse_reader<R: Read + Seek>(mut reader: R, len: u64) -> Option<ElfFile> {
         return None;
     }
     let sections = read_sections(&mut reader, len, shoff, shentsize, shnum)?;
-    let funcs = read_funcs(&mut reader, len, &sections, shstrndx);
+    let funcs = read_funcs(&mut reader, len, &sections);
+    let lines = read_dwarf_lines(&mut reader, len, &sections, shstrndx);
     Some(ElfFile {
         machine,
         loads,
         funcs,
+        lines,
     })
 }
 
 #[derive(Clone, Copy)]
 struct Section {
+    name: u32,
     kind: u32,
+    flags: u64,
     offset: u64,
     size: u64,
     link: u32,
@@ -333,12 +373,18 @@ fn read_sections<R: Read + Seek>(
     entsize: u64,
     shnum: u64,
 ) -> Option<Vec<Section>> {
-    if shoff.saturating_add(shnum.saturating_mul(entsize)) > len {
+    let total = shnum.checked_mul(entsize)?;
+    if total > 64 * 1024 * 1024 || shoff.saturating_add(total) > len {
         return None;
     }
+    let mut raw = vec![0u8; total as usize];
+    reader.seek(SeekFrom::Start(shoff)).ok()?;
+    reader.read_exact(&mut raw).ok()?;
+    let step = entsize as usize;
     let mut sections = Vec::with_capacity(shnum as usize);
-    for index in 0..shnum {
-        sections.push(read_section(reader, len, shoff, entsize, index)?);
+    for index in 0..shnum as usize {
+        let buf = &raw[index * step..index * step + 64];
+        sections.push(parse_section_bytes(buf)?);
     }
     Some(sections)
 }
@@ -357,8 +403,14 @@ fn read_section<R: Read + Seek>(
     let mut buf = [0u8; 64];
     reader.seek(SeekFrom::Start(at)).ok()?;
     reader.read_exact(&mut buf).ok()?;
+    parse_section_bytes(&buf)
+}
+
+fn parse_section_bytes(buf: &[u8]) -> Option<Section> {
     Some(Section {
+        name: u32::from_le_bytes(buf[0..4].try_into().ok()?),
         kind: u32::from_le_bytes(buf[4..8].try_into().ok()?),
+        flags: u64::from_le_bytes(buf[8..16].try_into().ok()?),
         offset: u64::from_le_bytes(buf[24..32].try_into().ok()?),
         size: u64::from_le_bytes(buf[32..40].try_into().ok()?),
         link: u32::from_le_bytes(buf[40..44].try_into().ok()?),
@@ -366,12 +418,7 @@ fn read_section<R: Read + Seek>(
     })
 }
 
-fn read_funcs<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
-    sections: &[Section],
-    _shstrndx: u64,
-) -> Vec<ElfFunc> {
+fn read_funcs<R: Read + Seek>(reader: &mut R, len: u64, sections: &[Section]) -> Vec<ElfFunc> {
     let symtab = sections
         .iter()
         .find(|section| section.kind == SHT_SYMTAB)
@@ -406,14 +453,17 @@ fn read_funcs<R: Read + Seek>(
     {
         return Vec::new();
     }
-    let count = (symtab.size / entsize) as usize;
+    let mut symbytes = vec![0u8; symtab.size as usize];
+    if reader.seek(SeekFrom::Start(symtab.offset)).is_err()
+        || reader.read_exact(&mut symbytes).is_err()
+    {
+        return Vec::new();
+    }
+    let step = entsize as usize;
+    let count = symbytes.len() / step;
     let mut funcs = Vec::new();
     for index in 0..count {
-        let mut ent = vec![0u8; entsize as usize];
-        let at = symtab.offset + index as u64 * entsize;
-        if reader.seek(SeekFrom::Start(at)).is_err() || reader.read_exact(&mut ent).is_err() {
-            break;
-        }
+        let ent = &symbytes[index * step..index * step + 24];
         let name_off = u32::from_le_bytes(ent[0..4].try_into().unwrap()) as usize;
         let info = ent[4];
         let shndx = u16::from_le_bytes(ent[6..8].try_into().unwrap());
@@ -438,6 +488,77 @@ fn read_funcs<R: Read + Seek>(
         });
     }
     funcs
+}
+
+fn read_dwarf_lines<R: Read + Seek>(
+    reader: &mut R,
+    len: u64,
+    sections: &[Section],
+    shstrndx: u64,
+) -> Arc<LineTable> {
+    let Ok(shstr_idx) = usize::try_from(shstrndx) else {
+        return Arc::new(LineTable::default());
+    };
+    let Some(shstr_sec) = sections.get(shstr_idx) else {
+        return Arc::new(LineTable::default());
+    };
+    let Some(shstr) = read_section_bytes(reader, len, *shstr_sec, MAX_STRINGS) else {
+        return Arc::new(LineTable::default());
+    };
+    let mut line_sec = None;
+    let mut line_str_sec = None;
+    let mut str_sec = None;
+    for section in sections {
+        if section.kind == SHT_NOBITS || (section.flags & SHF_COMPRESSED) != 0 || section.size == 0
+        {
+            continue;
+        }
+        let Some(name) = cstr_at(&shstr, section.name as usize) else {
+            continue;
+        };
+        match name {
+            ".debug_line" if line_sec.is_none() => line_sec = Some(*section),
+            ".debug_line_str" if line_str_sec.is_none() => line_str_sec = Some(*section),
+            ".debug_str" if str_sec.is_none() => str_sec = Some(*section),
+            _ => {}
+        }
+    }
+    let Some(line_sec) = line_sec else {
+        return Arc::new(LineTable::default());
+    };
+    let Some(debug_line) = read_section_bytes(reader, len, line_sec, MAX_LINE_SECTION_BYTES) else {
+        return Arc::new(LineTable::default());
+    };
+    let debug_line_str = line_str_sec
+        .and_then(|sec| read_section_bytes(reader, len, sec, MAX_STR_SECTION_BYTES))
+        .unwrap_or_default();
+    let debug_str = str_sec
+        .and_then(|sec| read_section_bytes(reader, len, sec, MAX_STR_SECTION_BYTES))
+        .unwrap_or_default();
+    Arc::new(LineTable::parse(
+        DwarfLineSections {
+            debug_line: &debug_line,
+            debug_line_str: &debug_line_str,
+            debug_str: &debug_str,
+        },
+        8,
+    ))
+}
+
+fn read_section_bytes<R: Read + Seek>(
+    reader: &mut R,
+    len: u64,
+    section: Section,
+    cap: u64,
+) -> Option<Vec<u8>> {
+    if section.size == 0 || section.size > cap || section.offset.saturating_add(section.size) > len
+    {
+        return None;
+    }
+    let mut buf = vec![0u8; section.size as usize];
+    reader.seek(SeekFrom::Start(section.offset)).ok()?;
+    reader.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
 fn cstr_at(buf: &[u8], offset: usize) -> Option<&str> {
@@ -528,6 +649,48 @@ mod tests {
         assert!(parse_bytes(&[]).is_none());
         assert!(parse_bytes(b"not elf").is_none());
         assert!(parse_bytes(&[0x7f, b'E', b'L', b'F', 1, 1]).is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn compiled_elf_with_debug_info_resolves_source_file_and_line() {
+        let dir = std::env::temp_dir().join(format!("anyprof-elf-dwarf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("sample.cpp");
+        let bin = dir.join("sample");
+        std::fs::write(
+            &src,
+            "int target_fn(int x) {\n    return x * 3 + 1;\n}\nint main() {\n    return target_fn(5);\n}\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("g++")
+            .args(["-O0", "-g", "-o"])
+            .arg(&bin)
+            .arg(&src)
+            .status();
+        let Ok(status) = status else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let elf = super::parse_path(&bin).expect("parse compiled elf");
+        let target = elf
+            .funcs
+            .iter()
+            .find(|func| func.name.contains("target_fn"))
+            .expect("target_fn symbol");
+        let bias = 0x5555_0000_0000u64;
+        let image = UserImage::from_elf(bias, bias + 0x10_0000, "sample".to_string(), &elf, bias);
+        let (file, line) =
+            super::location_for(std::slice::from_ref(&image), bias + target.vaddr + 4, true)
+                .expect("dwarf location for target_fn");
+        assert!(file.ends_with("sample.cpp"), "unexpected file: {file}");
+        assert!((1..=3).contains(&line), "unexpected line: {line}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn synthetic_elf(symbols: &[(&str, u64, u64)]) -> Vec<u8> {

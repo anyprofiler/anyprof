@@ -12,6 +12,8 @@
 
 #![cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyprof_core::Runtime;
@@ -24,9 +26,19 @@ struct Func {
     from_cpp: bool,
 }
 
-/// Functions from one PDB, sorted by RVA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineSpan {
+    rva: u32,
+    end: u32,
+    file: u32,
+    line: u32,
+}
+
+/// Functions and source line spans from one PDB, sorted by RVA.
 pub(crate) struct ImageSymbols {
     funcs: Vec<Func>,
+    files: Vec<String>,
+    lines: Vec<LineSpan>,
 }
 
 impl ImageSymbols {
@@ -47,6 +59,17 @@ impl ImageSymbols {
             return None;
         }
         Some((func.name.as_str(), func.runtime, func.from_cpp))
+    }
+
+    pub(crate) fn line_at(&self, rva: u64) -> Option<(&str, u32)> {
+        let rva = u32::try_from(rva).ok()?;
+        let idx = self.lines.partition_point(|span| span.rva <= rva);
+        let span = self.lines.get(idx.checked_sub(1)?)?;
+        if rva >= span.end || span.line == 0 {
+            return None;
+        }
+        let file = self.files.get(span.file as usize)?;
+        Some((file.as_str(), span.line))
     }
 }
 
@@ -273,6 +296,31 @@ fn index(mut funcs: Vec<Func>) -> Vec<Func> {
     funcs
 }
 
+fn index_lines(mut spans: Vec<LineSpan>) -> Vec<LineSpan> {
+    spans.sort_by(|left, right| left.rva.cmp(&right.rva).then(left.end.cmp(&right.end)));
+    let mut merged: Vec<LineSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.rva >= span.end || span.line == 0 {
+            continue;
+        }
+        if let Some(prev) = merged.last_mut() {
+            if span.rva < prev.end {
+                prev.end = span.rva;
+            }
+            if prev.rva >= prev.end {
+                *prev = span;
+                continue;
+            }
+            if prev.end == span.rva && prev.file == span.file && prev.line == span.line {
+                prev.end = span.end;
+                continue;
+            }
+        }
+        merged.push(span);
+    }
+    merged
+}
+
 /// Longer record first, then a Rust name over a native one.
 ///
 /// A zero-length public used to outrank a real procedure when the public was
@@ -302,22 +350,27 @@ pub(crate) fn load(image: &Path) -> ImageSymbols {
         .and_then(|mut file| read_codeview(&mut file));
     let embedded = codeview.as_ref().map(|cv| cv.path.as_str());
     for path in candidate_pdb_paths(image, embedded) {
-        if let Some(funcs) = read_pdb(&path, codeview.as_ref()) {
+        if let Some(symbols) = read_pdb(&path, codeview.as_ref()) {
             tracing::debug!(
                 image = %image.display(),
                 pdb = %path.display(),
-                functions = funcs.len(),
+                functions = symbols.funcs.len(),
+                lines = symbols.lines.len(),
                 "loaded PDB symbols"
             );
-            return ImageSymbols { funcs };
+            return symbols;
         }
     }
     tracing::debug!(image = %image.display(), "no PDB symbols");
-    ImageSymbols { funcs: Vec::new() }
+    ImageSymbols {
+        funcs: Vec::new(),
+        files: Vec::new(),
+        lines: Vec::new(),
+    }
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn read_pdb(path: &Path, codeview: Option<&CodeView>) -> Option<Vec<Func>> {
+fn read_pdb(path: &Path, codeview: Option<&CodeView>) -> Option<ImageSymbols> {
     use std::fs::File;
 
     let file = File::open(path).ok()?;
@@ -351,7 +404,82 @@ fn read_pdb(path: &Path, codeview: Option<&CodeView>) -> Option<Vec<Func>> {
             break;
         }
     }
-    Some(index(funcs))
+    let (files, lines) = collect_lines(&mut pdb, &map);
+    Some(ImageSymbols {
+        funcs: index(funcs),
+        files,
+        lines,
+    })
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn collect_lines(
+    pdb: &mut pdb::PDB<'_, std::fs::File>,
+    map: &pdb::AddressMap<'_>,
+) -> (Vec<String>, Vec<LineSpan>) {
+    use pdb::FallibleIterator;
+
+    let Ok(strings) = pdb.string_table() else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(dbi) = pdb.debug_information() else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(mut modules) = dbi.modules() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut files: Vec<String> = Vec::new();
+    let mut file_ids: HashMap<String, u32> = HashMap::new();
+    let mut spans: Vec<LineSpan> = Vec::new();
+
+    while let Ok(Some(module)) = modules.next() {
+        let Ok(Some(info)) = pdb.module_info(&module) else {
+            continue;
+        };
+        let Ok(program) = info.line_program() else {
+            continue;
+        };
+        let mut module_files: HashMap<u32, Option<u32>> = HashMap::new();
+        let mut iter = program.lines();
+        while let Ok(Some(line)) = iter.next() {
+            if line.line_start == 0 || line.line_start >= 0x00ef_feff {
+                continue;
+            }
+            let Some(rva) = line.offset.to_rva(map) else {
+                continue;
+            };
+            let len = line.length.unwrap_or(64).clamp(1, 64 * 1024);
+            let end = rva.0.saturating_add(len);
+            let file_id = *module_files.entry(line.file_index.0).or_insert_with(|| {
+                let info = program.get_file_info(line.file_index).ok()?;
+                let name = info.name.to_string_lossy(&strings).ok()?;
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                if let Some(&existing) = file_ids.get(trimmed) {
+                    return Some(existing);
+                }
+                let id = u32::try_from(files.len()).ok()?;
+                let owned = trimmed.to_string();
+                files.push(owned.clone());
+                file_ids.insert(owned, id);
+                Some(id)
+            });
+            if let Some(file) = file_id {
+                spans.push(LineSpan {
+                    rva: rva.0,
+                    end,
+                    file,
+                    line: line.line_start,
+                });
+                if spans.len() >= 4_000_000 {
+                    return (files, index_lines(spans));
+                }
+            }
+        }
+    }
+    (files, index_lines(spans))
 }
 
 /// GUID plus age. Info-stream age may be higher than the image. DBI age, when
@@ -448,8 +576,8 @@ fn push_raw(raw: &mut Vec<RawSym>, offset: pdb::PdbInternalSectionOffset, len: u
 #[cfg(test)]
 mod tests {
     use super::{
-        Func, ImageSymbols, candidate_pdb_paths, index, read_codeview, rsds_uuid_bytes,
-        signature_matches,
+        Func, ImageSymbols, LineSpan, candidate_pdb_paths, index, index_lines, read_codeview,
+        rsds_uuid_bytes, signature_matches,
     };
     use anyprof_core::Runtime;
     use std::path::{Path, PathBuf};
@@ -464,19 +592,25 @@ mod tests {
         }
     }
 
+    fn symbols_from_funcs(funcs: Vec<Func>) -> ImageSymbols {
+        ImageSymbols {
+            funcs: index(funcs),
+            files: Vec::new(),
+            lines: Vec::new(),
+        }
+    }
+
     #[test]
     fn an_address_inside_a_procedure_uses_that_name() {
-        let image = ImageSymbols {
-            funcs: index(vec![
-                func(0x1100, 0x20, "anyprof_rust_caller", Runtime::Native),
-                func(
-                    0x1000,
-                    0x50,
-                    "anyprof_rust_fixture::anyprof_rust_spin",
-                    Runtime::Rust,
-                ),
-            ]),
-        };
+        let image = symbols_from_funcs(vec![
+            func(0x1100, 0x20, "anyprof_rust_caller", Runtime::Native),
+            func(
+                0x1000,
+                0x50,
+                "anyprof_rust_fixture::anyprof_rust_spin",
+                Runtime::Rust,
+            ),
+        ]);
         let (name, runtime, from_cpp) = image.name_at(0x1010).unwrap();
         assert_eq!(name, "anyprof_rust_fixture::anyprof_rust_spin");
         assert_eq!(runtime, Runtime::Rust);
@@ -487,12 +621,10 @@ mod tests {
 
     #[test]
     fn a_public_symbol_covers_up_to_the_next_one() {
-        let image = ImageSymbols {
-            funcs: index(vec![
-                func(0x2000, 0, "second", Runtime::Rust),
-                func(0x1000, 0, "first", Runtime::Rust),
-            ]),
-        };
+        let image = symbols_from_funcs(vec![
+            func(0x2000, 0, "second", Runtime::Rust),
+            func(0x1000, 0, "first", Runtime::Rust),
+        ]);
         assert_eq!(image.name_at(0x1FFF).unwrap().0, "first");
         assert_eq!(image.name_at(0x2000).unwrap().0, "second");
         assert!(image.name_at(0x2000 + 64 * 1024).is_none());
@@ -500,26 +632,49 @@ mod tests {
 
     #[test]
     fn a_procedure_wins_over_a_public_at_the_same_rva() {
-        let image = ImageSymbols {
-            funcs: index(vec![
-                func(0x1000, 0, "public_only", Runtime::Rust),
-                func(0x1000, 0x40, "procedure", Runtime::Rust),
-            ]),
-        };
+        let image = symbols_from_funcs(vec![
+            func(0x1000, 0, "public_only", Runtime::Rust),
+            func(0x1000, 0x40, "procedure", Runtime::Rust),
+        ]);
         assert_eq!(image.name_at(0x1008).unwrap().0, "procedure");
     }
 
     #[test]
     fn a_long_procedure_beats_a_zero_length_rust_public() {
-        let image = ImageSymbols {
-            funcs: index(vec![
-                func(0x1000, 0, "anyprof_rust_fixture::spin", Runtime::Rust),
-                func(0x1000, 0x2000, "procedure", Runtime::Native),
-            ]),
-        };
+        let image = symbols_from_funcs(vec![
+            func(0x1000, 0, "anyprof_rust_fixture::spin", Runtime::Rust),
+            func(0x1000, 0x2000, "procedure", Runtime::Native),
+        ]);
         assert_eq!(image.name_at(0x1100).unwrap().0, "procedure");
         assert_eq!(image.name_at(0x1000).unwrap().1, Runtime::Native);
         assert!(image.name_at(0x1000 + 0x2000).is_none());
+    }
+
+    #[test]
+    fn line_at_clamps_overlapping_spans_and_resolves_rvas() {
+        let image = ImageSymbols {
+            funcs: Vec::new(),
+            files: vec![r"C:\work\busy.rs".to_string()],
+            lines: index_lines(vec![
+                LineSpan {
+                    rva: 0x1010,
+                    end: 0x1030,
+                    file: 0,
+                    line: 24,
+                },
+                LineSpan {
+                    rva: 0x1000,
+                    end: 0x1040,
+                    file: 0,
+                    line: 20,
+                },
+            ]),
+        };
+        assert_eq!(image.line_at(0x0fff), None);
+        assert_eq!(image.line_at(0x1008), Some((r"C:\work\busy.rs", 20)));
+        assert_eq!(image.line_at(0x1010), Some((r"C:\work\busy.rs", 24)));
+        assert_eq!(image.line_at(0x102f), Some((r"C:\work\busy.rs", 24)));
+        assert_eq!(image.line_at(0x1030), None);
     }
 
     #[test]

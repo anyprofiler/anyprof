@@ -80,9 +80,44 @@ const HOTSPOT_SYMBOLS: &[&str] = &[
     "gHotSpotVMIntConstantEntryArrayStride",
 ];
 
+/// A Java method frame resolved from HotSpot metadata.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct JavaFrame {
+    pub name: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+}
+
+impl JavaFrame {
+    #[cfg(test)]
+    pub(crate) fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            file: None,
+            line: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FlagsField {
+    U16(u64),
+    U32(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LineMeta {
+    const_method_size: u64,
+    code_size: u64,
+    flags: FlagsField,
+    has_linenumber_mask: u32,
+    bcp_words: i32,
+}
+
 /// Byte offsets and the interpreter slot this process's HotSpot actually uses.
 #[derive(Debug)]
 struct Layout {
+    major: i32,
     code_range: CodeRange,
     frame_size: u64,
     blob_size: u64,
@@ -91,6 +126,8 @@ struct Layout {
     const_method: u64,
     constants: u64,
     name_index: u64,
+    source_file_index: Option<u64>,
+    line_meta: Option<LineMeta>,
     pool_holder: u64,
     klass_name: u64,
     sym_length: u64,
@@ -128,7 +165,13 @@ impl JavaVm {
     /// `None` means the leaf is not a Java method (outside the code cache, a
     /// stub, or a method pointer that does not resolve). The caller keeps the
     /// native walk. This does not invent a name.
-    pub(crate) fn frames<R>(&self, pc: u64, sp: u64, fp: u64, read: &mut R) -> Option<Vec<String>>
+    pub(crate) fn frames<R>(
+        &self,
+        pc: u64,
+        sp: u64,
+        fp: u64,
+        read: &mut R,
+    ) -> Option<Vec<JavaFrame>>
     where
         R: FnMut(u64, &mut [u8]) -> bool,
     {
@@ -152,10 +195,10 @@ impl JavaVm {
                 let Some(method) = read_u64(read, slot) else {
                     break;
                 };
-                let Some(name) = self.method_name(method, read) else {
+                let Some(frame) = self.method_frame(method, Some(fp), read) else {
                     break;
                 };
-                out.push(name);
+                out.push(frame);
                 let Some(next) = interpreter_sender(sp, fp, read) else {
                     break;
                 };
@@ -165,10 +208,10 @@ impl JavaVm {
                 continue;
             }
             if blob.frame_words > 0 {
-                let Some(name) = self.method_name(blob.method, read) else {
+                let Some(frame) = self.method_frame(blob.method, None, read) else {
                     break;
                 };
-                out.push(name);
+                out.push(frame);
                 let Some(next) = compiled_sender(sp, blob.frame_words, read) else {
                     break;
                 };
@@ -280,7 +323,12 @@ impl JavaVm {
         })
     }
 
-    fn method_name<R>(&self, method: u64, read: &mut R) -> Option<String>
+    fn method_frame<R>(
+        &self,
+        method: u64,
+        interp_fp: Option<u64>,
+        read: &mut R,
+    ) -> Option<JavaFrame>
     where
         R: FnMut(u64, &mut [u8]) -> bool,
     {
@@ -307,7 +355,81 @@ impl JavaVm {
         if class_name.contains(';') || method_name.contains(';') {
             return None;
         }
-        Some(format!("{}.{}", class_name.replace('/', "."), method_name))
+        let name = format!("{}.{}", class_name.replace('/', "."), method_name);
+        let file = self.source_file_name(pool, read);
+        let line = self.method_line(const_method, interp_fp, read);
+        Some(JavaFrame { name, file, line })
+    }
+
+    fn source_file_name<R>(&self, pool: u64, read: &mut R) -> Option<String>
+    where
+        R: FnMut(u64, &mut [u8]) -> bool,
+    {
+        let index_off = self.layout.source_file_index?;
+        let idx = read_u16(read, pool.checked_add(index_off)?)?;
+        if idx == 0 {
+            return None;
+        }
+        let slot = pool
+            .checked_add(self.layout.cp_size)?
+            .checked_add(u64::from(idx) * WORD)?;
+        let sym_ptr = read_u64(read, slot)?;
+        symbol(read, sym_ptr, &self.layout)
+    }
+
+    fn method_line<R>(&self, const_method: u64, interp_fp: Option<u64>, read: &mut R) -> Option<u32>
+    where
+        R: FnMut(u64, &mut [u8]) -> bool,
+    {
+        let meta = self.layout.line_meta?;
+        let flags = match meta.flags {
+            FlagsField::U16(off) => u32::from(read_u16(read, const_method.checked_add(off)?)?),
+            FlagsField::U32(off) => read_i32(read, const_method.checked_add(off)?)? as u32,
+        };
+        if (flags & meta.has_linenumber_mask) == 0 {
+            return None;
+        }
+        let code_size = read_u16(read, const_method.checked_add(meta.code_size)?)?;
+        if code_size == 0 {
+            return None;
+        }
+        let code_base = const_method.checked_add(meta.const_method_size)?;
+        let table_addr = code_base.checked_add(u64::from(code_size))?;
+        let target_bci = interp_fp
+            .and_then(|fp| word_addr(fp, meta.bcp_words))
+            .and_then(|slot| read_u64(read, slot))
+            .filter(|&bcp| bcp >= code_base && bcp < table_addr)
+            .and_then(|bcp| i32::try_from(bcp - code_base).ok())
+            .unwrap_or(0);
+
+        let mut cursor = 0u64;
+        let mut chunk = [0u8; 32];
+        let mut chunk_base = u64::MAX;
+        let mut chunk_valid = 0usize;
+        decode_compressed_line_table(
+            || {
+                if cursor >= 16 * 1024 {
+                    return None;
+                }
+                let addr = table_addr.checked_add(cursor)?;
+                cursor += 1;
+                if addr >= chunk_base
+                    && let Ok(off) = usize::try_from(addr - chunk_base)
+                    && off < chunk_valid
+                {
+                    return Some(chunk[off]);
+                }
+                if read(addr, &mut chunk) {
+                    chunk_base = addr;
+                    chunk_valid = chunk.len();
+                    return Some(chunk[0]);
+                }
+                let mut one = [0u8; 1];
+                read(addr, &mut one).then_some(one[0])
+            },
+            target_bci,
+            self.layout.major >= 20,
+        )
     }
 }
 
@@ -317,11 +439,16 @@ struct Blob {
     method: u64,
 }
 
-/// `Class.method` frames. Kernel addresses stay with the caller.
-pub(crate) fn java_profile_frames(names: &[String]) -> Vec<Frame> {
-    names
+/// `Class.method` frames with optional source file and line. Kernel addresses stay with the caller.
+pub(crate) fn java_profile_frames(frames: &[JavaFrame]) -> Vec<Frame> {
+    frames
         .iter()
-        .map(|name| Frame::new(Runtime::Java, name.clone()))
+        .map(|entry| {
+            let mut frame = Frame::new(Runtime::Java, entry.name.clone());
+            frame.file.clone_from(&entry.file);
+            frame.line = entry.line;
+            frame
+        })
         .collect()
 }
 
@@ -587,6 +714,10 @@ where
         }
         Ok(*offset)
     };
+    let opt_instance = |ty: &str, name: &str| -> Option<u64> {
+        let (is_static, offset, _) = fields.get(&(ty.to_string(), name.to_string()))?;
+        (!*is_static && *offset <= 1_000_000).then_some(*offset)
+    };
     let static_addr = |ty: &str, name: &str| -> Result<u64, String> {
         let (is_static, _, address) = fields.get(&(ty.to_string(), name.to_string())).ok_or_else(
             || {
@@ -676,10 +807,39 @@ where
             ));
         }
     };
-    let method_words = interpreter_slot(read_frame_constants(read, &resolved)?, arch, major)?;
+    let int_constants = read_int_constants(read, &resolved)?;
+    let method_words = interpreter_slot(int_constants.interpreter, arch, major)?;
+    let bcp_words = int_constants.bcp_offset.unwrap_or(match arch {
+        JvmArch::X86_64 => -7,
+        JvmArch::Aarch64 => -8,
+    });
+    let flags_field = opt_instance("ConstMethod", "_flags._flags")
+        .map(FlagsField::U32)
+        .or_else(|| opt_instance("ConstMethod", "_flags").map(FlagsField::U16));
+    let line_meta = match (
+        types
+            .get("ConstMethod")
+            .copied()
+            .filter(|&sz| (32..512).contains(&sz) && sz.is_multiple_of(WORD)),
+        opt_instance("ConstMethod", "_code_size"),
+        flags_field,
+        int_constants.linenumber_mask,
+    ) {
+        (Some(const_method_size), Some(code_size), Some(flags), Some(has_linenumber_mask)) => {
+            Some(LineMeta {
+                const_method_size,
+                code_size,
+                flags,
+                has_linenumber_mask,
+                bcp_words,
+            })
+        }
+        _ => None,
+    };
     let method_type = compiled_method_type(major)?;
     Ok(JavaVm {
         layout: Layout {
+            major,
             code_range,
             frame_size: instance("CodeBlob", "_frame_size")?,
             blob_size: instance("CodeBlob", "_size")?,
@@ -688,6 +848,8 @@ where
             const_method: instance("Method", "_constMethod")?,
             constants: instance("ConstMethod", "_constants")?,
             name_index: instance("ConstMethod", "_name_index")?,
+            source_file_index: opt_instance("ConstantPool", "_source_file_name_index"),
+            line_meta,
             pool_holder: instance("ConstantPool", "_pool_holder")?,
             klass_name: instance("Klass", "_name")?,
             sym_length: instance("Symbol", "_length")?,
@@ -741,7 +903,7 @@ where
         };
         if matches!(
             name.as_str(),
-            "HeapBlock" | "GrowableArrayBase" | "ConstantPool"
+            "HeapBlock" | "GrowableArrayBase" | "ConstantPool" | "ConstMethod"
         ) {
             let size = read_u64(read, entry.checked_add(size_off).unwrap_or(0)).unwrap_or(0);
             sizes.insert(name, size);
@@ -913,10 +1075,13 @@ enum InterpreterLayout {
     Unexported,
 }
 
-fn read_frame_constants<R>(
-    read: &mut R,
-    sym: &HashMap<&str, u64>,
-) -> Result<InterpreterLayout, String>
+struct IntConstants {
+    interpreter: InterpreterLayout,
+    bcp_offset: Option<i32>,
+    linenumber_mask: Option<u32>,
+}
+
+fn read_int_constants<R>(read: &mut R, sym: &HashMap<&str, u64>) -> Result<IntConstants, String>
 where
     R: FnMut(u64, &mut [u8]) -> bool,
 {
@@ -931,6 +1096,8 @@ where
     }
     let mut sender_sp = None;
     let mut last_sp = None;
+    let mut bcp_offset = None;
+    let mut linenumber_mask = None;
     let mut saw_end = false;
     for index in 0..MAX_CONSTANTS {
         let entry = table
@@ -945,28 +1112,134 @@ where
             continue;
         };
         let value = read_i32(read, entry.checked_add(value_off).unwrap_or(0)).unwrap_or(0);
-        if name == "frame::interpreter_frame_sender_sp_offset" {
-            sender_sp = Some(value);
-        } else if name == "frame::interpreter_frame_last_sp_offset" {
-            last_sp = Some(value);
+        match name.as_str() {
+            "frame::interpreter_frame_sender_sp_offset" => sender_sp = Some(value),
+            "frame::interpreter_frame_last_sp_offset" => last_sp = Some(value),
+            "frame::interpreter_frame_bcp_offset" => bcp_offset = Some(value),
+            "ConstMethodFlags::_misc_has_linenumber_table"
+            | "ConstMethod::_has_linenumber_table" => {
+                if let Ok(mask) = u32::try_from(value)
+                    && mask != 0
+                {
+                    linenumber_mask = Some(mask);
+                }
+            }
+            _ => {}
         }
-        if sender_sp.is_some() && last_sp.is_some() {
+    }
+    let interpreter = match (sender_sp, last_sp, saw_end) {
+        (Some(sender_sp), Some(last_sp), _) => InterpreterLayout::Exported { sender_sp, last_sp },
+        (None, None, true) => InterpreterLayout::Unexported,
+        (None, None, false) => {
+            return Err(
+                "HotSpot int-constant table did not end, so Java methods were not walked"
+                    .to_string(),
+            );
+        }
+        _ => {
+            return Err(
+                "HotSpot exported only one interpreter frame constant, so Java methods were not walked"
+                    .to_string(),
+            );
+        }
+    };
+    Ok(IntConstants {
+        interpreter,
+        bcp_offset,
+        linenumber_mask,
+    })
+}
+
+/// Decode HotSpot's `CompressedLineNumberReadStream` at `target_bci`.
+///
+/// `unsigned5` selects JDK 20+ `UNSIGNED5` (`1..=255`, `L = 191`) vs JDK 17
+/// `CompressedStream` (`0..=255`, `L = 192`).
+fn decode_compressed_line_table<F>(
+    mut next_byte: F,
+    target_bci: i32,
+    unsigned5: bool,
+) -> Option<u32>
+where
+    F: FnMut() -> Option<u8>,
+{
+    let mut bci: i32 = 0;
+    let mut line: i32 = 0;
+    let mut best_bci: i32 = -1;
+    let mut best_line: Option<u32> = None;
+    let mut first_line: Option<u32> = None;
+
+    for _ in 0..4096 {
+        let Some(byte) = next_byte() else {
+            break;
+        };
+        if byte == 0 {
             break;
         }
-    }
-    match (sender_sp, last_sp, saw_end) {
-        (Some(sender_sp), Some(last_sp), _) => {
-            Ok(InterpreterLayout::Exported { sender_sp, last_sp })
+        if byte == 0xff {
+            let bci_delta = read_hotspot_signed_int(&mut next_byte, unsigned5)?;
+            let line_delta = read_hotspot_signed_int(&mut next_byte, unsigned5)?;
+            bci = bci.saturating_add(bci_delta);
+            line = line.saturating_add(line_delta);
+        } else {
+            bci = bci.saturating_add(i32::from(byte >> 3));
+            line = line.saturating_add(i32::from(byte & 0x7));
         }
-        (None, None, true) => Ok(InterpreterLayout::Unexported),
-        (None, None, false) => Err(
-            "HotSpot int-constant table did not end, so Java methods were not walked".to_string(),
-        ),
-        _ => Err(
-            "HotSpot exported only one interpreter frame constant, so Java methods were not walked"
-                .to_string(),
-        ),
+        if let Ok(line_u32) = u32::try_from(line)
+            && line_u32 > 0
+        {
+            if first_line.is_none() {
+                first_line = Some(line_u32);
+            }
+            if bci == target_bci {
+                return Some(line_u32);
+            }
+            if bci < target_bci && bci >= best_bci {
+                best_bci = bci;
+                best_line = Some(line_u32);
+            }
+        }
     }
+    best_line.or(first_line)
+}
+
+fn read_hotspot_signed_int<F>(next_byte: &mut F, unsigned5: bool) -> Option<i32>
+where
+    F: FnMut() -> Option<u8>,
+{
+    let sum = if unsigned5 {
+        let b0 = next_byte()?;
+        if b0 == 0 {
+            return None;
+        }
+        let mut sum = u32::from(b0 - 1);
+        if sum >= 191 {
+            for i in 1..=4u32 {
+                let bi = next_byte()?;
+                if bi == 0 {
+                    return None;
+                }
+                sum = sum.wrapping_add(u32::from(bi - 1) << (6 * i));
+                if bi <= 191 {
+                    break;
+                }
+            }
+        }
+        sum
+    } else {
+        let b0 = next_byte()?;
+        let mut sum = u32::from(b0);
+        if sum >= 192 {
+            for i in 1..=4u32 {
+                let bi = next_byte()?;
+                sum = sum.wrapping_add(u32::from(bi) << (6 * i));
+                if bi < 192 {
+                    break;
+                }
+            }
+        }
+        sum
+    };
+    Some(((sum >> 1) as i32) ^ -((sum & 1) as i32))
 }
 
 /// Method slot from an exported pair, or from the checked aarch64 header.
@@ -1897,6 +2170,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compressed_line_table_decodes_unsigned5_and_jdk17_pack200() {
+        // AnyprofSpin.spin(): (0, 9), (4, 10), (12, 11), (17, 10)
+        // JDK 21+ UNSIGNED5:
+        // Pair 1: 0xff, bci_delta=0 (sum=0 -> byte 1), line_delta=+9 (sum=18 -> byte 19)
+        // Pair 2: regular bci_delta=4, line_delta=1 -> (4 << 3) | 1 = 33
+        // Pair 3: regular bci_delta=8, line_delta=1 -> (8 << 3) | 1 = 65
+        // Pair 4: 0xff, bci_delta=+5 (sum=10 -> byte 11), line_delta=-1 (sum=1 -> byte 2)
+        // End: 0
+        let jdk21 = [0xffu8, 1, 19, 33, 65, 0xff, 11, 2, 0];
+        let decode_21 = |bci: i32| {
+            let mut it = jdk21.iter().copied();
+            super::decode_compressed_line_table(|| it.next(), bci, true)
+        };
+        assert_eq!(decode_21(0), Some(9));
+        assert_eq!(decode_21(3), Some(9));
+        assert_eq!(decode_21(4), Some(10));
+        assert_eq!(decode_21(14), Some(11));
+        assert_eq!(decode_21(20), Some(10));
+
+        // JDK 17 CompressedStream (0-based):
+        let jdk17 = [0xffu8, 0, 18, 33, 65, 0xff, 10, 1, 0];
+        let decode_17 = |bci: i32| {
+            let mut it = jdk17.iter().copied();
+            super::decode_compressed_line_table(|| it.next(), bci, false)
+        };
+        assert_eq!(decode_17(0), Some(9));
+        assert_eq!(decode_17(12), Some(11));
+        assert_eq!(decode_17(19), Some(10));
+    }
+
+    #[test]
     fn synthetic_fixture_unwinds_compiled_frames() {
         let fixture = SyntheticJavaFixture::two_compiled_frames();
         let sp = 0x7fff_0000_1000u64;
@@ -1919,7 +2223,48 @@ pub(crate) mod tests {
             .expect("compiled java frames");
         assert_eq!(
             frames,
-            vec!["Leaf.work".to_string(), "Caller.entry".to_string()]
+            vec![
+                super::JavaFrame::named("Leaf.work"),
+                super::JavaFrame::named("Caller.entry"),
+            ]
+        );
+    }
+
+    #[test]
+    fn synthetic_fixture_populates_optional_source_file_and_line() {
+        let fixture = SyntheticJavaFixture::two_compiled_frames_with_source();
+        let sp = 0x7fff_0000_1000u64;
+        let stack = fixture.build_copied_stack(sp);
+        let frames = fixture
+            .vm
+            .as_ref()
+            .expect("vm")
+            .frames(fixture.leaf_pc, sp, sp + 16, &mut |addr, buf| {
+                if let Some(off) = addr.checked_sub(sp)
+                    && let Ok(off) = usize::try_from(off)
+                    && let Some(end) = off.checked_add(buf.len())
+                    && end <= stack.len()
+                {
+                    buf.copy_from_slice(&stack[off..end]);
+                    return true;
+                }
+                fixture.read_metadata(addr, buf)
+            })
+            .expect("compiled java frames with source");
+        assert_eq!(
+            frames,
+            vec![
+                super::JavaFrame {
+                    name: "Leaf.work".to_string(),
+                    file: Some("Leaf.java".to_string()),
+                    line: Some(37),
+                },
+                super::JavaFrame {
+                    name: "Caller.entry".to_string(),
+                    file: Some("Caller.java".to_string()),
+                    line: Some(14),
+                },
+            ]
         );
     }
 
@@ -1932,7 +2277,15 @@ pub(crate) mod tests {
 
     impl SyntheticJavaFixture {
         pub fn two_compiled_frames() -> Self {
-            use super::{CodeRange, JavaVm, Layout};
+            Self::build(false)
+        }
+
+        pub fn two_compiled_frames_with_source() -> Self {
+            Self::build(true)
+        }
+
+        fn build(with_source: bool) -> Self {
+            use super::{CodeRange, FlagsField, JavaVm, Layout, LineMeta};
             let mut mem = std::collections::HashMap::new();
             let put = |mem: &mut std::collections::HashMap<u64, u8>, addr: u64, bytes: &[u8]| {
                 for (idx, &byte) in bytes.iter().enumerate() {
@@ -1983,27 +2336,49 @@ pub(crate) mod tests {
             let add_method = |mem: &mut std::collections::HashMap<u64, u8>,
                               meta_base: u64,
                               cls: &[u8],
-                              mth: &[u8]|
+                              mth: &[u8],
+                              src: &[u8],
+                              line_no: u8|
              -> u64 {
                 let sym_cls = meta_base;
                 let sym_mth = meta_base + 0x40;
+                let sym_src = meta_base + 0x60;
                 let klass = meta_base + 0x80;
                 let pool = meta_base + 0xc0;
                 let const_method = meta_base + 0x100;
-                let method = meta_base + 0x140;
+                let method = meta_base + 0x180;
                 put_sym(mem, sym_cls, cls);
                 put_sym(mem, sym_mth, mth);
+                put_sym(mem, sym_src, src);
                 put_u64(mem, klass, sym_cls);
                 put_u64(mem, pool, klass);
-                put_u64(mem, pool + 16, sym_mth);
+                put_u16(mem, pool + 8, 2); // _source_file_name_index = 2
+                put_u64(mem, pool + 16 + 8, sym_mth); // cp_size=16, idx=1
+                put_u64(mem, pool + 16 + 16, sym_src); // cp_size=16, idx=2
                 put_u64(mem, const_method, pool);
-                put_u16(mem, const_method + 8, 1);
+                put_u16(mem, const_method + 8, 1); // _name_index = 1
+                put_i32(mem, const_method + 12, 1); // _flags._flags = 1 (has_linenumber_table)
+                put_u16(mem, const_method + 16, 4); // _code_size = 4
+                // const_method_size = 32 -> code at +32..+36, line table at +36
+                // UNSIGNED5: 0xff, bci_delta=0 (1), line_delta=+line_no ((line_no*2)+1), 0
+                put(
+                    mem,
+                    const_method + 36,
+                    &[0xff, 1, line_no.saturating_mul(2).saturating_add(1), 0],
+                );
                 put_u64(mem, method, const_method);
                 method
             };
 
-            let leaf_method = add_method(&mut mem, 0x2001_0000, b"Leaf", b"work");
-            let caller_method = add_method(&mut mem, 0x2001_1000, b"Caller", b"entry");
+            let leaf_method = add_method(&mut mem, 0x2001_0000, b"Leaf", b"work", b"Leaf.java", 37);
+            let caller_method = add_method(
+                &mut mem,
+                0x2001_1000,
+                b"Caller",
+                b"entry",
+                b"Caller.java",
+                14,
+            );
 
             let add_blob = |mem: &mut std::collections::HashMap<u64, u8>,
                             seg_index: u64,
@@ -2030,6 +2405,7 @@ pub(crate) mod tests {
 
             let vm = JavaVm {
                 layout: Layout {
+                    major: 21,
                     code_range: CodeRange::Pointers { begin: 0, end: 8 },
                     frame_size: 16,
                     blob_size: 20,
@@ -2038,6 +2414,14 @@ pub(crate) mod tests {
                     const_method: 0,
                     constants: 0,
                     name_index: 8,
+                    source_file_index: with_source.then_some(8),
+                    line_meta: with_source.then_some(LineMeta {
+                        const_method_size: 32,
+                        code_size: 16,
+                        flags: FlagsField::U32(12),
+                        has_linenumber_mask: 1,
+                        bcp_words: -7,
+                    }),
                     pool_holder: 0,
                     klass_name: 0,
                     sym_length: 0,
@@ -2052,7 +2436,7 @@ pub(crate) mod tests {
                     array_len: 0,
                     array_cap: 4,
                     array_data: 8,
-                    cp_size: 8,
+                    cp_size: 16,
                     method_words: -3,
                 },
                 heaps: heaps_ptr_addr,

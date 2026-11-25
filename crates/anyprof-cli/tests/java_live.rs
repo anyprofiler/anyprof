@@ -215,6 +215,11 @@ fn record_one(java: &Path) {
         folded.contains("[java] AnyprofSpin.spin") && folded.contains("[java] AnyprofSpin.caller"),
         "collapsed stacks:\n{folded}"
     );
+    let json = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        json.contains("AnyprofSpin.java") && json.contains("\"line\":"),
+        "speedscope missing Java file:line metadata:\n{json}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -56,11 +56,11 @@ pub(crate) enum CountedStack {
     },
     /// Java methods, optionally after kernel PCs from the same sample.
     ///
-    /// Names are `Class.method`, leaf first. Kernel frames stay addresses
-    /// until the profile is finished.
+    /// Frames carry `Class.method` plus optional source file and line, leaf
+    /// first. Kernel frames stay addresses until the profile is finished.
     Java {
         kernel: Vec<u64>,
-        frames: Vec<String>,
+        frames: Vec<crate::java::JavaFrame>,
     },
 }
 

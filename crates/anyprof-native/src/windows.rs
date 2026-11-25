@@ -230,6 +230,7 @@ impl Symbols {
         // built in this directory gets function names.
         let options = SYMOPT_UNDNAME
             | SYMOPT_DEFERRED_LOADS
+            | windows_sys::Win32::System::Diagnostics::Debug::SYMOPT_LOAD_LINES
             | SYMOPT_FAIL_CRITICAL_ERRORS
             | SYMOPT_NO_PROMPTS
             | SYMOPT_IGNORE_NT_SYMPATH
@@ -707,7 +708,70 @@ fn frame_for(
     let mut frame = Frame::new(runtime, name);
     frame.address = Some(addr);
     frame.module = module;
+    if let Some((file, line)) =
+        line_for(process, lookup, pdbs).or_else(|| line_for(process, addr, pdbs))
+    {
+        frame.file = Some(file);
+        frame.line = Some(line);
+    }
     frame
+}
+
+fn line_for(
+    process: HANDLE,
+    addr: u64,
+    pdbs: &mut HashMap<String, crate::pdb_syms::ImageSymbols>,
+) -> Option<(String, u32)> {
+    if let Some(hit) = dbghelp_line(process, addr) {
+        return Some(hit);
+    }
+    let base = unsafe { SymGetModuleBase64(process, addr) };
+    if base == 0 || addr < base {
+        return None;
+    }
+    let file = module_file(process, addr).or_else(|| {
+        module_path(process, addr).and_then(|(_, full)| full.map(std::path::PathBuf::from))
+    })?;
+    let key = file.to_string_lossy().into_owned();
+    let symbols = pdbs
+        .entry(key)
+        .or_insert_with(|| crate::pdb_syms::load(&file));
+    let (src, line) = symbols.line_at(addr - base)?;
+    Some((src.to_string(), line))
+}
+
+fn dbghelp_line(process: HANDLE, addr: u64) -> Option<(String, u32)> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{IMAGEHLP_LINEW64, SymGetLineFromAddrW64};
+
+    let mut line: IMAGEHLP_LINEW64 = unsafe { std::mem::zeroed() };
+    line.SizeOfStruct = std::mem::size_of::<IMAGEHLP_LINEW64>() as u32;
+    let mut displacement = 0u32;
+    let ok = unsafe { SymGetLineFromAddrW64(process, addr, &mut displacement, &mut line) };
+    if ok == FALSE
+        || line.LineNumber == 0
+        || line.LineNumber >= 0x00ef_feff
+        || line.FileName.is_null()
+    {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < 32768 {
+        let unit = unsafe { *line.FileName.add(len) };
+        if unit == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(line.FileName, len) };
+    let path = String::from_utf16_lossy(slice).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some((path, line.LineNumber))
+    }
 }
 
 fn symbol_at(
