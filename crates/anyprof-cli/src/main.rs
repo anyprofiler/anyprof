@@ -2,31 +2,46 @@ mod cli;
 mod convert;
 mod interrupt;
 mod output;
+mod proc_match;
 mod record;
 mod registry;
 mod update;
 mod view;
+
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
 
 use cli::{Cli, Command};
 
-fn main() {
-    if let Err(err) = try_main() {
-        eprintln!("Error: {err:#}");
-        std::process::exit(1);
+fn main() -> ExitCode {
+    match try_main() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            ExitCode::from(1)
+        }
     }
 }
 
-fn try_main() -> Result<()> {
+fn try_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
     match cli.command {
         Command::Record(args) => record::run(args, cli.verbose),
-        Command::Convert(args) => convert::run(args),
-        Command::View(args) => view::run(args),
-        Command::Update => update::run(),
+        Command::Convert(args) => {
+            convert::run(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::View(args) => {
+            view::run(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Update => {
+            update::run()?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

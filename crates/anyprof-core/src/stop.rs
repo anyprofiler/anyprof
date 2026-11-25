@@ -47,6 +47,12 @@ impl StopGate {
         self.stop.load(Ordering::SeqCst)
     }
 
+    /// Ask the sampler to stop cleanly (for example when a spawned child exits)
+    /// without counting as an interrupt signal.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
     /// Mark the start of `Profiler.stop` and the following save.
     ///
     /// Call this before stopping the target profiler so a second interrupt
