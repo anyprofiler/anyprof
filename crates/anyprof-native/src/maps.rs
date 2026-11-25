@@ -40,6 +40,76 @@ pub(crate) fn live_path(path: &str) -> &str {
     path.strip_suffix(" (deleted)").unwrap_or(path)
 }
 
+/// Display module name taken from the mapped path before `/proc/<pid>/root`
+/// rewriting, so `/proc/42/root/app/service` is still named `service`.
+pub(crate) fn module_name(mapped_path: &str) -> String {
+    let clean = live_path(mapped_path);
+    std::path::Path::new(clean)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(clean)
+        .to_string()
+}
+
+/// Candidate path inside `pid`'s mount namespace (`/proc/<pid>/root/...`).
+///
+/// Rejects relative paths, `"/"`, NUL bytes, and any `..` segment so a crafted
+/// or unusual mapping line cannot escape `/proc/<pid>/root` or yield `"root"`
+/// as its file name.
+pub(crate) fn proc_root_candidate(pid: u32, mapped_path: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+
+    let clean = live_path(mapped_path);
+    if pid == 0 || !clean.starts_with('/') || clean.contains('\0') {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for component in Path::new(clean).components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => rel.push(part),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    let mut rooted = PathBuf::from(format!("/proc/{pid}/root"));
+    rooted.push(rel);
+    Some(rooted)
+}
+
+/// Host-openable path for a file mapped into `pid` on Linux.
+///
+/// For another process (`pid != std::process::id()`), prefers
+/// `/proc/<pid>/root<mapped_path>` when that regular file is readable so
+/// container binaries and libraries resolve inside the target's mount
+/// namespace instead of missing or opening a mismatched host library.
+pub(crate) fn resolve_mapped_path(pid: u32, mapped_path: &str) -> std::path::PathBuf {
+    resolve_mapped_path_with(pid, std::process::id(), mapped_path, is_readable_file)
+}
+
+fn resolve_mapped_path_with(
+    pid: u32,
+    self_pid: u32,
+    mapped_path: &str,
+    readable_file: impl Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    let clean = live_path(mapped_path);
+    if pid != self_pid
+        && let Some(candidate) = proc_root_candidate(pid, clean)
+        && readable_file(&candidate)
+    {
+        return candidate;
+    }
+    std::path::PathBuf::from(clean)
+}
+
+fn is_readable_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) && std::fs::File::open(path).is_ok()
+}
+
 fn parse_line(line: &str) -> Option<MapSpan> {
     let mut parts = line.split_whitespace();
     let range = parts.next()?;
@@ -69,7 +139,11 @@ fn parse_line(line: &str) -> Option<MapSpan> {
 
 #[cfg(test)]
 mod tests {
-    use super::{live_path, parse_maps};
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        live_path, module_name, parse_maps, proc_root_candidate, resolve_mapped_path_with,
+    };
 
     #[test]
     fn file_mappings_are_kept_and_pseudo_files_are_not() {
@@ -89,5 +163,69 @@ ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]
         assert!(!spans[1].executable);
         assert_eq!(spans[1].path, "/tmp/busy");
         assert_eq!(live_path(&spans[2].path), "/usr/lib/libc.so.6");
+    }
+
+    #[test]
+    fn proc_root_joins_absolute_paths_and_rejects_traversal_or_bare_root() {
+        assert_eq!(
+            proc_root_candidate(4242, "/app/server"),
+            Some(PathBuf::from("/proc/4242/root/app/server"))
+        );
+        assert_eq!(
+            proc_root_candidate(4242, "/usr/lib/libc.so.6 (deleted)"),
+            Some(PathBuf::from("/proc/4242/root/usr/lib/libc.so.6"))
+        );
+        assert_eq!(proc_root_candidate(0, "/app/server"), None);
+        assert_eq!(proc_root_candidate(4242, "/"), None);
+        assert_eq!(proc_root_candidate(4242, "relative/lib.so"), None);
+        assert_eq!(proc_root_candidate(4242, "/app/../../etc/passwd"), None);
+        assert_eq!(proc_root_candidate(4242, "/../bin/sh"), None);
+    }
+
+    #[test]
+    fn resolve_mapped_path_prefers_readable_proc_root_for_other_pids_and_keeps_module_name() {
+        let mapped = "/opt/jdk/lib/server/libjvm.so";
+        assert_eq!(module_name(mapped), "libjvm.so");
+        assert_eq!(module_name("/usr/lib/libc.so.6 (deleted)"), "libc.so.6");
+        assert_eq!(module_name("/"), "/");
+
+        let resolved = resolve_mapped_path_with(200, 100, mapped, |candidate| {
+            candidate == Path::new("/proc/200/root/opt/jdk/lib/server/libjvm.so")
+        });
+        assert_eq!(
+            resolved,
+            PathBuf::from("/proc/200/root/opt/jdk/lib/server/libjvm.so")
+        );
+        assert_eq!(module_name(mapped), "libjvm.so");
+
+        // Same pid skips `/proc/<pid>/root` indirection.
+        let same = resolve_mapped_path_with(100, 100, mapped, |_| true);
+        assert_eq!(same, PathBuf::from(mapped));
+
+        // Unreadable `/proc/<pid>/root/...` falls back to the mapped path.
+        let fallback = resolve_mapped_path_with(200, 100, mapped, |_| false);
+        assert_eq!(fallback, PathBuf::from(mapped));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_self_root_resolves_the_current_executable_without_naming_it_root() {
+        let exe = std::fs::read_link("/proc/self/exe").expect("read /proc/self/exe");
+        let mapped = exe.to_string_lossy();
+        let pid = std::process::id();
+        let rooted = proc_root_candidate(pid, &mapped).expect("proc root path");
+        assert!(
+            rooted.starts_with(format!("/proc/{pid}/root/")),
+            "{}",
+            rooted.display()
+        );
+        assert!(super::is_readable_file(&rooted), "{}", rooted.display());
+        let resolved = resolve_mapped_path_with(pid, 0, &mapped, super::is_readable_file);
+        assert_eq!(resolved, rooted);
+        assert_ne!(module_name(&mapped), "root");
+        assert_eq!(
+            Some(module_name(&mapped).as_str()),
+            exe.file_name().and_then(|name| name.to_str())
+        );
     }
 }

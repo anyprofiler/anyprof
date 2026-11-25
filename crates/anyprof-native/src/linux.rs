@@ -936,12 +936,14 @@ fn kernel_frame(symbols: &[Kallsym], addr: u64, leaf: bool) -> Frame {
     frame
 }
 
+const MAX_MAPPED_IMAGES: usize = 4096;
+
 fn load_images(pid: u32) -> Vec<UserImage> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
-    images_from_maps(&text)
+    images_from_maps(pid, &text)
 }
 
-fn images_from_maps(text: &str) -> Vec<UserImage> {
+fn images_from_maps(pid: u32, text: &str) -> Vec<UserImage> {
     let spans = maps::parse_maps(text);
     let mut order = Vec::new();
     let mut groups: HashMap<String, Vec<MapSpan>> = HashMap::new();
@@ -953,32 +955,29 @@ fn images_from_maps(text: &str) -> Vec<UserImage> {
         groups.entry(key).or_default().push(span);
     }
     let mut images = Vec::new();
-    for path in order.into_iter().take(512) {
-        let Some(group) = groups.remove(&path) else {
+    for mapped_path in order.into_iter().take(MAX_MAPPED_IMAGES) {
+        let Some(group) = groups.remove(&mapped_path) else {
             continue;
         };
-        images.push(image_from_group(&path, &group));
+        let open_path = maps::resolve_mapped_path(pid, &mapped_path);
+        images.push(image_from_group(&mapped_path, &open_path, &group));
     }
     images
 }
 
-fn image_from_group(path: &str, group: &[MapSpan]) -> UserImage {
-    let mut image = image_from_elf(path, group);
+fn image_from_group(mapped_path: &str, open_path: &Path, group: &[MapSpan]) -> UserImage {
+    let mut image = image_from_elf(mapped_path, open_path, group);
     // One scan per mapped file. libc and the dynamic linker miss and stay
     // native; the Rust executable hits and labels its `::` paths.
-    image.rust_image = crate::rust_image::file_is_rust(Path::new(path));
+    image.rust_image = crate::rust_image::file_is_rust(open_path);
     image
 }
 
-fn image_from_elf(path: &str, group: &[MapSpan]) -> UserImage {
+fn image_from_elf(mapped_path: &str, open_path: &Path, group: &[MapSpan]) -> UserImage {
     let start = group.iter().map(|span| span.start).min().unwrap_or(0);
     let end = group.iter().map(|span| span.end).max().unwrap_or(start);
-    let module = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-        .to_string();
-    let Some(elf) = elf::parse_path(Path::new(path)) else {
+    let module = maps::module_name(mapped_path);
+    let Some(elf) = elf::parse_path(open_path) else {
         return UserImage::range_only(start, end, module);
     };
     if !elf::is_x86_64(&elf) {
@@ -992,7 +991,7 @@ fn image_from_elf(path: &str, group: &[MapSpan]) -> UserImage {
         return UserImage::range_only(start, end, module);
     };
     let mut image = UserImage::from_elf(start, end, module, &elf, bias);
-    image.go = go_sym::open_image_at(Path::new(path), bias);
+    image.go = go_sym::open_image_at(open_path, bias);
     image
 }
 
