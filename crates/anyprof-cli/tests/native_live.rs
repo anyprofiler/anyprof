@@ -9,25 +9,37 @@ use std::process::Command;
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::path::Path;
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::process::Stdio;
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::time::Duration;
 
 #[cfg(not(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 )))]
 fn anyprof(args: &[&str]) -> std::process::Output {
@@ -39,7 +51,10 @@ fn anyprof(args: &[&str]) -> std::process::Output {
 
 #[cfg(not(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 )))]
 #[test]
@@ -215,7 +230,10 @@ fn record_native_writes_a_profile_of_a_busy_cpp_program() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn convert(input: &Path, output: &Path, to: &str) {
@@ -236,7 +254,10 @@ fn convert(input: &Path, output: &Path, to: &str) {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn parse_wrote(stderr: &str) -> (u64, std::path::PathBuf) {
@@ -258,7 +279,10 @@ fn parse_wrote(stderr: &str) -> (u64, std::path::PathBuf) {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn run_with_timeout(mut command: Command, limit: Duration) -> std::process::Output {
@@ -316,7 +340,10 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn record_native_writes_a_profile_of_a_busy_cpp_program_on_linux() {
     let _lock = CliLock::acquire();
@@ -391,7 +418,10 @@ fn record_native_writes_a_profile_of_a_busy_cpp_program_on_windows() {
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn record_native(pid: u32, output_dir: &Path) -> std::process::Output {
@@ -418,7 +448,10 @@ fn record_native(pid: u32, output_dir: &Path) -> std::process::Output {
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn assert_native_profile(recorded: &std::process::Output, pid: u32, output_dir: &Path, dir: &Path) {
@@ -470,7 +503,10 @@ fn assert_native_profile(recorded: &std::process::Output, pid: u32, output_dir: 
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn compile_unix(source: &Path, binary: &Path) -> bool {
     let mut errors = Vec::new();
     for compiler in ["g++", "clang++"] {
@@ -479,12 +515,10 @@ fn compile_unix(source: &Path, binary: &Path) -> bool {
             "-std=c++17",
             "-O0",
             "-fno-omit-frame-pointer",
+            "-mno-omit-leaf-frame-pointer",
             "-fno-optimize-sibling-calls",
             "-g",
         ]);
-        if compiler == "clang++" {
-            command.arg("-mno-omit-leaf-frame-pointer");
-        }
         command.arg("-o").arg(binary).arg(source);
         match command.output() {
             Ok(output) if output.status.success() => return true,
@@ -576,7 +610,10 @@ fn skip_or_fail(message: &str) {
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 struct CliLock {
@@ -584,7 +621,10 @@ struct CliLock {
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 impl CliLock {
@@ -619,7 +659,10 @@ impl CliLock {
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 impl Drop for CliLock {
@@ -628,7 +671,10 @@ impl Drop for CliLock {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const LINUX_BUSY_CPP: &str = r#"
 namespace anyprof_native {
 __attribute__((noinline)) void spin() {

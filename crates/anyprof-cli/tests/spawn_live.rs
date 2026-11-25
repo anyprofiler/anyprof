@@ -67,7 +67,10 @@ fn run_with_timeout(mut command: Command, limit: Duration) -> std::process::Outp
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 const SHORT_RUST_SPIN: &str = r#"
@@ -100,7 +103,10 @@ fn main() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn compile_rust_fixture(dir: &Path, stem: &str) -> PathBuf {
@@ -140,7 +146,10 @@ fn compile_rust_fixture(dir: &Path, stem: &str) -> PathBuf {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn anyprof_cmd() -> Command {
@@ -159,7 +168,10 @@ fn anyprof_cmd() -> Command {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn skip_if_unprivileged(stderr: &str) -> bool {
@@ -176,7 +188,10 @@ fn skip_if_unprivileged(stderr: &str) -> bool {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 #[test]
@@ -267,7 +282,10 @@ fn spawn_short_lived_fixture_captures_profile_and_propagates_exit_code() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 #[test]
@@ -344,7 +362,10 @@ fn name_flag_attaches_unique_target_and_rejects_ambiguous_names() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn find_python() -> Option<PathBuf> {
@@ -391,7 +412,10 @@ fn find_python() -> Option<PathBuf> {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 #[test]

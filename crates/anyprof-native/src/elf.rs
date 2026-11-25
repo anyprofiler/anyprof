@@ -10,7 +10,10 @@
 //! module and the address.
 
 #![cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
     allow(dead_code)
 )]
 
@@ -34,7 +37,14 @@ const MAX_STRINGS: u64 = 64 * 1024 * 1024;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
-const EM_X86_64: u16 = 62;
+#[allow(dead_code)]
+pub(crate) const EM_X86_64: u16 = 62;
+#[allow(dead_code)]
+pub(crate) const EM_AARCH64: u16 = 183;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const HOST_ELF_MACHINE: u16 = EM_AARCH64;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const HOST_ELF_MACHINE: u16 = EM_X86_64;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
@@ -222,23 +232,44 @@ fn find_location(images: &[UserImage], addr: u64) -> Option<(&str, u32)> {
     image.location_at(addr)
 }
 
-/// Linux x86_64 page size. The kernel maps each `PT_LOAD` from the page that
-/// contains `p_offset`, and the sampler only walks that architecture.
-const MAP_PAGE: u64 = 4096;
+/// Runtime OS page size in bytes (`4096`, `16384`, or `65536` on Linux `aarch64`).
+#[cfg(target_os = "linux")]
+pub(crate) fn system_page_size() -> u64 {
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n > 0 && (n as u64).is_power_of_two() {
+        n as u64
+    } else {
+        4096
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn system_page_size() -> u64 {
+    4096
+}
 
 /// Runtime load bias: `map_start - link_address_of_that_file_offset`.
 ///
-/// The mapping's file offset is page-aligned. rustc (lld) emits an executable
-/// segment whose `p_offset` sits 0x820 bytes into a page, so the kernel maps
-/// file offset `p_offset & !4095`. That offset is still inside the previous
-/// segment's `p_filesz`. Treating the first containing segment as the mapping
-/// shifts every symbol in the executable segment by one page, and a Rust
-/// spin loop then symbolizes as unrelated standard-library functions. Match
-/// the segment whose own page contains this file offset first.
-pub(crate) fn load_bias(map_start: u64, map_offset: u64, loads: &[LoadSegment]) -> Option<u64> {
+/// The mapping's file offset is aligned to the kernel's `page_size` (4K on
+/// x86_64; 4K, 16K, or 64K on Linux aarch64). rustc (lld) emits an executable
+/// segment whose `p_offset` sits mid-page, so the kernel maps file offset
+/// `p_offset & !(page_size - 1)`. That offset can sit inside the previous
+/// segment's `p_filesz`. Match the segment whose own page contains this file
+/// offset first.
+pub(crate) fn load_bias(
+    map_start: u64,
+    map_offset: u64,
+    loads: &[LoadSegment],
+    page_size: u64,
+) -> Option<u64> {
+    let page = if page_size >= 4096 && page_size.is_power_of_two() {
+        page_size
+    } else {
+        4096
+    };
     let load = loads
         .iter()
-        .find(|load| load.filesz > 0 && load.offset & !(MAP_PAGE - 1) == map_offset)
+        .find(|load| load.filesz > 0 && (load.offset & !(page - 1)) == map_offset)
         .or_else(|| {
             loads.iter().find(|load| {
                 let end = load.offset.saturating_add(load.filesz.max(1));
@@ -570,14 +601,14 @@ fn cstr_at(buf: &[u8], offset: usize) -> Option<&str> {
     std::str::from_utf8(&rest[..end]).ok()
 }
 
-/// Whether this ELF is the x86_64 image the Linux sampler can walk.
-pub(crate) fn is_x86_64(elf: &ElfFile) -> bool {
-    elf.machine == EM_X86_64
+/// Whether this ELF matches the host Linux sampler architecture (`x86_64` or `aarch64`).
+pub(crate) fn is_host_linux_elf(elf: &ElfFile) -> bool {
+    elf.machine == HOST_ELF_MACHINE
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UserImage, load_bias, name_for, parse_bytes};
+    use super::{EM_AARCH64, EM_X86_64, UserImage, load_bias, name_for, parse_bytes};
 
     #[test]
     fn itanium_names_are_demangled_and_c_names_stay() {
@@ -602,8 +633,8 @@ mod tests {
             ("main", 0x1200, 0x40),
         ]);
         let elf = parse_bytes(&bytes).expect("synthetic elf");
-        assert!(super::is_x86_64(&elf));
-        let bias = load_bias(0x5555_0000_0000, 0, &elf.loads).unwrap();
+        assert_eq!(elf.machine, EM_X86_64);
+        let bias = load_bias(0x5555_0000_0000, 0, &elf.loads, 4096).unwrap();
         assert_eq!(bias, 0x5555_0000_0000);
         let image = UserImage::from_elf(bias, bias + 0x2000, "busy".to_string(), &elf, bias);
         let (name, module, runtime) =
@@ -638,10 +669,54 @@ mod tests {
             },
         ];
         let map_start = 0x5555_0008_8000u64;
-        let bias = load_bias(map_start, 0x15000, &loads).unwrap();
+        let bias = load_bias(map_start, 0x15000, &loads, 4096).unwrap();
         assert_eq!(bias, map_start - 0x16000);
         // Link vaddr 0x17440 is file offset 0x16440, 0x1440 bytes into the map.
         assert_eq!(bias.wrapping_add(0x17440), map_start + 0x1440);
+    }
+
+    #[test]
+    fn aarch64_elf_and_16k_64k_page_alignments_resolve_load_bias() {
+        let mut bytes = synthetic_elf(&[("arm64_leaf", 0x2000, 0x80)]);
+        bytes[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        let elf = parse_bytes(&bytes).expect("synthetic arm64 elf");
+        assert_eq!(elf.machine, EM_AARCH64);
+
+        // 16 KiB pages (0x4000): segment at file offset 0x16820 / vaddr 0x26820
+        // maps from page offset 0x14000, inside the previous segment's filesz (0x16810).
+        let loads_16k = [
+            super::LoadSegment {
+                offset: 0,
+                vaddr: 0,
+                filesz: 0x16810,
+            },
+            super::LoadSegment {
+                offset: 0x16820,
+                vaddr: 0x26820,
+                filesz: 0x20000,
+            },
+        ];
+        let map_16k = 0x0000_aaaa_c001_4000u64;
+        let bias_16k = load_bias(map_16k, 0x14000, &loads_16k, 16 * 1024).unwrap();
+        assert_eq!(bias_16k, map_16k - 0x24000);
+
+        // 64 KiB pages (0x1_0000): segment at file offset 0x2a400 / vaddr 0x3a400
+        // maps from page offset 0x20000, inside the previous segment's filesz (0x2a3f0).
+        let loads_64k = [
+            super::LoadSegment {
+                offset: 0,
+                vaddr: 0,
+                filesz: 0x2a3f0,
+            },
+            super::LoadSegment {
+                offset: 0x2a400,
+                vaddr: 0x3a400,
+                filesz: 0x40000,
+            },
+        ];
+        let map_64k = 0x0000_aaaa_c002_0000u64;
+        let bias_64k = load_bias(map_64k, 0x20000, &loads_64k, 64 * 1024).unwrap();
+        assert_eq!(bias_64k, map_64k - 0x30000);
     }
 
     #[test]
@@ -651,7 +726,10 @@ mod tests {
         assert!(parse_bytes(&[0x7f, b'E', b'L', b'F', 1, 1]).is_none());
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn compiled_elf_with_debug_info_resolves_source_file_and_line() {
         let dir = std::env::temp_dir().join(format!("anyprof-elf-dwarf-{}", std::process::id()));

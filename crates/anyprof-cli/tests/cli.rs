@@ -8,12 +8,18 @@ fn anyprof(args: &[&str]) -> std::process::Output {
         .expect("run anyprof")
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn euid() -> u32 {
     unsafe { geteuid() }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 unsafe extern "C" {
     fn geteuid() -> u32;
 }
@@ -179,7 +185,10 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
         .expect("spawn sleep");
     #[cfg(target_os = "macos")]
     let pid = sleeper.id().to_string();
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     let pid = if euid() == 0 {
         "2147483646".to_string()
     } else {
@@ -192,7 +201,10 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     let pid = "4".to_string();
     #[cfg(not(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     )))]
     let pid = std::process::id().to_string();
@@ -220,7 +232,10 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
         stderr.contains("task_for_pid"),
         "macOS should explain the Mach permission failure: {stderr}"
     );
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         if euid() == 0 {
             assert!(
@@ -251,7 +266,10 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     }
     #[cfg(not(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     )))]
     assert!(

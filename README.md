@@ -11,7 +11,7 @@ Capture CPU profiles from any running process — no code changes, agents, or re
 
 ## Runtime & Platform Support
 
-| Runtime | Backend | Default Rate & Format | macOS (`arm64` & Intel) | Windows `x64` | Linux `x86_64` | Key Notes |
+| Runtime | Backend | Default Rate & Format | macOS (`arm64` & Intel) | Windows `x64` | Linux (`x86_64` & `aarch64`) | Key Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | **Node.js** | `node` | 10,000 Hz · `.cpuprofile` | Supported | Supported | Supported | Activates V8 inspector (`SIGUSR1` / `_debugProcess`); closes temporary port on exit |
 | **Browser** | `browser` | 10,000 Hz · `.cpuprofile` | Supported | Supported | Supported | Connects to `--remote-debugging-port` (`127.0.0.1:9222`); match tab by URL, title, or ID |
@@ -62,7 +62,7 @@ anyprof rec -p 1234 -d 10s -w                    # record and open in built-in v
 anyprof rec -B -t example.com -d 10s -o page.cpuprofile
 
 # C/C++, Rust, Go, Python, or Java (auto-detected by PID)
-anyprof rec -p 1234 -d 10s                       # Linux x86_64 & Windows x64
+anyprof rec -p 1234 -d 10s                       # Linux (x86_64 & aarch64) & Windows x64
 sudo anyprof rec -p 1234 -d 10s                  # macOS (task_for_pid requires root)
 anyprof rec -p 1234 -d 10s -k                    # include Linux kernel frames
 
@@ -91,7 +91,7 @@ anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 | `-f, --format <FORMAT>` | `collapsed`, `pprof`, `speedscope`, or `cpuprofile` (inferred from `-o` extension or backend default). |
 | `-F, --frequency <HZ>` | Sampling rate (`1`–`1000000` Hz). Mutually exclusive with `--interval`. |
 | `--interval <DURATION>` | Sampling period (e.g. `100us`, `1ms`, `10ms`). Mutually exclusive with `-F`. |
-| `-k, --kernel` | Include kernel stack frames (supported on Linux `x86_64`). |
+| `-k, --kernel` | Include kernel stack frames (supported on Linux `x86_64` & `aarch64`). |
 | `-b, --backend <NAME>` | Force backend: `node`, `browser`, `rust`, `go`, `python`, `java`, or `native`. |
 | `-w, --web` | Open the recorded profile in the built-in viewer after saving. |
 | `-v`, `-vv`, `-vvv` | Increase log verbosity (`info`, `debug`, `trace`; also respects `RUST_LOG`). |
@@ -122,11 +122,11 @@ anyprof convert -i <INPUT> -o <OUTPUT> [-f <FROM_FORMAT>] -t <TO_FORMAT>
 
 - **Node.js**: Requires no root privileges. On macOS/Linux, `anyprof` verifies the target is a `node` binary before sending `SIGUSR1` (avoid signaling during the first milliseconds of startup before Node installs its signal handler). On Windows, `node` must be on `PATH`.
 - **macOS**: Native, Rust, Go, Python, and Java sampling call Mach `task_for_pid` and require `sudo` (`sudo anyprof rec -p <pid>`). Processes protected by SIP or Hardened Runtime cannot be attached. Compile C/C++ with `-fno-omit-frame-pointer` and Rust with `-C force-frame-pointers=yes` so caller chains unwind completely.
-- **Linux `x86_64`**: Uses non-suspending `perf_event_open` (`PERF_COUNT_SW_TASK_CLOCK`) and resolves container paths via `/proc/<pid>/root`.
+- **Linux (`x86_64` & `aarch64`)**: Uses non-suspending `perf_event_open` (`PERF_COUNT_SW_TASK_CLOCK`) and resolves container paths via `/proc/<pid>/root`.
   - User-space sampling requires `kernel.perf_event_paranoid <= 2` (or `CAP_PERFMON` / `root`).
   - Kernel frames (`-k`) require `kernel.perf_event_paranoid <= 1` and `kernel.kptr_restrict = 0` for `/proc/kallsyms` symbol names.
-  - Python and Java read VM frames via `process_vm_readv`, which checks ptrace attach permission: under `kernel.yama.ptrace_scope = 1` (Ubuntu default), attaching to an unrelated same-user PID requires `root`, `CAP_SYS_PTRACE`, or `ptrace_scope = 0`.
-  - Compile C/C++ with `-fno-omit-frame-pointer` (plus `-mno-omit-leaf-frame-pointer` at `-O2`) and Rust with `-C force-frame-pointers=yes`.
+  - Python and Java read VM frames via `process_vm_readv`, which checks ptrace attach permission: under `kernel.yama.ptrace_scope = 1` (Ubuntu default), attaching to an unrelated same-user PID requires `root`, `CAP_SYS_PTRACE`, or `ptrace_scope = 0` (spawning via `anyprof rec -- <cmd>` works at `ptrace_scope = 1`).
+  - Compile C/C++ with `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer` and Rust with `-C force-frame-pointers=yes`.
 - **Windows `x64`**: Same-user processes require no administrator privileges; cross-user or elevated processes require `SeDebugPrivilege`. `StackWalk64` uses PE unwind tables directly (no frame-pointer flag needed); keep matching `.pdb` files next to executables (`-C debuginfo=2` for Rust) for symbol names.
 
 For deep runtime ABI layouts, `pclntab` / HotSpot / CPython unwinding rules, and symbolizer limits, see [docs/internals.md](docs/internals.md).
@@ -139,7 +139,7 @@ anyprof record / view / convert (anyprof-cli)
   ├── anyprof-cdp       Chrome DevTools Protocol client (HTTP discovery + Profiler.*)
   ├── anyprof-node      Node.js inspector attach & lifecycle
   ├── anyprof-browser   Browser tab target discovery over CDP
-  ├── anyprof-native    macOS Mach, Windows x64 StackWalk64, Linux x86_64 perf_event_open
+  ├── anyprof-native    macOS Mach, Windows x64 StackWalk64, Linux x86_64/aarch64 perf_event_open
   ├── anyprof-rust      Rust binary detection & symbol demangling
   ├── anyprof-go        Go 1.18–1.26+ pclntab (pcsp) unwinder
   ├── anyprof-python    CPython 3.11–3.13 _PyRuntime frame-chain walker

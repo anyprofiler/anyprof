@@ -358,7 +358,7 @@ fn signed_varint(bytes: &[u8]) -> i32 {
 }
 
 fn plausible_ptr(addr: u64) -> bool {
-    (0x1000..0x0000_8000_0000_0000).contains(&addr) && addr.is_multiple_of(8)
+    (0x1000..crate::walk::USER_ADDR_LIMIT).contains(&addr) && addr.is_multiple_of(8)
 }
 
 fn read_u64(read: &mut impl FnMut(u64, &mut [u8]) -> bool, addr: u64) -> Option<u64> {
@@ -742,7 +742,10 @@ fn read_file_u64(path: &Path, offset: u64) -> Option<u64> {
     Some(u64::from_le_bytes(buf))
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn open_elf(path: &Path, spans: &[crate::maps::MapSpan]) -> Option<PythonVm> {
     let image = python_sym::exports(path)?;
     let offsets = layout_for(path, &image).ok()?;
@@ -750,7 +753,12 @@ fn open_elf(path: &Path, spans: &[crate::maps::MapSpan]) -> Option<PythonVm> {
         .iter()
         .find(|span| span.executable)
         .or_else(|| spans.first())?;
-    let slide = crate::elf::load_bias(anchor.start, anchor.offset, &image.loads)?;
+    let slide = crate::elf::load_bias(
+        anchor.start,
+        anchor.offset,
+        &image.loads,
+        crate::elf::system_page_size(),
+    )?;
     let start = spans.iter().map(|span| span.start).min()?;
     let end = spans.iter().map(|span| span.end).max()?;
     if end <= start {
@@ -797,8 +805,8 @@ enum Support {
 /// Detection only looks for `_PyRuntime`. This then requires one of the
 /// walked layouts: the default GIL builds of 3.11, 3.12, and 3.13. Anything
 /// else, including an older CPython, 3.14, and a free-threaded 3.13, is an
-/// error. On Linux x86_64 a supported process is also probed with
-/// `process_vm_readv`. `EPERM` and `EACCES` are errors that name the errno
+/// error. On Linux `x86_64` and `aarch64` a supported process is also probed
+/// with `process_vm_readv`. `EPERM` and `EACCES` are errors that name the errno
 /// and `kernel.yama.ptrace_scope`. anyprof does not change that sysctl.
 /// Either failure returns before a native interpreter stack can be recorded
 /// under the python backend.
@@ -810,7 +818,10 @@ pub fn prepare_python(pid: u32) -> Result<(), Error> {
         Support::Absent => Ok(()),
         Support::Rejected(message) => Err(Error::backend("python", message)),
         Support::Supported => {
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             {
                 let Some(vm) = attach_linux(pid) else {
                     return Err(Error::backend(
@@ -866,7 +877,10 @@ fn classify_paths(paths: &[PathBuf]) -> Support {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn probe_runtime(pid: u32, runtime: u64) -> Result<(), Error> {
     let mut buf = [0u8; 8];
     match read_process_errno(pid, runtime, &mut buf) {
@@ -875,7 +889,10 @@ fn probe_runtime(pid: u32, runtime: u64) -> Result<(), Error> {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn read_denied_message(pid: u32, err: i32) -> String {
     let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
         .ok()
@@ -951,7 +968,10 @@ fn candidate_paths(pid: u32) -> Vec<PathBuf> {
 }
 
 /// Opens the interpreter for a Linux process. `None` keeps the native walk.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) fn attach_linux(pid: u32) -> Option<PythonVm> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
     let spans = crate::maps::parse_maps(&text);
@@ -1353,7 +1373,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn a_cross_user_read_names_process_vm_readv() {
         // pid 1 belongs to another user. The credential check fails before a
@@ -1382,7 +1405,10 @@ mod tests {
         assert!(!pid_is_cpython(0));
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn reads_a_live_312_frame() {
         let python = Path::new("/usr/bin/python3.12");
