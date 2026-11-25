@@ -233,7 +233,7 @@ fn find_location(images: &[UserImage], addr: u64) -> Option<(&str, u32)> {
 }
 
 /// Runtime OS page size in bytes (`4096`, `16384`, or `65536` on Linux `aarch64`).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn system_page_size() -> u64 {
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if n > 0 && (n as u64).is_power_of_two() {
@@ -243,7 +243,7 @@ pub(crate) fn system_page_size() -> u64 {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn system_page_size() -> u64 {
     4096
 }
