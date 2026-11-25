@@ -41,7 +41,6 @@ const MAX_LOCAL_ENTRIES: u32 = 32_768;
 const MAX_NSYMS: u32 = 2_000_000;
 const MAX_EXPORT_TRIE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TRIE_NODES: usize = 200_000;
-const MAX_CACHED_TEXT_UNWIND_BYTES: u64 = 640 * 1024;
 
 const LC_DYLD_INFO: u32 = 0x22;
 const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
@@ -345,11 +344,6 @@ impl DyldSharedCache {
         })
     }
 
-    /// Whether `dylib_path` is indexed in this shared cache.
-    pub(crate) fn contains_image(&self, dylib_path: &str) -> bool {
-        self.images_by_path.contains_key(dylib_path)
-    }
-
     /// Read only `__TEXT` bounds and Compact Unwind / `__eh_frame` sections for
     /// `dylib_path`, deferring symbol table and `.symbols` parsing until needed.
     pub(crate) fn load_unwind(
@@ -529,7 +523,6 @@ impl DyldSharedCache {
             base_svma,
             ..Default::default()
         };
-        let mut text_range = None;
         let mut unwind_range = None;
         let mut eh_range = None;
 
@@ -561,7 +554,6 @@ impl DyldSharedCache {
                 match (seg, sect) {
                     ("__TEXT", "__text") if unwind.text_svma.is_none() => {
                         unwind.text_svma = Some(range);
-                        text_range = Some((addr, size));
                     }
                     ("__TEXT", "__stubs") if unwind.stubs_svma.is_none() => {
                         unwind.stubs_svma = Some(range);
@@ -592,13 +584,6 @@ impl DyldSharedCache {
         if let Some((addr, size)) = eh_range {
             unwind.eh_frame = self
                 .read_vm_bytes(addr, size, MAX_EH_FRAME_BYTES)
-                .map(SectionBytes::new);
-        }
-        if unwind.has_unwind_data()
-            && let Some((addr, size)) = text_range
-        {
-            unwind.text = self
-                .read_vm_bytes(addr, size, MAX_CACHED_TEXT_UNWIND_BYTES)
                 .map(SectionBytes::new);
         }
         unwind

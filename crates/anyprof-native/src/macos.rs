@@ -110,6 +110,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
     let started = Instant::now();
     let mut next = started;
     let mut collector = SampleCollector::new();
+    let mut cache_activated = false;
     loop {
         if opts.stop.stop_requested() {
             break;
@@ -156,6 +157,10 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
                 }
                 break;
             }
+        }
+        if !cache_activated && !opts.stop.stop_requested() {
+            cache_activated = true;
+            symbols.activate_shared_cache(&mut unwinder);
         }
         next += interval;
         let now = Instant::now();
@@ -977,6 +982,7 @@ pub(crate) fn read_memory(task: task_t, addr: u64, buf: &mut [u8]) -> bool {
 
 enum ImageSource {
     File(String),
+    PendingCache(String),
     SharedCache(String),
     None,
 }
@@ -990,7 +996,7 @@ struct TrackedImage {
 struct SymbolTable {
     pid: u32,
     cpu: MachCpu,
-    shared_cache: Option<&'static crate::dyld_cache::DyldSharedCache>,
+    shared_cache: Option<Option<&'static crate::dyld_cache::DyldSharedCache>>,
     info_addr: Option<u64>,
     seen_dyld_count: Option<u32>,
     seen_loads: std::collections::HashSet<u64>,
@@ -1000,12 +1006,10 @@ struct SymbolTable {
 
 impl SymbolTable {
     fn new(pid: u32) -> Self {
-        let cpu = MachCpu::host();
-        let shared_cache = crate::dyld_cache::DyldSharedCache::host(cpu);
         Self {
             pid,
-            cpu,
-            shared_cache,
+            cpu: MachCpu::host(),
+            shared_cache: None,
             info_addr: None,
             seen_dyld_count: None,
             seen_loads: std::collections::HashSet::new(),
@@ -1076,15 +1080,37 @@ impl SymbolTable {
         }
     }
 
+    fn activate_shared_cache(&mut self, unwinder: &mut MachUnwinder) {
+        let cpu = self.cpu;
+        let Some(cache) = *self
+            .shared_cache
+            .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
+        else {
+            return;
+        };
+        for entry in &mut self.images {
+            let ImageSource::PendingCache(path) = &entry.source else {
+                continue;
+            };
+            let path = path.clone();
+            if let Some(parsed) =
+                cache.load_unwind(&path, entry.symbols.start, &entry.symbols.module)
+            {
+                parsed.register_unwind_module(unwinder);
+                entry.symbols = parsed;
+                entry.source = ImageSource::SharedCache(path);
+                entry.symbols_loaded = false;
+            } else {
+                entry.source = ImageSource::None;
+                entry.symbols_loaded = true;
+            }
+        }
+    }
+
     fn load_tracked_unwind(&self, remote: RemoteImage) -> Option<TrackedImage> {
         let module = module_name(&remote.path);
-        let in_cache_only = self
-            .shared_cache
-            .is_some_and(|cache| cache.contains_image(&remote.path))
-            && !Path::new(&remote.path).is_file();
-
-        if !in_cache_only {
-            let path = Path::new(&remote.path);
+        let path = Path::new(&remote.path);
+        if path.is_file() {
             let file_unwind = ImageSymbols::parse_unwind_file(path, remote.load, &module, self.cpu);
             let rust_image = crate::rust_image::file_is_rust(path);
             let go = attach_go(&remote.path, remote.load);
@@ -1097,10 +1123,21 @@ impl SymbolTable {
                     symbols_loaded: false,
                 });
             }
-            if let Some(parsed) = self
-                .shared_cache
-                .and_then(|cache| cache.load_unwind(&remote.path, remote.load, &module))
-            {
+            if remote.end > remote.load {
+                let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
+                image.rust_image = rust_image;
+                image.go = go;
+                return Some(TrackedImage {
+                    symbols: image,
+                    source: ImageSource::PendingCache(remote.path),
+                    symbols_loaded: false,
+                });
+            }
+            return None;
+        }
+
+        if let Some(Some(cache)) = self.shared_cache {
+            if let Some(parsed) = cache.load_unwind(&remote.path, remote.load, &module) {
                 return Some(TrackedImage {
                     symbols: parsed,
                     source: ImageSource::SharedCache(remote.path),
@@ -1108,11 +1145,8 @@ impl SymbolTable {
                 });
             }
             if remote.end > remote.load {
-                let mut image = ImageSymbols::range_only(remote.load, remote.end, module);
-                image.rust_image = rust_image;
-                image.go = go;
                 return Some(TrackedImage {
-                    symbols: image,
+                    symbols: ImageSymbols::range_only(remote.load, remote.end, module),
                     source: ImageSource::None,
                     symbols_loaded: true,
                 });
@@ -1120,21 +1154,11 @@ impl SymbolTable {
             return None;
         }
 
-        if let Some(parsed) = self
-            .shared_cache
-            .and_then(|cache| cache.load_unwind(&remote.path, remote.load, &module))
-        {
-            return Some(TrackedImage {
-                symbols: parsed,
-                source: ImageSource::SharedCache(remote.path),
-                symbols_loaded: false,
-            });
-        }
         if remote.end > remote.load {
             return Some(TrackedImage {
                 symbols: ImageSymbols::range_only(remote.load, remote.end, module),
-                source: ImageSource::None,
-                symbols_loaded: true,
+                source: ImageSource::PendingCache(remote.path),
+                symbols_loaded: false,
             });
         }
         None
@@ -1163,6 +1187,8 @@ impl SymbolTable {
     }
 
     fn ensure_symbols_loaded(&mut self, idx: usize) {
+        let cpu = self.cpu;
+        let shared_cache = &mut self.shared_cache;
         let Some(entry) = self.images.get_mut(idx) else {
             return;
         };
@@ -1172,12 +1198,28 @@ impl SymbolTable {
         entry.symbols_loaded = true;
         match &entry.source {
             ImageSource::File(path) => {
-                entry
-                    .symbols
-                    .populate_file_symbols(Path::new(path), self.cpu);
+                entry.symbols.populate_file_symbols(Path::new(path), cpu);
+            }
+            ImageSource::PendingCache(path) => {
+                let path = path.clone();
+                if let Some(cache) = *shared_cache
+                    .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
+                {
+                    if let Some(mut parsed) =
+                        cache.load_unwind(&path, entry.symbols.start, &entry.symbols.module)
+                    {
+                        cache.populate_symbols(&path, &mut parsed);
+                        entry.symbols = parsed;
+                        entry.source = ImageSource::SharedCache(path);
+                    } else {
+                        cache.populate_symbols(&path, &mut entry.symbols);
+                    }
+                }
             }
             ImageSource::SharedCache(path) => {
-                if let Some(cache) = self.shared_cache {
+                if let Some(cache) = *shared_cache
+                    .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
+                {
                     cache.populate_symbols(path, &mut entry.symbols);
                 }
             }
