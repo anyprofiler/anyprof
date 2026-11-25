@@ -17,38 +17,59 @@ use crate::script_hints;
 
 const WAIT: Duration = Duration::from_secs(5);
 
+pub(crate) struct AttachedInspector {
+    pub websocket_url: String,
+    pub activated_by_us: bool,
+}
+
 pub(crate) fn inspector_websocket(
     pid: u32,
     cmdline: &[String],
     inspect: Option<&str>,
-) -> Result<String, Error> {
+) -> Result<AttachedInspector, Error> {
     let hints = script_hints(cmdline);
     if let Some(raw) = inspect {
         let endpoint = parse_inspect(raw).map_err(fail)?;
-        if let Some(url) = endpoint.websocket_url.clone() {
-            tracing::info!(pid, %url, "using the inspector websocket from --inspect");
-            return Ok(url);
+        if let Some(websocket_url) = endpoint.websocket_url.clone() {
+            tracing::info!(pid, %websocket_url, "using the inspector websocket from --inspect");
+            return Ok(AttachedInspector {
+                websocket_url,
+                activated_by_us: false,
+            });
         }
-        if let Some(url) = try_endpoint(&endpoint, &hints) {
-            return Ok(url);
+        if let Some(websocket_url) = try_endpoint(&endpoint, &hints) {
+            return Ok(AttachedInspector {
+                websocket_url,
+                activated_by_us: false,
+            });
         }
         activate(pid)?;
-        return poll_endpoint(&endpoint, &hints).ok_or_else(|| {
+        let websocket_url = poll_endpoint(&endpoint, &hints).ok_or_else(|| {
             fail(format!(
                 "inspector did not answer at {}:{} after activation",
                 endpoint.host, endpoint.port
             ))
+        })?;
+        return Ok(AttachedInspector {
+            websocket_url,
+            activated_by_us: true,
         });
     }
 
-    if let Some(url) = try_discovered(pid, &hints) {
-        return Ok(url);
+    if let Some(websocket_url) = try_discovered(pid, &hints) {
+        return Ok(AttachedInspector {
+            websocket_url,
+            activated_by_us: false,
+        });
     }
     activate(pid)?;
     let deadline = Instant::now() + WAIT;
     loop {
-        if let Some(url) = try_discovered(pid, &hints) {
-            return Ok(url);
+        if let Some(websocket_url) = try_discovered(pid, &hints) {
+            return Ok(AttachedInspector {
+                websocket_url,
+                activated_by_us: true,
+            });
         }
         if Instant::now() >= deadline {
             break;
@@ -60,10 +81,14 @@ pub(crate) fn inspector_websocket(
         port: 9229,
         websocket_url: None,
     };
-    try_endpoint(&fallback, &hints).ok_or_else(|| {
+    let websocket_url = try_endpoint(&fallback, &hints).ok_or_else(|| {
         fail(
             "inspector did not open a node target on a port this process is listening on, or on 127.0.0.1:9229. Pass --inspect with the port or websocket URL",
         )
+    })?;
+    Ok(AttachedInspector {
+        websocket_url,
+        activated_by_us: true,
     })
 }
 

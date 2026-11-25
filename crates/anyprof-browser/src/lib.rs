@@ -93,8 +93,15 @@ impl Backend for BrowserBackend {
                 .unwrap_or_else(|| self.default_sampling_interval()),
         );
         tracing::info!(%websocket, ?opts.duration, interval_us, "profiling browser tab");
-        let bytes = capture_cpu_profile(&websocket, opts.duration, interval_us, None, &opts.stop)
-            .map_err(|err| Error::backend(self.name(), err.to_string()))?;
+        let bytes = capture_cpu_profile(
+            &websocket,
+            opts.duration,
+            interval_us,
+            None,
+            false,
+            &opts.stop,
+        )
+        .map_err(|err| Error::backend(self.name(), err.to_string()))?;
         let mut imported = import_cpuprofile(&bytes, Runtime::Browser)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
         imported.raw_cpuprofile = Some(bytes);

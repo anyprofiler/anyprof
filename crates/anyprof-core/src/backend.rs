@@ -116,6 +116,9 @@ pub struct RecordOptions {
     pub inspect: Option<String>,
     /// Browser tab selector: target id, or a substring of the page URL or title.
     pub tab: Option<String>,
+    /// Leave a Node.js inspector listening after sampling when anyprof had to
+    /// activate it. An inspector that was already open is never closed.
+    pub keep_inspector: bool,
     /// Set when the user asks to end sampling. The sampler still returns a profile.
     pub stop: Arc<StopGate>,
 }
@@ -128,6 +131,7 @@ impl Default for RecordOptions {
             include_kernel: false,
             inspect: None,
             tab: None,
+            keep_inspector: false,
             stop: StopGate::new(),
         }
     }

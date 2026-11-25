@@ -4,17 +4,56 @@ use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::io::Read;
 #[cfg(unix)]
 use std::sync::Arc;
-#[cfg(unix)]
-use std::time::Instant;
 
-/// The CLI live tests both need 127.0.0.1:9229.
+/// The CLI live tests and `anyprof-node`'s 9229 test share `127.0.0.1:9229`
+/// across test binaries.
 static PORT_9229: Mutex<()> = Mutex::new(());
+
+struct Port9229Lock {
+    path: std::path::PathBuf,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Port9229Lock {
+    fn acquire() -> Self {
+        let guard = PORT_9229.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join("anyprof-port-9229.lock");
+        let start = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => {
+                    return Self {
+                        path,
+                        _guard: guard,
+                    };
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if start.elapsed() > Duration::from_secs(120) {
+                        panic!("timed out waiting for {path:?}");
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => panic!("lock {path:?}: {err}"),
+            }
+        }
+    }
+}
+
+impl Drop for Port9229Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 fn anyprof(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_anyprof"))
@@ -166,7 +205,7 @@ fn assert_devtools_profile(bytes: &[u8], script_name: &str) {
 
 #[test]
 fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
-    let _port = PORT_9229.lock().unwrap_or_else(|err| err.into_inner());
+    let _port = Port9229Lock::acquire();
     if !node_available() {
         eprintln!("skipping live cpuprofile record: node is not on PATH");
         return;
@@ -337,7 +376,7 @@ fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
 #[cfg(unix)]
 #[test]
 fn sigint_ends_an_open_recording_and_writes_the_profile() {
-    let _port = PORT_9229.lock().unwrap_or_else(|err| err.into_inner());
+    let _port = Port9229Lock::acquire();
     if !node_available() {
         eprintln!("skipping sigint record: node is not on PATH");
         return;

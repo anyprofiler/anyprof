@@ -95,17 +95,19 @@ impl Backend for NodeBackend {
             ));
         }
 
-        let websocket =
+        let attached =
             attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
         let interval_us = sampling_interval_us(
             opts.sampling_interval
                 .unwrap_or_else(|| self.default_sampling_interval()),
         );
+        let close_inspector = attached.activated_by_us && !opts.keep_inspector;
         let bytes = capture_cpu_profile(
-            &websocket,
+            &attached.websocket_url,
             opts.duration,
             interval_us,
             Some(target.pid),
+            close_inspector,
             &opts.stop,
         )
         .map_err(|err| Error::backend(self.name(), err.to_string()))?;

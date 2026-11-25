@@ -70,6 +70,7 @@ pub fn run(args: RecordArgs, verbose: u8) -> anyhow::Result<()> {
                 include_kernel: args.kernel,
                 inspect: args.inspect.clone(),
                 tab: args.tab.clone(),
+                keep_inspector: args.keep_inspector,
                 stop: Arc::clone(&stop),
             },
         )
@@ -301,6 +302,11 @@ fn validate(args: &RecordArgs) -> anyhow::Result<()> {
     if args.duration.is_some_and(|duration| duration.is_zero()) {
         return Err(anyhow!("--duration must be greater than zero"));
     }
+    if args.keep_inspector && args.browser {
+        return Err(anyhow!(
+            "--keep-inspector applies to Node.js and cannot be combined with --browser"
+        ));
+    }
     if args
         .interval
         .is_some_and(|interval| interval < Duration::from_micros(1))
@@ -429,6 +435,14 @@ mod tests {
         let zero = record(&["--pid", "1", "-w", "--web-timeout", "0s"]);
         let message = validate(&zero).unwrap_err().to_string();
         assert!(message.contains("--web-timeout"), "{message}");
+    }
+
+    #[test]
+    fn keep_inspector_rejects_browser_and_accepts_pid() {
+        let bad = record(&["--browser", "--keep-inspector"]);
+        let message = validate(&bad).unwrap_err().to_string();
+        assert!(message.contains("--keep-inspector"), "{message}");
+        assert!(validate(&record(&["--pid", "1", "--keep-inspector"])).is_ok());
     }
 
     #[test]
