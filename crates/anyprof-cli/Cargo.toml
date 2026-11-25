@@ -13,6 +13,10 @@ description = "anyprof command-line interface."
 name = "anyprof"
 path = "src/main.rs"
 
+[features]
+default = []
+self-update = ["dep:axoupdater", "dep:tokio"]
+
 [dependencies]
 anyprof-browser.workspace = true
 anyprof-core.workspace = true
@@ -25,12 +29,12 @@ anyprof-rust.workspace = true
 anyprof-node.workspace = true
 anyprof-web.workspace = true
 anyhow.workspace = true
-axoupdater.workspace = true
+axoupdater = { workspace = true, optional = true }
 clap.workspace = true
 ctrlc.workspace = true
 humantime.workspace = true
 jiff.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

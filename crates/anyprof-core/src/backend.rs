@@ -90,6 +90,48 @@ pub fn interval_for_frequency(hertz: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / u64::from(hertz.max(1)))
 }
 
+/// Which language-runtime frame unwinders the native sampler may activate.
+///
+/// Explicit `--backend native` ([`RecordOptions::default`]) uses [`Self::None`]
+/// so profiling a Python, Java, or Go process with `-b native` captures its
+/// underlying C/C++/assembly stacks instead of replacing them with VM frames.
+/// Language backends (`GoBackend`, `PythonBackend`, `JavaBackend`) select their
+/// corresponding runtime unwinder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LanguageUnwind {
+    /// Unwind native C/C++/Rust stacks only; never replace frames with VM stacks.
+    #[default]
+    None,
+    /// Unwind Go goroutine stacks via `pclntab` when on a Go PC.
+    Go,
+    /// Unwind CPython interpreter frames when inside the CPython runtime.
+    Python,
+    /// Unwind HotSpot Java frames when inside the JVM code cache.
+    Java,
+    /// Enable all supported language-runtime unwinders (`Go`, `Python`, `Java`).
+    Auto,
+}
+
+impl LanguageUnwind {
+    /// Whether Go `pclntab` unwinding is enabled.
+    #[must_use]
+    pub const fn allows_go(self) -> bool {
+        matches!(self, Self::Go | Self::Auto)
+    }
+
+    /// Whether CPython interpreter frame walking is enabled.
+    #[must_use]
+    pub const fn allows_python(self) -> bool {
+        matches!(self, Self::Python | Self::Auto)
+    }
+
+    /// Whether HotSpot JVM code-cache frame walking is enabled.
+    #[must_use]
+    pub const fn allows_java(self) -> bool {
+        matches!(self, Self::Java | Self::Auto)
+    }
+}
+
 /// Options for one recording session.
 ///
 /// [`RecordOptions::default`] samples for 30 seconds at the backend's default
@@ -99,7 +141,8 @@ pub fn interval_for_frequency(hertz: u32) -> Duration {
 pub struct RecordOptions {
     /// How long to sample.
     ///
-    /// `None` means sample until [`Self::stop`] is signaled. `Some(0)` is rejected.
+    /// `None` means sample until [`Self::stop`] is signaled or [`Session::stop`]
+    /// is called. `Some(0)` is rejected.
     pub duration: Option<Duration>,
     /// Time between samples.
     ///
@@ -119,6 +162,8 @@ pub struct RecordOptions {
     /// Leave a Node.js inspector listening after sampling when anyprof had to
     /// activate it. An inspector that was already open is never closed.
     pub keep_inspector: bool,
+    /// Language-runtime unwinder policy used by the native sampler.
+    pub language_unwind: LanguageUnwind,
     /// Set when the user asks to end sampling. The sampler still returns a profile.
     pub stop: Arc<StopGate>,
 }
@@ -132,6 +177,7 @@ impl Default for RecordOptions {
             inspect: None,
             tab: None,
             keep_inspector: false,
+            language_unwind: LanguageUnwind::None,
             stop: StopGate::new(),
         }
     }

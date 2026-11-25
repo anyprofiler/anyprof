@@ -11,11 +11,12 @@
 //! `Profiler.setSamplingInterval`, `Profiler.start`, and `Profiler.stop`.
 //! Frames are stamped [`anyprof_core::Runtime::Browser`].
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyprof_cdp::{
-    InspectEndpoint, capture_cpu_profile, choose_page, list_targets, parse_inspect,
-    sampling_interval_us,
+    CdpSession, InspectEndpoint, choose_page, list_targets, parse_inspect, sampling_interval_us,
+    start_cpu_profile,
 };
 use anyprof_core::{
     Backend, Capabilities, DEVTOOLS_SAMPLING_INTERVAL, Error, Format, Profile, RecordOptions,
@@ -93,20 +94,21 @@ impl Backend for BrowserBackend {
                 .unwrap_or_else(|| self.default_sampling_interval()),
         );
         tracing::info!(%websocket, ?opts.duration, interval_us, "profiling browser tab");
-        let bytes = capture_cpu_profile(
+        let cdp = start_cpu_profile(
             &websocket,
             opts.duration,
             interval_us,
             None,
             false,
-            &opts.stop,
+            Arc::clone(&opts.stop),
         )
         .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        let mut imported = import_cpuprofile(&bytes, Runtime::Browser)
-            .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        imported.raw_cpuprofile = Some(bytes);
-        Ok(Box::new(ReadySession {
-            profile: finish_profile(imported, target.pid, opts, interval_us),
+        Ok(Box::new(BrowserSession {
+            cdp,
+            pid: target.pid,
+            started_at: Instant::now(),
+            requested_duration: opts.duration,
+            interval_us,
         }))
     }
 }
@@ -114,14 +116,13 @@ impl Backend for BrowserBackend {
 fn finish_profile(
     mut profile: Profile,
     pid: u32,
-    opts: &RecordOptions,
+    elapsed: Duration,
+    requested_duration: Option<Duration>,
     interval_us: u32,
 ) -> Profile {
     profile.pid = pid;
-    if profile.duration.is_zero()
-        && let Some(duration) = opts.duration
-    {
-        profile.duration = duration;
+    if profile.duration.is_zero() {
+        profile.duration = requested_duration.unwrap_or(elapsed);
     }
     if profile.period.is_none() {
         profile.period = Some(Duration::from_micros(u64::from(interval_us)));
@@ -129,13 +130,37 @@ fn finish_profile(
     profile
 }
 
-struct ReadySession {
-    profile: Profile,
+struct BrowserSession {
+    cdp: CdpSession,
+    pid: u32,
+    started_at: Instant,
+    requested_duration: Option<Duration>,
+    interval_us: u32,
 }
 
-impl Session for ReadySession {
+impl Session for BrowserSession {
     fn stop(self: Box<Self>) -> Result<Profile, Error> {
-        Ok(self.profile)
+        let Self {
+            cdp,
+            pid,
+            started_at,
+            requested_duration,
+            interval_us,
+        } = *self;
+        let bytes = cdp
+            .stop()
+            .map_err(|err| Error::backend("browser", err.to_string()))?;
+        let elapsed = started_at.elapsed();
+        let mut imported = import_cpuprofile(&bytes, Runtime::Browser)
+            .map_err(|err| Error::backend("browser", err.to_string()))?;
+        imported.raw_cpuprofile = Some(bytes);
+        Ok(finish_profile(
+            imported,
+            pid,
+            elapsed,
+            requested_duration,
+            interval_us,
+        ))
     }
 }
 

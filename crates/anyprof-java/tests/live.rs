@@ -291,8 +291,8 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             &anyprof_core::Target { pid },
             &record(Duration::from_secs(1)),
         );
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
         if refused {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             let message = match started {
                 Err(err) => err.to_string(),
                 Ok(_) => panic!(
@@ -305,8 +305,16 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
-        let session = started.unwrap_or_else(|err| panic!("unrelated java sample failed: {err}"));
+        let session = match started {
+            Ok(session) => session,
+            Err(err) => {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                panic!("unrelated java sample failed: {err}");
+            }
+        };
+        std::thread::sleep(Duration::from_secs(1));
         let profile = session.stop().expect("stop");
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
         assert_spin_stack(&profile);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -366,10 +374,11 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
+        std::thread::sleep(Duration::from_secs(1));
         let alive = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
         let _ = child.kill();
         let _ = child.wait();
-        let profile = session.stop().expect("stop");
         assert!(alive, "the Java process exited during the profile");
         assert_spin_stack(&profile);
         assert_exports(&profile);
@@ -415,10 +424,11 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
+        std::thread::sleep(Duration::from_millis(500));
         let alive = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
         let _ = child.kill();
         let _ = child.wait();
-        let profile = session.stop().expect("stop");
         let fixture = weight_named(&profile, "AnyprofSpin.");
         assert!(
             fixture == 0,
@@ -462,10 +472,11 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
+        std::thread::sleep(Duration::from_secs(2));
         let alive = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
         let _ = child.kill();
         let _ = child.wait();
-        let profile = session.stop().expect("stop");
         let a = weight_named(&profile, "AnyprofSpin.spinA");
         let b = weight_named(&profile, "AnyprofSpin.spinB");
         assert!(
@@ -541,10 +552,11 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
+        std::thread::sleep(Duration::from_millis(1500));
         let alive = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
         let _ = child.kill();
         let _ = child.wait();
-        let profile = session.stop().expect("stop");
         assert!(
             alive,
             "the alternating Java process exited during the profile"

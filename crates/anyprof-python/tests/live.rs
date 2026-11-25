@@ -210,8 +210,8 @@ os.execv(sys.executable, [sys.executable, script, counter])
                     ..anyprof_core::RecordOptions::default()
                 },
             );
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             if refused {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
                 let message = match started {
                     Err(err) => err.to_string(),
                     Ok(_) => panic!(
@@ -234,12 +234,17 @@ os.execv(sys.executable, [sys.executable, script, counter])
             } else {
                 let session = match started {
                     Ok(session) => session,
-                    Err(err) => panic!(
-                        "ptrace_scope {scope:?} should read {} (root {root}): {err}",
-                        python.display()
-                    ),
+                    Err(err) => {
+                        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                        panic!(
+                            "ptrace_scope {scope:?} should read {} (root {root}): {err}",
+                            python.display()
+                        );
+                    }
                 };
+                std::thread::sleep(Duration::from_secs(1));
                 let profile = session.stop().expect("stop");
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
                 assert_spin_profile(&profile, pid, &script, &python);
                 assert_exports(&profile);
             }
@@ -300,6 +305,35 @@ os.execv(sys.executable, [sys.executable, script, counter])
                 "{} must be detected as CPython",
                 python.display()
             );
+
+            // Explicit `NativeBackend` (`LanguageUnwind::None` default) must
+            // profile the CPython interpreter's underlying native C stacks
+            // without replacing them with `Runtime::Python` bytecode frames.
+            if let Ok(native_session) = anyprof_native::NativeBackend.start(
+                &anyprof_core::Target { pid },
+                &anyprof_core::RecordOptions {
+                    duration: None,
+                    sampling_interval: Some(Duration::from_millis(10)),
+                    ..anyprof_core::RecordOptions::default()
+                },
+            ) {
+                std::thread::sleep(Duration::from_millis(250));
+                let native_profile = native_session.stop().expect("stop native session");
+                assert!(
+                    native_profile.total_weight() > 0,
+                    "NativeBackend should collect C frames from spinning CPython"
+                );
+                assert!(
+                    native_profile
+                        .stacks
+                        .iter()
+                        .flat_map(|stack| stack.frames.iter())
+                        .all(|frame| frame.runtime != Runtime::Python),
+                    "NativeBackend with LanguageUnwind::None must not replace CPython C frames with Python VM frames:\n{}",
+                    explain(&native_profile)
+                );
+            }
+
             let started = PythonBackend.start(
                 &anyprof_core::Target { pid },
                 &anyprof_core::RecordOptions {
@@ -314,10 +348,11 @@ os.execv(sys.executable, [sys.executable, script, counter])
                 let _ = std::fs::remove_dir_all(&dir);
                 return;
             };
+            std::thread::sleep(Duration::from_secs(1));
             let still_running = child.try_wait().ok().flatten().is_none();
+            let profile = session.stop().expect("stop");
             let _ = child.kill();
             let _ = child.wait();
-            let profile = session.stop().expect("stop");
             assert!(
                 still_running,
                 "{} exited during the profile",
@@ -357,10 +392,11 @@ os.execv(sys.executable, [sys.executable, script, counter])
                 let _ = std::fs::remove_dir_all(&dir);
                 return;
             };
+            std::thread::sleep(Duration::from_millis(500));
             let alive = child.try_wait().ok().flatten().is_none();
+            let profile = session.stop().expect("stop");
             let _ = child.kill();
             let _ = child.wait();
-            let profile = session.stop().expect("stop");
             let parked = weight_named(&profile, "parked");
             let total = profile.total_weight();
             assert!(
@@ -424,10 +460,11 @@ os.execv(sys.executable, [sys.executable, script, counter])
                 let _ = std::fs::remove_dir_all(&dir);
                 return;
             };
+            std::thread::sleep(Duration::from_secs(2));
             let alive = child.try_wait().ok().flatten().is_none();
+            let profile = session.stop().expect("stop");
             let _ = child.kill();
             let _ = child.wait();
-            let profile = session.stop().expect("stop");
             let a = weight_named(&profile, "spin_a");
             let b = weight_named(&profile, "spin_b");
             assert!(

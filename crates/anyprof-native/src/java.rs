@@ -1541,130 +1541,53 @@ struct ElfHotspot {
 
 #[cfg(target_os = "linux")]
 fn elf_hotspot(path: &Path) -> Result<ElfHotspot, String> {
-    let mut file = std::fs::File::open(path).map_err(|_| {
+    use object::LittleEndian;
+    use object::elf;
+    use object::read::elf::{FileHeader as _, Sym as _};
+
+    let file = std::fs::File::open(path).map_err(|_| {
         format!(
             "libjvm at {} could not be opened, so Java methods were not read",
             path.display()
         )
     })?;
-    use std::io::{Read, Seek, SeekFrom};
-    let mut ident = [0u8; 16];
-    file.read_exact(&mut ident).map_err(|_| elf_reject(path))?;
-    if ident[0..4] != [0x7f, b'E', b'L', b'F'] || ident[4] != 2 || ident[5] != 1 {
-        return Err(elf_reject(path));
-    }
-    let mut ehdr = [0u8; 64];
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| elf_reject(path))?;
-    file.read_exact(&mut ehdr).map_err(|_| elf_reject(path))?;
-    let machine = u16::from_le_bytes(ehdr[18..20].try_into().unwrap());
+    let cache = object::ReadCache::new(file);
+    let parsed = crate::binfmt::parse_elf64(&cache, 10_000).ok_or_else(|| elf_reject(path))?;
+    let machine = parsed.header.e_machine(LittleEndian);
     let arch = match machine {
-        62 => JvmArch::X86_64,
-        183 => JvmArch::Aarch64,
+        elf::EM_X86_64 => JvmArch::X86_64,
+        elf::EM_AARCH64 => JvmArch::Aarch64,
         _ => {
             return Err(format!(
-                "libjvm at {} has ELF machine {machine}, which this build does not walk",
-                path.display()
+                "libjvm at {} has ELF machine {}, which this build does not walk",
+                path.display(),
+                machine.0
             ));
         }
     };
-    let phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
-    let shoff = u64::from_le_bytes(ehdr[40..48].try_into().unwrap());
-    let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap());
-    let phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
-    let shentsize = u16::from_le_bytes(ehdr[58..60].try_into().unwrap());
-    let shnum = u16::from_le_bytes(ehdr[60..62].try_into().unwrap());
-    if phentsize < 56 || shentsize < 64 || phnum > 128 || shnum > 10_000 {
-        return Err(elf_reject(path));
-    }
-    let mut load_offset = None;
-    let mut load_vaddr = None;
-    for index in 0..phnum {
-        let mut ph = vec![0u8; usize::from(phentsize)];
-        let at = phoff
-            .checked_add(u64::from(index) * u64::from(phentsize))
-            .ok_or_else(|| elf_reject(path))?;
-        file.seek(SeekFrom::Start(at))
-            .map_err(|_| elf_reject(path))?;
-        file.read_exact(&mut ph).map_err(|_| elf_reject(path))?;
-        let kind = u32::from_le_bytes(ph[0..4].try_into().unwrap());
-        if kind != 1 {
-            continue;
-        }
-        let offset = u64::from_le_bytes(ph[8..16].try_into().unwrap());
-        let vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
-        if load_vaddr.is_none_or(|current| vaddr < current) {
-            load_offset = Some(offset);
-            load_vaddr = Some(vaddr);
-        }
-    }
-    let (Some(load_offset), Some(load_vaddr)) = (load_offset, load_vaddr) else {
+    let Some(lowest_load) = parsed.loads.iter().min_by_key(|load| load.vaddr).copied() else {
         return Err(elf_reject(path));
     };
-    let mut sections = Vec::with_capacity(usize::from(shnum));
-    for index in 0..shnum {
-        let mut sh = vec![0u8; usize::from(shentsize)];
-        let at = shoff
-            .checked_add(u64::from(index) * u64::from(shentsize))
-            .ok_or_else(|| elf_reject(path))?;
-        file.seek(SeekFrom::Start(at))
-            .map_err(|_| elf_reject(path))?;
-        file.read_exact(&mut sh).map_err(|_| elf_reject(path))?;
-        sections.push(sh);
-    }
     let mut wanted: HashMap<String, u64> = HashMap::new();
-    for kind in [11u32, 2] {
+    for kind in [elf::SHT_DYNSYM, elf::SHT_SYMTAB] {
         if wanted.len() == HOTSPOT_SYMBOLS.len() {
             break;
         }
-        for section in &sections {
-            let section_type = u32::from_le_bytes(section[4..8].try_into().unwrap());
-            if section_type != kind {
-                continue;
-            }
-            let offset = u64::from_le_bytes(section[24..32].try_into().unwrap());
-            let size = u64::from_le_bytes(section[32..40].try_into().unwrap());
-            let link = u32::from_le_bytes(section[40..44].try_into().unwrap());
-            let entsize = u64::from_le_bytes(section[56..64].try_into().unwrap());
-            if entsize < 24 || size > 64 * 1024 * 1024 || link as usize >= sections.len() {
-                continue;
-            }
-            let strings = &sections[link as usize];
-            let str_off = u64::from_le_bytes(strings[24..32].try_into().unwrap());
-            let str_size = u64::from_le_bytes(strings[32..40].try_into().unwrap());
-            if str_size > 64 * 1024 * 1024 {
-                continue;
-            }
-            let mut table = vec![0u8; size as usize];
-            file.seek(SeekFrom::Start(offset))
-                .map_err(|_| elf_reject(path))?;
-            file.read_exact(&mut table).map_err(|_| elf_reject(path))?;
-            let mut names = vec![0u8; str_size as usize];
-            file.seek(SeekFrom::Start(str_off))
-                .map_err(|_| elf_reject(path))?;
-            file.read_exact(&mut names).map_err(|_| elf_reject(path))?;
-            let count = (size / entsize) as usize;
-            for index in 0..count {
-                let at = index * entsize as usize;
-                let name_off = u32::from_le_bytes(table[at..at + 4].try_into().unwrap()) as usize;
-                let shndx = u16::from_le_bytes(table[at + 6..at + 8].try_into().unwrap());
-                let value = u64::from_le_bytes(table[at + 8..at + 16].try_into().unwrap());
-                if shndx == 0 || name_off >= names.len() {
-                    continue;
+        crate::binfmt::visit_elf64_symbols(
+            &cache,
+            &parsed.sections,
+            kind,
+            2_700_000,
+            64 * 1024 * 1024,
+            |name, sym| {
+                if sym.st_shndx(LittleEndian) == elf::SHN_UNDEF {
+                    return;
                 }
-                let end = names[name_off..]
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .map(|pos| name_off + pos)
-                    .unwrap_or(names.len());
-                let Ok(name) = std::str::from_utf8(&names[name_off..end]) else {
-                    continue;
-                };
                 if HOTSPOT_SYMBOLS.contains(&name) && !wanted.contains_key(name) {
-                    wanted.insert(name.to_string(), value);
+                    wanted.insert(name.to_string(), sym.st_value(LittleEndian));
                 }
-            }
-        }
+            },
+        );
     }
     if let Some(missing) = HOTSPOT_SYMBOLS
         .iter()
@@ -1677,8 +1600,8 @@ fn elf_hotspot(path: &Path) -> Result<ElfHotspot, String> {
     }
     Ok(ElfHotspot {
         arch,
-        load_offset,
-        load_vaddr,
+        load_offset: lowest_load.offset,
+        load_vaddr: lowest_load.vaddr,
         values: wanted,
     })
 }
@@ -1817,19 +1740,12 @@ fn macos_regions_have_libjvm(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn macos_exe_is_java(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
+    let Some(path) = anyprof_core::executable_file(pid) else {
         return false;
     };
-    let mut buf = vec![0u8; 4 * 1024];
-    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-    if n <= 0 {
-        return false;
-    }
-    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(n as usize);
-    let Ok(text) = std::str::from_utf8(&buf[..end]) else {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    let name = text.rsplit('/').next().unwrap_or(text);
     name.eq_ignore_ascii_case("java") || name.eq_ignore_ascii_case("javaw")
 }
 
@@ -1843,7 +1759,6 @@ unsafe extern "C" {
         buffer: *mut std::ffi::c_void,
         buffersize: i32,
     ) -> i32;
-    fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_char, buffersize: u32) -> i32;
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -1939,150 +1854,49 @@ fn windows_libjvm(
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn pe_hotspot(path: &Path, base: u64) -> Result<(HashMap<String, u64>, JvmArch), String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).map_err(|_| {
+    use crate::binfmt::{Pe64Error, PeExportError, parse_pe64, walk_pe64_exports};
+
+    let file = std::fs::File::open(path).map_err(|_| {
         format!(
             "jvm.dll at {} could not be opened, so Java methods were not read",
             path.display()
         )
     })?;
-    let mut dos = [0u8; 64];
-    file.read_exact(&mut dos).map_err(|_| pe_reject(path))?;
-    if dos[0] != b'M' || dos[1] != b'Z' {
-        return Err(pe_reject(path));
-    }
-    let e_lfanew = u32::from_le_bytes(dos[0x3c..0x40].try_into().unwrap());
-    if e_lfanew > 1024 * 1024 {
-        return Err(pe_reject(path));
-    }
-    file.seek(SeekFrom::Start(u64::from(e_lfanew)))
-        .map_err(|_| pe_reject(path))?;
-    let mut pe = [0u8; 24];
-    file.read_exact(&mut pe).map_err(|_| pe_reject(path))?;
-    if &pe[0..4] != b"PE\0\0" {
-        return Err(pe_reject(path));
-    }
-    let machine = u16::from_le_bytes(pe[4..6].try_into().unwrap());
-    let arch = match machine {
-        0x8664 => JvmArch::X86_64,
-        0xAA64 => JvmArch::Aarch64,
-        _ => {
+    let cache = object::ReadCache::new(file);
+    let pe = parse_pe64(&cache, 96).map_err(|err| match err {
+        Pe64Error::NotPe32Plus => {
+            "jvm.dll is not a PE32+ image, so Java methods were not read".to_string()
+        }
+        Pe64Error::InvalidPe => pe_reject(path),
+    })?;
+    const AMD64: u16 = object::pe::IMAGE_FILE_MACHINE_AMD64.0;
+    const ARM64: u16 = object::pe::IMAGE_FILE_MACHINE_ARM64.0;
+    let arch = match pe.machine {
+        AMD64 => JvmArch::X86_64,
+        ARM64 => JvmArch::Aarch64,
+        machine => {
             return Err(format!(
                 "jvm.dll at {} has PE machine {machine:#x}, which this build does not walk",
                 path.display()
             ));
         }
     };
-    let sections = u16::from_le_bytes(pe[6..8].try_into().unwrap());
-    let optional_size = u16::from_le_bytes(pe[20..22].try_into().unwrap());
-    if sections > 96 || !(120..=4096).contains(&optional_size) {
-        return Err(pe_reject(path));
-    }
-    let mut optional = vec![0u8; usize::from(optional_size)];
-    file.read_exact(&mut optional)
-        .map_err(|_| pe_reject(path))?;
-    let magic = u16::from_le_bytes(optional[0..2].try_into().unwrap());
-    if magic != 0x20b {
-        return Err("jvm.dll is not a PE32+ image, so Java methods were not read".to_string());
-    }
-    let export_rva = u32::from_le_bytes(optional[112..116].try_into().unwrap());
-    let export_size = u32::from_le_bytes(optional[116..120].try_into().unwrap());
-    if export_rva == 0 || export_size < 40 {
-        return Err(format!(
+    let mut values = HashMap::new();
+    walk_pe64_exports(&cache, &pe, 200_000, |name, rva, _| {
+        let Some(name) = name else {
+            return;
+        };
+        if HOTSPOT_SYMBOLS.contains(&name) {
+            values.insert(name.to_string(), base.wrapping_add(u64::from(rva)));
+        }
+    })
+    .map_err(|err| match err {
+        PeExportError::MissingExportTable => format!(
             "jvm.dll at {} has no export table, so Java methods cannot be read",
             path.display()
-        ));
-    }
-    let mut section_table = vec![0u8; usize::from(sections) * 40];
-    file.read_exact(&mut section_table)
-        .map_err(|_| pe_reject(path))?;
-    let rva_offset = |rva: u32| -> Option<u64> {
-        let rva = u64::from(rva);
-        for index in 0..usize::from(sections) {
-            let at = index * 40;
-            let virtual_size =
-                u32::from_le_bytes(section_table[at + 8..at + 12].try_into().ok()?) as u64;
-            let virtual_addr =
-                u32::from_le_bytes(section_table[at + 12..at + 16].try_into().ok()?) as u64;
-            let raw_size =
-                u32::from_le_bytes(section_table[at + 16..at + 20].try_into().ok()?) as u64;
-            let raw_ptr =
-                u32::from_le_bytes(section_table[at + 20..at + 24].try_into().ok()?) as u64;
-            let span = virtual_size.max(raw_size);
-            if rva >= virtual_addr && rva - virtual_addr < span {
-                return raw_ptr.checked_add(rva - virtual_addr);
-            }
-        }
-        None
-    };
-    let export_at = rva_offset(export_rva).ok_or_else(|| pe_reject(path))?;
-    let mut export = [0u8; 40];
-    file.seek(SeekFrom::Start(export_at))
-        .map_err(|_| pe_reject(path))?;
-    file.read_exact(&mut export).map_err(|_| pe_reject(path))?;
-    let function_count = u32::from_le_bytes(export[20..24].try_into().unwrap());
-    let name_count = u32::from_le_bytes(export[24..28].try_into().unwrap());
-    let functions_rva = u32::from_le_bytes(export[28..32].try_into().unwrap());
-    let names_rva = u32::from_le_bytes(export[32..36].try_into().unwrap());
-    let ordinals_rva = u32::from_le_bytes(export[36..40].try_into().unwrap());
-    if function_count == 0 || name_count == 0 || function_count > 200_000 || name_count > 200_000 {
-        return Err(pe_reject(path));
-    }
-    let mut functions = vec![0u8; function_count as usize * 4];
-    let mut names = vec![0u8; name_count as usize * 4];
-    let mut ordinals = vec![0u8; name_count as usize * 2];
-    file.seek(SeekFrom::Start(
-        rva_offset(functions_rva).ok_or_else(|| pe_reject(path))?,
-    ))
-    .map_err(|_| pe_reject(path))?;
-    file.read_exact(&mut functions)
-        .map_err(|_| pe_reject(path))?;
-    file.seek(SeekFrom::Start(
-        rva_offset(names_rva).ok_or_else(|| pe_reject(path))?,
-    ))
-    .map_err(|_| pe_reject(path))?;
-    file.read_exact(&mut names).map_err(|_| pe_reject(path))?;
-    file.seek(SeekFrom::Start(
-        rva_offset(ordinals_rva).ok_or_else(|| pe_reject(path))?,
-    ))
-    .map_err(|_| pe_reject(path))?;
-    file.read_exact(&mut ordinals)
-        .map_err(|_| pe_reject(path))?;
-    let mut values = HashMap::new();
-    for index in 0..name_count as usize {
-        let name_rva = u32::from_le_bytes(names[index * 4..index * 4 + 4].try_into().unwrap());
-        let ordinal = u16::from_le_bytes(ordinals[index * 2..index * 2 + 2].try_into().unwrap());
-        if u32::from(ordinal) >= function_count {
-            continue;
-        }
-        let function_rva = u32::from_le_bytes(
-            functions[ordinal as usize * 4..ordinal as usize * 4 + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let name_at = rva_offset(name_rva).ok_or_else(|| pe_reject(path))?;
-        file.seek(SeekFrom::Start(name_at))
-            .map_err(|_| pe_reject(path))?;
-        let mut name_buf = [0u8; 128];
-        let n = file.read(&mut name_buf).map_err(|_| pe_reject(path))?;
-        let end = name_buf[..n]
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(n);
-        let Ok(name) = std::str::from_utf8(&name_buf[..end]) else {
-            continue;
-        };
-        if !HOTSPOT_SYMBOLS.contains(&name) {
-            continue;
-        }
-        let export_start = u64::from(export_rva);
-        let export_end = export_start + u64::from(export_size);
-        let function = u64::from(function_rva);
-        if function >= export_start && function < export_end {
-            continue;
-        }
-        values.insert(name.to_string(), base.wrapping_add(function));
-    }
+        ),
+        PeExportError::Malformed => pe_reject(path),
+    })?;
     if let Some(missing) = HOTSPOT_SYMBOLS
         .iter()
         .find(|name| !values.contains_key(**name))

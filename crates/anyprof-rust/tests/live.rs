@@ -116,19 +116,20 @@ mod supported {
                 ..anyprof_core::RecordOptions::default()
             },
         );
-        let during = read_counter(&counter);
         let Some(session) = accept_or_skip(started) else {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(500));
+        let during = read_counter(&counter);
+        std::thread::sleep(Duration::from_millis(500));
         let after = read_counter(&counter);
         let still_running = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
         let _ = child.kill();
         let _ = child.wait();
-        let profile = session.stop().expect("stop");
         assert!(
             still_running && during > before && after >= during,
             "the target must keep running (before {before}, during {during}, after {after}, alive {still_running})"
@@ -199,8 +200,9 @@ mod supported {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
-        drop(child);
+        std::thread::sleep(Duration::from_millis(800));
         let profile = session.stop().expect("stop release nofp");
+        drop(child);
         assert!(
             profile.stacks.iter().any(|stack| {
                 let has_leaf = stack
@@ -251,10 +253,11 @@ mod supported {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
+        std::thread::sleep(Duration::from_millis(500));
         let alive = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
         let _ = child.kill();
         let _ = child.wait();
-        let profile = session.stop().expect("stop");
         let total = profile.total_weight();
         assert!(
             total <= 2,
@@ -307,10 +310,11 @@ mod supported {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
+        std::thread::sleep(Duration::from_secs(1));
         let alive = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
         let _ = child.kill();
         let _ = child.wait();
-        let profile = session.stop().expect("stop");
         let a = weight_named(&profile, "anyprof_rust_spin_a");
         let b = weight_named(&profile, "anyprof_rust_spin_b");
         assert!(

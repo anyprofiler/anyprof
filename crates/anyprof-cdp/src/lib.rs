@@ -13,7 +13,7 @@ mod error;
 mod http;
 mod targets;
 
-pub use client::capture_cpu_profile;
+pub use client::{CdpSession, capture_cpu_profile, start_cpu_profile};
 pub use endpoint::{InspectEndpoint, parse_inspect};
 pub use error::Error;
 pub use targets::{DebugTarget, choose_node, choose_page, list_targets};

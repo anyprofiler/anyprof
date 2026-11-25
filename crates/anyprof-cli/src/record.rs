@@ -83,20 +83,19 @@ pub fn run(args: RecordArgs, verbose: u8) -> anyhow::Result<ExitCode> {
         "starting profile"
     );
 
-    let start_res = watch_recording(&label, args.duration, verbose, || {
-        backend.start(
-            &Target { pid },
-            &RecordOptions {
-                duration: args.duration,
-                sampling_interval: requested_interval,
-                include_kernel: args.kernel,
-                inspect: args.inspect.clone(),
-                tab: args.tab.clone(),
-                keep_inspector: args.keep_inspector,
-                stop: Arc::clone(&stop),
-            },
-        )
-    });
+    let start_res = backend.start(
+        &Target { pid },
+        &RecordOptions {
+            duration: args.duration,
+            sampling_interval: requested_interval,
+            include_kernel: args.kernel,
+            inspect: args.inspect.clone(),
+            tab: args.tab.clone(),
+            keep_inspector: args.keep_inspector,
+            language_unwind: anyprof_core::LanguageUnwind::None,
+            stop: Arc::clone(&stop),
+        },
+    );
     let session = match start_res {
         Ok(session) => session,
         Err(err) => {
@@ -111,11 +110,28 @@ pub fn run(args: RecordArgs, verbose: u8) -> anyhow::Result<ExitCode> {
             return Err(err.into());
         }
     };
-    // Profiler.stop runs inside the backend. Saving the file is the rest of
-    // that phase: a second Ctrl+C here exits immediately.
+    watch_recording(&label, args.duration, verbose, || {
+        wait_for_recording_window(args.duration, &stop);
+    });
+    // Profiler.stop runs inside `session.stop()` before terminating any spawned
+    // target so V8/Mach/Win32 detachment reads a live process. Saving the file
+    // is the rest of that phase: a second Ctrl+C here exits immediately.
     stop.begin_stopping();
+    let profile = match session.stop() {
+        Ok(profile) => profile,
+        Err(err) => {
+            if let Some(ref mut spawned) = child_guard
+                && let Some(status) = spawned.poll_exit()
+                && !status.success()
+            {
+                return Err(anyhow!(
+                    "spawned command exited with {status} before sampling completed ({err})"
+                ));
+            }
+            return Err(err.into());
+        }
+    };
     let child_exit = child_guard.as_mut().and_then(SpawnedTarget::finish);
-    let profile = session.stop()?;
     let counts = anyprof_export::sample_counts(&profile);
     if let Some(warning) = uninformative_reason(&profile, counts) {
         eprintln!("warning: {warning}");
@@ -411,6 +427,27 @@ fn recording_label(backend: &str, args: &RecordArgs, pid: u32) -> String {
         }
     } else {
         format!("{backend} pid {pid}")
+    }
+}
+
+fn wait_for_recording_window(limit: Option<Duration>, stop: &StopGate) {
+    let started = Instant::now();
+    loop {
+        if stop.stop_requested() {
+            return;
+        }
+        match limit {
+            Some(duration) => {
+                let Some(remaining) = duration.checked_sub(started.elapsed()) else {
+                    return;
+                };
+                if remaining.is_zero() {
+                    return;
+                }
+                thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
     }
 }
 

@@ -44,17 +44,27 @@ fn samples_a_busy_cpp_program() {
             ..anyprof_core::RecordOptions::default()
         },
     );
+    let session = match started {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("native profile failed: {err}");
+        }
+    };
+    std::thread::sleep(Duration::from_millis(500));
     let during = read_counter(&counter);
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(500));
     let after = read_counter(&counter);
     let alive = anyprof_core::process_exists(pid);
-    let session = started.unwrap_or_else(|err| panic!("native profile failed: {err}"));
+
+    let profile = session.stop().unwrap_or_else(|err| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("stop failed: {err}")
+    });
     let _ = child.kill();
     let _ = child.wait();
-
-    let profile = session
-        .stop()
-        .unwrap_or_else(|err| panic!("stop failed: {err}"));
     assert!(
         during > before && after > during,
         "the target must keep running during and after the profile (before {before}, during {during}, after {after})"
@@ -135,11 +145,19 @@ fn an_idle_process_does_not_invent_on_cpu_samples() {
         },
     );
     let alive = anyprof_core::process_exists(pid);
-    let session = started.unwrap_or_else(|err| panic!("native profile failed: {err}"));
+    let session = match started {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("native profile failed: {err}");
+        }
+    };
+    std::thread::sleep(Duration::from_millis(500));
     let still_alive = anyprof_core::process_exists(pid);
+    let profile = session.stop().expect("stop");
     let _ = child.kill();
     let _ = child.wait();
-    let profile = session.stop().expect("stop");
     let total = profile.total_weight();
     assert!(
         total <= 2,

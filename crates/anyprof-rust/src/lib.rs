@@ -11,11 +11,12 @@
 //! x86_64 is the same sampler as gnu; CI type-checks it and does not live-sample
 //! it.
 
-mod exe;
-
 use std::time::Duration;
 
-use anyprof_core::{Backend, Capabilities, Error, Format, RecordOptions, Session, Target};
+use anyprof_core::{
+    Backend, Capabilities, Error, Format, LanguageUnwind, RecordOptions, Session, Target,
+    executable_file,
+};
 use anyprof_native::{NativeBackend, file_is_rust};
 
 /// Detail for [`Error::NotImplemented`] on Windows builds that are not x64.
@@ -56,7 +57,7 @@ impl Backend for RustBackend {
     }
 
     fn detect(&self, pid: u32) -> bool {
-        let Some(path) = exe::executable_path(pid) else {
+        let Some(path) = executable_file(pid) else {
             tracing::debug!(pid, "rust detect: executable path is not readable");
             return false;
         };
@@ -87,7 +88,20 @@ impl Backend for RustBackend {
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
         // Missing pids and a zero duration are reported as `rust:` even where
         // sampling exists. Not-implemented stays the platform message below.
-        NativeBackend.start(target, opts).map_err(retarget)
+        let mut rust_opts = opts.clone();
+        rust_opts.language_unwind = LanguageUnwind::None;
+        let inner = NativeBackend.start(target, &rust_opts).map_err(retarget)?;
+        Ok(Box::new(RetargetSession { inner }))
+    }
+}
+
+struct RetargetSession {
+    inner: Box<dyn Session>,
+}
+
+impl Session for RetargetSession {
+    fn stop(self: Box<Self>) -> Result<anyprof_core::Profile, Error> {
+        self.inner.stop().map_err(retarget)
     }
 }
 

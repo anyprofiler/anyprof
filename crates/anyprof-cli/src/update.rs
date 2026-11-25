@@ -10,15 +10,22 @@
 //! checksum: cargo-dist 0.33 publishes `sha256.sum` for the archives only. The
 //! installer embeds the archive's SHA-256 and verifies it before unpacking.
 
+#[cfg(feature = "self-update")]
 use std::cmp::Ordering;
+#[cfg(feature = "self-update")]
 use std::ffi::OsString;
+#[cfg(feature = "self-update")]
 use std::path::PathBuf;
 
-use anyhow::{Context, anyhow};
+#[cfg(feature = "self-update")]
+use anyhow::Context;
+use anyhow::anyhow;
+#[cfg(feature = "self-update")]
 use axoupdater::{AxoUpdater, AxoupdateError, ReleaseSource, ReleaseSourceType, Version};
 
 /// cargo-dist app name. The published installers are `anyprof-cli-installer.sh`
 /// and `anyprof-cli-installer.ps1`.
+#[cfg(feature = "self-update")]
 const APP_NAME: &str = "anyprof-cli";
 const OWNER: &str = "anyprofiler";
 const REPO: &str = "anyprof";
@@ -40,6 +47,16 @@ const INSTALL_DIR_OVERRIDE: &str = "ANYPROF_CLI_INSTALL_DIR";
 const SHELL_INSTALLER: &str = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.sh | sh";
 const POWERSHELL_INSTALLER: &str = "powershell -ExecutionPolicy Bypass -c \"irm https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.ps1 | iex\"";
 
+#[cfg(not(feature = "self-update"))]
+pub fn run() -> anyhow::Result<()> {
+    clear_installer_overrides();
+    Err(anyhow!(
+        "anyprof was not installed with the GitHub release installer (built without the `self-update` feature), so it cannot update itself.\n{}",
+        reinstall_hint()
+    ))
+}
+
+#[cfg(feature = "self-update")]
 pub fn run() -> anyhow::Result<()> {
     clear_installer_overrides();
 
@@ -123,6 +140,7 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "self-update")]
 fn is_pinned_source(source: &ReleaseSource) -> bool {
     source.release_type == ReleaseSourceType::GitHub
         && source.owner == OWNER
@@ -151,6 +169,7 @@ fn clear_installer_overrides() {
 /// installer copies the new one in, and renames it back only if this process
 /// is still alive when the installer fails. Ctrl+C also reaches the installer,
 /// so ignoring it here is enough for that rollback to run.
+#[cfg(feature = "self-update")]
 fn hold_interrupts_until_exit() {
     if let Err(err) = ctrlc::set_handler(|| {
         eprintln!("anyprof: update in progress; waiting for the installer to exit");
@@ -160,6 +179,7 @@ fn hold_interrupts_until_exit() {
 }
 
 /// Where axoupdater leaves the old executable on Windows.
+#[cfg(feature = "self-update")]
 fn previous_exe_path() -> PathBuf {
     let mut path: OsString = std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from("anyprof.exe"))
@@ -168,18 +188,22 @@ fn previous_exe_path() -> PathBuf {
     PathBuf::from(path)
 }
 
+#[cfg(any(feature = "self-update", test))]
 fn format_updated(old: &str, new: &str) -> String {
     format!("anyprof {old} → {new}")
 }
 
+#[cfg(any(feature = "self-update", test))]
 fn format_already_latest(version: &str) -> String {
     format!("anyprof {version} is already the latest release")
 }
 
+#[cfg(any(feature = "self-update", test))]
 fn format_newer_than_latest(current: &str, latest: &str) -> String {
     format!("anyprof {current} is newer than the latest release ({latest}); nothing to update")
 }
 
+#[cfg(any(feature = "self-update", test))]
 fn format_cleanup_warning(previous: &std::path::Path) -> String {
     format!(
         "anyprof: the new version is installed, but the old copy at {} could not be deleted. Delete it by hand.",
@@ -195,6 +219,7 @@ fn reinstall_hint() -> String {
     )
 }
 
+#[cfg(feature = "self-update")]
 fn writable_hint() -> String {
     match std::env::current_exe()
         .ok()
@@ -205,6 +230,7 @@ fn writable_hint() -> String {
     }
 }
 
+#[cfg(feature = "self-update")]
 fn receipt_failure(err: AxoupdateError) -> anyhow::Error {
     match &err {
         AxoupdateError::NoReceipt { .. } | AxoupdateError::NoHome {} => anyhow!(
@@ -218,6 +244,7 @@ fn receipt_failure(err: AxoupdateError) -> anyhow::Error {
     }
 }
 
+#[cfg(feature = "self-update")]
 fn location_failure(err: AxoupdateError) -> anyhow::Error {
     anyhow!(
         "anyprof could not work out where this binary is installed ({err}).\n{}",
@@ -225,10 +252,12 @@ fn location_failure(err: AxoupdateError) -> anyhow::Error {
     )
 }
 
+#[cfg(feature = "self-update")]
 fn lookup_failure(err: AxoupdateError) -> anyhow::Error {
     anyhow!("anyprof could not look up the latest release on github.com/{OWNER}/{REPO} ({err})")
 }
 
+#[cfg(feature = "self-update")]
 fn install_failure(err: AxoupdateError) -> anyhow::Error {
     match &err {
         // The installer's output is already on the terminal, so only the exit
@@ -255,13 +284,18 @@ fn install_failure(err: AxoupdateError) -> anyhow::Error {
 mod tests {
     use std::path::Path;
 
+    #[cfg(feature = "self-update")]
     use super::{
-        APP_NAME, OWNER, REPO, format_already_latest, format_cleanup_warning,
-        format_newer_than_latest, format_updated, install_failure, is_pinned_source,
-        location_failure, receipt_failure, reinstall_hint,
+        APP_NAME, OWNER, REPO, install_failure, is_pinned_source, location_failure, receipt_failure,
     };
+    use super::{
+        format_already_latest, format_cleanup_warning, format_newer_than_latest, format_updated,
+        reinstall_hint,
+    };
+    #[cfg(feature = "self-update")]
     use axoupdater::{AxoupdateError, ReleaseSource, ReleaseSourceType};
 
+    #[cfg(feature = "self-update")]
     fn source(
         release_type: ReleaseSourceType,
         owner: &str,
@@ -287,8 +321,22 @@ mod tests {
             format_newer_than_latest("0.1.2", "0.1.1"),
             "anyprof 0.1.2 is newer than the latest release (0.1.1); nothing to update"
         );
+        assert!(reinstall_hint().contains("releases/latest/download"));
     }
 
+    #[cfg(not(feature = "self-update"))]
+    #[test]
+    fn disabled_self_update_points_at_both_labelled_installers() {
+        let err = super::run().expect_err("self-update disabled should error");
+        let message = err.to_string();
+        assert!(message.contains("release installer"), "{message}");
+        assert!(message.contains("macOS and Linux:"), "{message}");
+        assert!(message.contains("Windows (PowerShell):"), "{message}");
+        assert!(message.contains("anyprof-cli-installer.sh"), "{message}");
+        assert!(message.contains("anyprof-cli-installer.ps1"), "{message}");
+    }
+
+    #[cfg(feature = "self-update")]
     #[test]
     fn only_the_anyprof_github_repository_is_trusted() {
         assert!(is_pinned_source(&source(
@@ -307,6 +355,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "self-update")]
     #[test]
     fn missing_receipt_points_at_both_labelled_installers() {
         let message = receipt_failure(AxoupdateError::NoReceipt {
@@ -321,6 +370,7 @@ mod tests {
         assert!(reinstall_hint().contains("releases/latest/download"));
     }
 
+    #[cfg(feature = "self-update")]
     #[test]
     fn a_failed_install_location_lookup_is_not_called_a_replace_failure() {
         let message = location_failure(AxoupdateError::Io(std::io::Error::other(
@@ -331,6 +381,7 @@ mod tests {
         assert!(!message.contains("replace"), "{message}");
     }
 
+    #[cfg(feature = "self-update")]
     #[test]
     fn failed_install_names_the_exit_status_and_the_directory() {
         let message = install_failure(AxoupdateError::InstallFailed {

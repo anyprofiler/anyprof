@@ -173,121 +173,15 @@ fn signature_matches(
     dbi_age.is_none_or(|age| age == image_age)
 }
 
-/// Read the CodeView record by seeking to the debug directory.
+/// Read the CodeView record by seeking to the debug directory via `object`.
 ///
 /// The directory is not required to sit in the first 1 MiB. Only the DOS
 /// stub, the PE headers, the section table, the debug directory, and the
-/// `RSDS` record itself are read.
+/// `RSDS` record itself are read through [`object::ReadCache`].
 fn read_codeview<R: std::io::Read + std::io::Seek>(file: &mut R) -> Option<CodeView> {
-    use std::io::SeekFrom;
-    let mut dos = [0_u8; 0x40];
-    file.read_exact(&mut dos).ok()?;
-    if dos[0..2] != *b"MZ" {
-        return None;
-    }
-    let e_lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().ok()?) as u64;
-    if e_lfanew > 1024 * 1024 {
-        return None;
-    }
-    file.seek(SeekFrom::Start(e_lfanew)).ok()?;
-    let mut coff = [0_u8; 24];
-    file.read_exact(&mut coff).ok()?;
-    if coff[0..4] != *b"PE\0\0" {
-        return None;
-    }
-    let sections = u16::from_le_bytes(coff[6..8].try_into().ok()?) as usize;
-    let opt_size = u16::from_le_bytes(coff[20..22].try_into().ok()?) as usize;
-    if sections > 512 || opt_size > 1024 * 1024 {
-        return None;
-    }
-    let mut opt = vec![0_u8; opt_size];
-    file.read_exact(&mut opt).ok()?;
-    let magic = u16::from_le_bytes(opt.get(..2)?.try_into().ok()?);
-    let (dir_at, dir_count) = match magic {
-        0x20B if opt.len() >= 112 => (
-            112,
-            u32::from_le_bytes(opt[108..112].try_into().ok()?) as usize,
-        ),
-        0x10B if opt.len() >= 96 => (
-            96,
-            u32::from_le_bytes(opt[92..96].try_into().ok()?) as usize,
-        ),
-        _ => return None,
-    };
-    if dir_count <= 6 {
-        return None;
-    }
-    let entry = opt.get(dir_at + 48..dir_at + 56)?;
-    let debug_rva = u32::from_le_bytes(entry[0..4].try_into().ok()?);
-    let debug_size = u32::from_le_bytes(entry[4..8].try_into().ok()?) as usize;
-    if debug_rva == 0 || !(28..=1024 * 1024).contains(&debug_size) {
-        return None;
-    }
-    let mut section_bytes = vec![0_u8; sections * 40];
-    file.read_exact(&mut section_bytes).ok()?;
-    let debug_off = rva_to_file_offset(&section_bytes, debug_rva)?;
-    file.seek(SeekFrom::Start(debug_off)).ok()?;
-    let mut dir = vec![0_u8; debug_size];
-    file.read_exact(&mut dir).ok()?;
-    let (ptr, size) = codeview_file_range(&dir)?;
-    let mut data = vec![0_u8; size];
-    file.seek(SeekFrom::Start(ptr)).ok()?;
-    file.read_exact(&mut data).ok()?;
-    parse_rsds(&data)
-}
-
-fn rva_to_file_offset(sections: &[u8], rva: u32) -> Option<u64> {
-    let (sections, _rest) = sections.as_chunks::<40>();
-    for sec in sections {
-        let virt_size = u32::from_le_bytes(sec[8..12].try_into().ok()?);
-        let virt = u32::from_le_bytes(sec[12..16].try_into().ok()?);
-        let raw_size = u32::from_le_bytes(sec[16..20].try_into().ok()?);
-        let raw_ptr = u32::from_le_bytes(sec[20..24].try_into().ok()?);
-        let span = virt_size.max(raw_size);
-        if rva >= virt && rva < virt.saturating_add(span) {
-            return Some(u64::from(raw_ptr) + u64::from(rva - virt));
-        }
-    }
-    None
-}
-
-fn codeview_file_range(dir: &[u8]) -> Option<(u64, usize)> {
-    let mut cursor = 0;
-    while cursor + 28 <= dir.len() {
-        let rec = &dir[cursor..cursor + 28];
-        let kind = u32::from_le_bytes(rec[12..16].try_into().ok()?);
-        let size = u32::from_le_bytes(rec[16..20].try_into().ok()?) as usize;
-        let ptr = u32::from_le_bytes(rec[24..28].try_into().ok()?) as u64;
-        // `IMAGE_DEBUG_TYPE_CODEVIEW`.
-        if kind == 2 && (24..1024 * 1024).contains(&size) && ptr > 0 {
-            return Some((ptr, size));
-        }
-        cursor += 28;
-    }
-    None
-}
-
-fn parse_rsds(data: &[u8]) -> Option<CodeView> {
-    if data.len() < 24 || data[0..4] != *b"RSDS" {
-        return None;
-    }
-    let mut guid = [0_u8; 16];
-    guid.copy_from_slice(&data[4..20]);
-    let age = u32::from_le_bytes(data[20..24].try_into().ok()?);
-    let path = &data[24..];
-    let end = path
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(path.len());
-    let text = std::str::from_utf8(&path[..end]).ok()?.trim();
-    if text.is_empty() {
-        return None;
-    }
-    Some(CodeView {
-        guid,
-        age,
-        path: text.to_string(),
-    })
+    let cache = object::ReadCache::new(file);
+    let (guid, age, path) = crate::binfmt::read_pe_codeview(&cache)?;
+    Some(CodeView { guid, age, path })
 }
 
 fn index(mut funcs: Vec<Func>) -> Vec<Func> {

@@ -1090,22 +1090,7 @@ fn macos_exports(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn macos_exe(pid: u32) -> Option<PathBuf> {
-    const MAX: u32 = 4 * 1024;
-    let mut buf = vec![0u8; MAX as usize];
-    let pid = i32::try_from(pid).ok()?;
-    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), MAX) };
-    if n <= 0 {
-        return None;
-    }
-    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(n as usize);
-    let text = String::from_utf8(buf[..end].to_vec()).ok()?;
-    (!text.is_empty()).then_some(PathBuf::from(text))
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_char, buffersize: u32) -> i32;
+    anyprof_core::executable_file(pid)
 }
 
 #[cfg(windows)]
@@ -1179,24 +1164,9 @@ pub(crate) fn attach_process(process: windows_sys::Win32::Foundation::HANDLE) ->
 
 #[cfg(windows)]
 fn windows_candidates(pid: u32) -> Vec<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    let Some(path) = anyprof_core::executable_file(pid) else {
+        return Vec::new();
     };
-
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return Vec::new();
-    }
-    let mut buf = vec![0u16; 32 * 1024];
-    let mut len = buf.len() as u32;
-    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
-    unsafe { CloseHandle(handle) };
-    if ok == 0 || len == 0 {
-        return Vec::new();
-    }
-    let path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
     let mut out = vec![path.clone()];
     let Some(dir) = path.parent() else {
         return out;

@@ -17,12 +17,16 @@
     allow(dead_code)
 )]
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 
 use anyprof_core::Runtime;
+use object::read::ReadRef;
+use object::read::elf::{FileHeader as _, SectionHeader as _, Sym as _};
+use object::{LittleEndian, elf};
 
+use crate::binfmt::{parse_elf64, read_elf64_section, visit_elf64_symbols};
 use crate::dwarf_line::{
     DwarfLineSections, LineTable, MAX_LINE_SECTION_BYTES, MAX_STR_SECTION_BYTES,
 };
@@ -31,32 +35,17 @@ use crate::symbol::{self, frame_runtime};
 
 /// How far past a symbol an instruction can sit and still belong to it.
 const MAX_SYMBOL_SPAN: u64 = 16 * 1024 * 1024;
-const MAX_SYMBOLS: u64 = 2_000_000;
+const MAX_SYMBOLS: usize = 2_000_000;
 const MAX_STRINGS: u64 = 64 * 1024 * 1024;
 
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ELFCLASS64: u8 = 2;
-const ELFDATA2LSB: u8 = 1;
 #[allow(dead_code)]
-pub(crate) const EM_X86_64: u16 = 62;
+pub(crate) const EM_X86_64: u16 = object::elf::EM_X86_64.0;
 #[allow(dead_code)]
-pub(crate) const EM_AARCH64: u16 = 183;
+pub(crate) const EM_AARCH64: u16 = object::elf::EM_AARCH64.0;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const HOST_ELF_MACHINE: u16 = EM_AARCH64;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) const HOST_ELF_MACHINE: u16 = EM_X86_64;
-const ET_EXEC: u16 = 2;
-const ET_DYN: u16 = 3;
-const PT_LOAD: u32 = 1;
-const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
-const SHT_SYMTAB: u32 = 2;
-const SHT_STRTAB: u32 = 3;
-const SHT_NOBITS: u32 = 8;
-const SHT_DYNSYM: u32 = 11;
-const SHF_COMPRESSED: u64 = 0x800;
-const STT_FUNC: u8 = 2;
-const STT_GNU_IFUNC: u8 = 10;
-const SHN_UNDEF: u16 = 0;
 
 const MAX_EH_FRAME_HDR_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EH_FRAME_BYTES: u64 = 64 * 1024 * 1024;
@@ -356,376 +345,198 @@ pub(crate) fn load_bias(
 /// Read an ELF64 symbol table from `path`.
 pub(crate) fn parse_path(path: &Path) -> Option<ElfFile> {
     let file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    parse_reader(file, len)
+    parse_reader(file)
 }
 
 /// Parse `bytes` as an ELF64 object.
 #[cfg(test)]
 pub(crate) fn parse_bytes(bytes: &[u8]) -> Option<ElfFile> {
-    parse_reader(std::io::Cursor::new(bytes), bytes.len() as u64)
+    parse_reader(std::io::Cursor::new(bytes))
 }
 
-fn parse_reader<R: Read + Seek>(mut reader: R, len: u64) -> Option<ElfFile> {
-    if len < 64 {
+fn parse_reader<R: Read + Seek>(reader: R) -> Option<ElfFile> {
+    let cache = object::ReadCache::new(reader);
+    let parsed = parse_elf64(&cache, 100_000)?;
+    let etype = parsed.header.e_type(LittleEndian);
+    if etype != elf::ET_EXEC && etype != elf::ET_DYN {
         return None;
     }
-    reader.seek(SeekFrom::Start(0)).ok()?;
-    let mut ehdr = [0u8; 64];
-    reader.read_exact(&mut ehdr).ok()?;
-    if ehdr[0..4] != ELF_MAGIC || ehdr[4] != ELFCLASS64 || ehdr[5] != ELFDATA2LSB {
-        return None;
-    }
-    let etype = u16::from_le_bytes(ehdr[16..18].try_into().ok()?);
-    if etype != ET_EXEC && etype != ET_DYN {
-        return None;
-    }
-    let machine = u16::from_le_bytes(ehdr[18..20].try_into().ok()?);
-    let phoff = u64::from_le_bytes(ehdr[32..40].try_into().ok()?);
-    let shoff = u64::from_le_bytes(ehdr[40..48].try_into().ok()?);
-    let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().ok()?) as u64;
-    let phnum = u16::from_le_bytes(ehdr[56..58].try_into().ok()?) as u64;
-    let shentsize = u16::from_le_bytes(ehdr[58..60].try_into().ok()?) as u64;
-    let mut shnum = u16::from_le_bytes(ehdr[60..62].try_into().ok()?) as u64;
-    let mut shstrndx = u16::from_le_bytes(ehdr[62..64].try_into().ok()?) as u64;
-    if phentsize < 56 || shentsize < 64 {
-        return None;
-    }
-    let (loads, gnu_eh_frame) = read_loads(&mut reader, len, phoff, phentsize, phnum)?;
-    if shoff == 0 {
+    let machine = parsed.header.e_machine(LittleEndian).0;
+    if parsed.sections.is_empty() {
         let unwind = Arc::new(read_elf_unwind_from_phdr(
-            &mut reader,
-            len,
-            &loads,
-            gnu_eh_frame,
+            &cache,
+            &parsed.loads,
+            parsed.gnu_eh_frame,
         ));
         return Some(ElfFile {
             machine,
-            loads,
+            loads: parsed.loads,
             funcs: Vec::new(),
             lines: Arc::new(LineTable::default()),
             unwind,
         });
     }
-    if shnum == 0 {
-        let section0 = read_section(&mut reader, len, shoff, shentsize, 0)?;
-        shnum = section0.size;
-        if shstrndx == 0xffff {
-            shstrndx = u64::from(section0.link);
-        }
-    }
-    if shnum == 0 || shnum > 100_000 {
-        return None;
-    }
-    let sections = read_sections(&mut reader, len, shoff, shentsize, shnum)?;
-    let funcs = read_funcs(&mut reader, len, &sections);
-    let lines = read_dwarf_lines(&mut reader, len, &sections, shstrndx);
+    let funcs = read_funcs(&cache, &parsed.sections);
+    let lines = read_dwarf_lines(&cache, &parsed.sections);
     let unwind = Arc::new(read_elf_unwind(
-        &mut reader,
-        len,
-        &loads,
-        gnu_eh_frame,
-        &sections,
-        shstrndx,
+        &cache,
+        &parsed.loads,
+        parsed.gnu_eh_frame,
+        &parsed.sections,
     ));
     Some(ElfFile {
         machine,
-        loads,
+        loads: parsed.loads,
         funcs,
         lines,
         unwind,
     })
 }
 
-#[derive(Clone, Copy)]
-struct Section {
-    name: u32,
-    kind: u32,
-    flags: u64,
-    addr: u64,
-    offset: u64,
-    size: u64,
-    link: u32,
-    entsize: u64,
-}
-
-fn read_loads<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
-    phoff: u64,
-    entsize: u64,
-    phnum: u64,
-) -> Option<(Vec<LoadSegment>, Option<LoadSegment>)> {
-    if phnum > 1000 || phoff.saturating_add(phnum.saturating_mul(entsize)) > len {
-        return None;
-    }
-    let mut loads = Vec::new();
-    let mut gnu_eh_frame = None;
-    for index in 0..phnum {
-        let mut buf = vec![0u8; entsize as usize];
-        reader.seek(SeekFrom::Start(phoff + index * entsize)).ok()?;
-        reader.read_exact(&mut buf).ok()?;
-        let kind = u32::from_le_bytes(buf[0..4].try_into().ok()?);
-        if kind != PT_LOAD && kind != PT_GNU_EH_FRAME {
-            continue;
-        }
-        let offset = u64::from_le_bytes(buf[8..16].try_into().ok()?);
-        let vaddr = u64::from_le_bytes(buf[16..24].try_into().ok()?);
-        let filesz = u64::from_le_bytes(buf[32..40].try_into().ok()?);
-        let seg = LoadSegment {
-            offset,
-            vaddr,
-            filesz,
-        };
-        if kind == PT_LOAD {
-            loads.push(seg);
-        } else if gnu_eh_frame.is_none() && filesz > 0 {
-            gnu_eh_frame = Some(seg);
-        }
-    }
-    Some((loads, gnu_eh_frame))
-}
-
-fn read_sections<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
-    shoff: u64,
-    entsize: u64,
-    shnum: u64,
-) -> Option<Vec<Section>> {
-    let total = shnum.checked_mul(entsize)?;
-    if total > 64 * 1024 * 1024 || shoff.saturating_add(total) > len {
-        return None;
-    }
-    let mut raw = vec![0u8; total as usize];
-    reader.seek(SeekFrom::Start(shoff)).ok()?;
-    reader.read_exact(&mut raw).ok()?;
-    let step = entsize as usize;
-    let mut sections = Vec::with_capacity(shnum as usize);
-    for index in 0..shnum as usize {
-        let buf = &raw[index * step..index * step + 64];
-        sections.push(parse_section_bytes(buf)?);
-    }
-    Some(sections)
-}
-
-fn read_section<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
-    shoff: u64,
-    entsize: u64,
-    index: u64,
-) -> Option<Section> {
-    let at = shoff.saturating_add(index.saturating_mul(entsize));
-    if at.saturating_add(64) > len {
-        return None;
-    }
-    let mut buf = [0u8; 64];
-    reader.seek(SeekFrom::Start(at)).ok()?;
-    reader.read_exact(&mut buf).ok()?;
-    parse_section_bytes(&buf)
-}
-
-fn parse_section_bytes(buf: &[u8]) -> Option<Section> {
-    Some(Section {
-        name: u32::from_le_bytes(buf[0..4].try_into().ok()?),
-        kind: u32::from_le_bytes(buf[4..8].try_into().ok()?),
-        flags: u64::from_le_bytes(buf[8..16].try_into().ok()?),
-        addr: u64::from_le_bytes(buf[16..24].try_into().ok()?),
-        offset: u64::from_le_bytes(buf[24..32].try_into().ok()?),
-        size: u64::from_le_bytes(buf[32..40].try_into().ok()?),
-        link: u32::from_le_bytes(buf[40..44].try_into().ok()?),
-        entsize: u64::from_le_bytes(buf[56..64].try_into().ok()?),
-    })
-}
-
-fn read_funcs<R: Read + Seek>(reader: &mut R, len: u64, sections: &[Section]) -> Vec<ElfFunc> {
-    let symtab = sections
+fn read_funcs<'data, R: ReadRef<'data>>(
+    data: R,
+    sections: &object::read::elf::SectionTable<'data, elf::FileHeader64<LittleEndian>, R>,
+) -> Vec<ElfFunc> {
+    let has_symtab = sections
         .iter()
-        .find(|section| section.kind == SHT_SYMTAB)
-        .or_else(|| sections.iter().find(|section| section.kind == SHT_DYNSYM));
-    let Some(symtab) = symtab else {
-        return Vec::new();
-    };
-    let Some(strings) = sections.get(symtab.link as usize) else {
-        return Vec::new();
-    };
-    if strings.kind != SHT_STRTAB && strings.kind != 0 {
-        // A symtab's link is the string table. Kind 0 only happens in tests
-        // that omit it; a real file uses SHT_STRTAB.
-    }
-    if strings.size > MAX_STRINGS || strings.offset.saturating_add(strings.size) > len {
-        return Vec::new();
-    }
-    let entsize = if symtab.entsize == 0 {
-        24
+        .any(|sec| sec.sh_type(LittleEndian) == elf::SHT_SYMTAB);
+    let kind = if has_symtab {
+        elf::SHT_SYMTAB
     } else {
-        symtab.entsize
+        elf::SHT_DYNSYM
     };
-    if entsize < 24 || symtab.size / entsize > MAX_SYMBOLS {
-        return Vec::new();
-    }
-    if symtab.offset.saturating_add(symtab.size) > len {
-        return Vec::new();
-    }
-    let mut strtab = vec![0u8; strings.size as usize];
-    if reader.seek(SeekFrom::Start(strings.offset)).is_err()
-        || reader.read_exact(&mut strtab).is_err()
-    {
-        return Vec::new();
-    }
-    let mut symbytes = vec![0u8; symtab.size as usize];
-    if reader.seek(SeekFrom::Start(symtab.offset)).is_err()
-        || reader.read_exact(&mut symbytes).is_err()
-    {
-        return Vec::new();
-    }
-    let step = entsize as usize;
-    let count = symbytes.len() / step;
     let mut funcs = Vec::new();
-    for index in 0..count {
-        let ent = &symbytes[index * step..index * step + 24];
-        let name_off = u32::from_le_bytes(ent[0..4].try_into().unwrap()) as usize;
-        let info = ent[4];
-        let shndx = u16::from_le_bytes(ent[6..8].try_into().unwrap());
-        let value = u64::from_le_bytes(ent[8..16].try_into().unwrap());
-        let size = u64::from_le_bytes(ent[16..24].try_into().unwrap());
-        let kind = info & 0xf;
-        if shndx == SHN_UNDEF || value == 0 || (kind != STT_FUNC && kind != STT_GNU_IFUNC) {
-            continue;
-        }
-        let Some(raw) = cstr_at(&strtab, name_off) else {
-            continue;
-        };
-        if raw.is_empty() {
-            continue;
-        }
-        let presented = symbol::present_elf_symbol(raw);
-        funcs.push(ElfFunc {
-            vaddr: value,
-            size,
-            name: presented.name,
-            runtime: presented.runtime,
-        });
-    }
+    visit_elf64_symbols(
+        data,
+        sections,
+        kind,
+        MAX_SYMBOLS,
+        MAX_STRINGS,
+        |raw, sym| {
+            let st_type = sym.st_type();
+            let shndx = sym.st_shndx(LittleEndian);
+            let value = sym.st_value(LittleEndian);
+            if shndx == elf::SHN_UNDEF
+                || value == 0
+                || (st_type != elf::STT_FUNC && st_type != elf::STT_GNU_IFUNC)
+                || raw.is_empty()
+            {
+                return;
+            }
+            let presented = symbol::present_elf_symbol(raw);
+            funcs.push(ElfFunc {
+                vaddr: value,
+                size: sym.st_size(LittleEndian),
+                name: presented.name,
+                runtime: presented.runtime,
+            });
+        },
+    );
     funcs
 }
 
-fn read_dwarf_lines<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
-    sections: &[Section],
-    shstrndx: u64,
+fn read_dwarf_lines<'data, R: ReadRef<'data>>(
+    data: R,
+    sections: &object::read::elf::SectionTable<'data, elf::FileHeader64<LittleEndian>, R>,
 ) -> Arc<LineTable> {
-    let Ok(shstr_idx) = usize::try_from(shstrndx) else {
-        return Arc::new(LineTable::default());
-    };
-    let Some(shstr_sec) = sections.get(shstr_idx) else {
-        return Arc::new(LineTable::default());
-    };
-    let Some(shstr) = read_section_bytes(reader, len, *shstr_sec, MAX_STRINGS) else {
-        return Arc::new(LineTable::default());
-    };
     let mut line_sec = None;
     let mut line_str_sec = None;
     let mut str_sec = None;
-    for section in sections {
-        if section.kind == SHT_NOBITS || (section.flags & SHF_COMPRESSED) != 0 || section.size == 0
+    for section in sections.iter() {
+        if section.sh_type(LittleEndian) == elf::SHT_NOBITS
+            || section.sh_flags(LittleEndian).contains(elf::SHF_COMPRESSED)
+            || section.sh_size(LittleEndian) == 0
         {
             continue;
         }
-        let Some(name) = cstr_at(&shstr, section.name as usize) else {
+        let Ok(name) = sections.section_name(LittleEndian, section) else {
             continue;
         };
         match name {
-            ".debug_line" if line_sec.is_none() => line_sec = Some(*section),
-            ".debug_line_str" if line_str_sec.is_none() => line_str_sec = Some(*section),
-            ".debug_str" if str_sec.is_none() => str_sec = Some(*section),
+            b".debug_line" if line_sec.is_none() => line_sec = Some(section),
+            b".debug_line_str" if line_str_sec.is_none() => line_str_sec = Some(section),
+            b".debug_str" if str_sec.is_none() => str_sec = Some(section),
             _ => {}
         }
     }
     let Some(line_sec) = line_sec else {
         return Arc::new(LineTable::default());
     };
-    let Some(debug_line) = read_section_bytes(reader, len, line_sec, MAX_LINE_SECTION_BYTES) else {
+    let Some(debug_line) = read_elf64_section(data, line_sec, MAX_LINE_SECTION_BYTES) else {
         return Arc::new(LineTable::default());
     };
     let debug_line_str = line_str_sec
-        .and_then(|sec| read_section_bytes(reader, len, sec, MAX_STR_SECTION_BYTES))
+        .and_then(|sec| read_elf64_section(data, sec, MAX_STR_SECTION_BYTES))
         .unwrap_or_default();
     let debug_str = str_sec
-        .and_then(|sec| read_section_bytes(reader, len, sec, MAX_STR_SECTION_BYTES))
+        .and_then(|sec| read_elf64_section(data, sec, MAX_STR_SECTION_BYTES))
         .unwrap_or_default();
     Arc::new(LineTable::parse(
         DwarfLineSections {
-            debug_line: &debug_line,
-            debug_line_str: &debug_line_str,
-            debug_str: &debug_str,
+            debug_line,
+            debug_line_str,
+            debug_str,
         },
         8,
     ))
 }
 
-fn read_elf_unwind<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
+fn read_elf_unwind<'data, R: ReadRef<'data>>(
+    data: R,
     loads: &[LoadSegment],
     gnu_eh_frame: Option<LoadSegment>,
-    sections: &[Section],
-    shstrndx: u64,
+    sections: &object::read::elf::SectionTable<'data, elf::FileHeader64<LittleEndian>, R>,
 ) -> ElfUnwind {
     let base_svma = loads.iter().map(|load| load.vaddr).min().unwrap_or(0);
-    let shstr = usize::try_from(shstrndx)
-        .ok()
-        .and_then(|idx| sections.get(idx).copied())
-        .and_then(|sec| read_section_bytes(reader, len, sec, MAX_STRINGS));
     let mut text_svma = None;
     let mut got_svma = None;
     let mut got_plt_svma = None;
     let mut eh_hdr_sec = None;
     let mut eh_sec = None;
     let mut debug_frame_sec = None;
-    if let Some(shstr) = shstr.as_deref() {
-        for section in sections {
-            if section.kind == SHT_NOBITS
-                || (section.flags & SHF_COMPRESSED) != 0
-                || section.size == 0
-            {
-                continue;
-            }
-            let Some(name) = cstr_at(shstr, section.name as usize) else {
-                continue;
-            };
-            let range = section.addr..section.addr.saturating_add(section.size);
-            match name {
-                ".text" if text_svma.is_none() => text_svma = Some(range),
-                ".got" if got_svma.is_none() => got_svma = Some(range),
-                ".got.plt" if got_plt_svma.is_none() => got_plt_svma = Some(range),
-                ".eh_frame_hdr" if eh_hdr_sec.is_none() => eh_hdr_sec = Some(*section),
-                ".eh_frame" if eh_sec.is_none() => eh_sec = Some(*section),
-                ".debug_frame" if debug_frame_sec.is_none() => debug_frame_sec = Some(*section),
-                _ => {}
-            }
+    for section in sections.iter() {
+        if section.sh_type(LittleEndian) == elf::SHT_NOBITS
+            || section.sh_flags(LittleEndian).contains(elf::SHF_COMPRESSED)
+            || section.sh_size(LittleEndian) == 0
+        {
+            continue;
+        }
+        let Ok(name) = sections.section_name(LittleEndian, section) else {
+            continue;
+        };
+        let addr = section.sh_addr(LittleEndian);
+        let size = section.sh_size(LittleEndian);
+        let range = addr..addr.saturating_add(size);
+        match name {
+            b".text" if text_svma.is_none() => text_svma = Some(range),
+            b".got" if got_svma.is_none() => got_svma = Some(range),
+            b".got.plt" if got_plt_svma.is_none() => got_plt_svma = Some(range),
+            b".eh_frame_hdr" if eh_hdr_sec.is_none() => eh_hdr_sec = Some(section),
+            b".eh_frame" if eh_sec.is_none() => eh_sec = Some(section),
+            b".debug_frame" if debug_frame_sec.is_none() => debug_frame_sec = Some(section),
+            _ => {}
         }
     }
     let mut eh_frame_hdr_svma = None;
     let mut eh_frame_hdr = None;
     if let Some(sec) = eh_hdr_sec
-        && let Some(bytes) = read_section_bytes(reader, len, sec, MAX_EH_FRAME_HDR_BYTES)
+        && let Some(bytes) = read_elf64_section(data, sec, MAX_EH_FRAME_HDR_BYTES)
     {
-        eh_frame_hdr_svma = Some(sec.addr..sec.addr.saturating_add(sec.size));
-        eh_frame_hdr = Some(crate::walk::SectionBytes::new(bytes));
+        let addr = sec.sh_addr(LittleEndian);
+        eh_frame_hdr_svma = Some(addr..addr.saturating_add(sec.sh_size(LittleEndian)));
+        eh_frame_hdr = Some(crate::walk::SectionBytes::new(bytes.to_vec()));
     }
     let mut eh_frame_svma = None;
     let mut eh_frame = None;
     if let Some(sec) = eh_sec
-        && let Some(bytes) = read_section_bytes(reader, len, sec, MAX_EH_FRAME_BYTES)
+        && let Some(bytes) = read_elf64_section(data, sec, MAX_EH_FRAME_BYTES)
     {
-        eh_frame_svma = Some(sec.addr..sec.addr.saturating_add(sec.size));
-        eh_frame = Some(crate::walk::SectionBytes::new(bytes));
+        let addr = sec.sh_addr(LittleEndian);
+        eh_frame_svma = Some(addr..addr.saturating_add(sec.sh_size(LittleEndian)));
+        eh_frame = Some(crate::walk::SectionBytes::new(bytes.to_vec()));
     }
     if eh_frame.is_none() {
-        let fallback = read_elf_unwind_from_phdr(reader, len, loads, gnu_eh_frame);
+        let fallback = read_elf_unwind_from_phdr(data, loads, gnu_eh_frame);
         if fallback.eh_frame.is_some() {
             eh_frame_hdr_svma = fallback.eh_frame_hdr_svma;
             eh_frame_hdr = fallback.eh_frame_hdr;
@@ -735,8 +546,8 @@ fn read_elf_unwind<R: Read + Seek>(
     }
     let debug_frame = if eh_frame.is_none() {
         debug_frame_sec
-            .and_then(|sec| read_section_bytes(reader, len, sec, MAX_EH_FRAME_BYTES))
-            .map(crate::walk::SectionBytes::new)
+            .and_then(|sec| read_elf64_section(data, sec, MAX_EH_FRAME_BYTES))
+            .map(|bytes| crate::walk::SectionBytes::new(bytes.to_vec()))
     } else {
         None
     };
@@ -752,9 +563,8 @@ fn read_elf_unwind<R: Read + Seek>(
     }
 }
 
-fn read_elf_unwind_from_phdr<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
+fn read_elf_unwind_from_phdr<'data, R: ReadRef<'data>>(
+    data: R,
     loads: &[LoadSegment],
     gnu_eh_frame: Option<LoadSegment>,
 ) -> ElfUnwind {
@@ -765,19 +575,19 @@ fn read_elf_unwind_from_phdr<R: Read + Seek>(
             ..Default::default()
         };
     };
-    let Some(hdr_bytes) = read_range_bytes(
-        reader,
-        len,
-        hdr_seg.offset,
-        hdr_seg.filesz,
-        MAX_EH_FRAME_HDR_BYTES,
-    ) else {
+    if hdr_seg.filesz == 0 || hdr_seg.filesz > MAX_EH_FRAME_HDR_BYTES {
+        return ElfUnwind {
+            base_svma,
+            ..Default::default()
+        };
+    }
+    let Ok(hdr_bytes) = data.read_bytes_at(hdr_seg.offset, hdr_seg.filesz) else {
         return ElfUnwind {
             base_svma,
             ..Default::default()
         };
     };
-    let Some(eh_vaddr) = decode_eh_frame_hdr_ptr(&hdr_bytes, hdr_seg.vaddr) else {
+    let Some(eh_vaddr) = decode_eh_frame_hdr_ptr(hdr_bytes, hdr_seg.vaddr) else {
         return ElfUnwind {
             base_svma,
             ..Default::default()
@@ -795,8 +605,13 @@ fn read_elf_unwind_from_phdr<R: Read + Seek>(
     let off_in_load = eh_vaddr - load.vaddr;
     let eh_offset = load.offset.saturating_add(off_in_load);
     let eh_size = (load.filesz - off_in_load).min(MAX_EH_FRAME_BYTES);
-    let Some(eh_bytes) = read_range_bytes(reader, len, eh_offset, eh_size, MAX_EH_FRAME_BYTES)
-    else {
+    if eh_size == 0 {
+        return ElfUnwind {
+            base_svma,
+            ..Default::default()
+        };
+    }
+    let Ok(eh_bytes) = data.read_bytes_at(eh_offset, eh_size) else {
         return ElfUnwind {
             base_svma,
             ..Default::default()
@@ -805,9 +620,9 @@ fn read_elf_unwind_from_phdr<R: Read + Seek>(
     ElfUnwind {
         base_svma,
         eh_frame_hdr_svma: Some(hdr_seg.vaddr..hdr_seg.vaddr.saturating_add(hdr_seg.filesz)),
-        eh_frame_hdr: Some(crate::walk::SectionBytes::new(hdr_bytes)),
+        eh_frame_hdr: Some(crate::walk::SectionBytes::new(hdr_bytes.to_vec())),
         eh_frame_svma: Some(eh_vaddr..eh_vaddr.saturating_add(eh_size)),
-        eh_frame: Some(crate::walk::SectionBytes::new(eh_bytes)),
+        eh_frame: Some(crate::walk::SectionBytes::new(eh_bytes.to_vec())),
         ..Default::default()
     }
 }
@@ -833,40 +648,6 @@ fn decode_eh_frame_hdr_ptr(hdr: &[u8], hdr_vaddr: u64) -> Option<u64> {
         0x30 => Some(hdr_vaddr.wrapping_add(raw)),
         _ => None,
     }
-}
-
-fn read_section_bytes<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
-    section: Section,
-    cap: u64,
-) -> Option<Vec<u8>> {
-    read_range_bytes(reader, len, section.offset, section.size, cap)
-}
-
-fn read_range_bytes<R: Read + Seek>(
-    reader: &mut R,
-    len: u64,
-    offset: u64,
-    size: u64,
-    cap: u64,
-) -> Option<Vec<u8>> {
-    if size == 0 || size > cap || offset.saturating_add(size) > len {
-        return None;
-    }
-    let mut buf = vec![0u8; size as usize];
-    reader.seek(SeekFrom::Start(offset)).ok()?;
-    reader.read_exact(&mut buf).ok()?;
-    Some(buf)
-}
-
-fn cstr_at(buf: &[u8], offset: usize) -> Option<&str> {
-    let rest = buf.get(offset..)?;
-    let end = rest
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(rest.len());
-    std::str::from_utf8(&rest[..end]).ok()
 }
 
 /// Whether this ELF matches the host Linux sampler architecture (`x86_64` or `aarch64`).
@@ -1123,11 +904,13 @@ mod tests {
         let shoff = align8(shstr_off + shstr.len() as u64);
         let file_len = shoff + 5 * 64;
         let mut bytes = vec![0u8; file_len as usize];
-        bytes[0..4].copy_from_slice(&super::ELF_MAGIC);
+        bytes[0..4].copy_from_slice(b"\x7fELF");
         bytes[4] = 2;
         bytes[5] = 1;
+        bytes[6] = 1;
         bytes[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
         bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
         bytes[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
         bytes[40..48].copy_from_slice(&shoff.to_le_bytes());
         bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize

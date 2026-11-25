@@ -21,7 +21,7 @@
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -39,6 +39,7 @@ const MAX_SYMBOL_SPAN: u64 = 16 * 1024 * 1024;
 
 const MH_MAGIC_64: u32 = 0xFEED_FACF;
 pub(crate) const MH_DYLIB_IN_CACHE: u32 = 0x8000_0000;
+#[cfg(test)]
 const FAT_MAGIC: u32 = 0xCAFE_BABE;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 const CPU_TYPE_ARM64: u32 = 0x0100_000C;
@@ -356,47 +357,37 @@ fn parse_reader<R: Read + Seek>(
     cpu: MachCpu,
     include_symbols: bool,
 ) -> Option<ImageSymbols> {
-    let mut magic = [0u8; 8];
-    reader.seek(SeekFrom::Start(0)).ok()?;
-    if reader.read(&mut magic).ok()? >= 8 && crate::policy::is_dyld_shared_cache(&magic) {
+    use object::LittleEndian;
+    use object::ReadRef as _;
+
+    let cache = object::ReadCache::new(&mut reader);
+    if let Ok(magic) = cache.read_bytes_at(0, 8)
+        && crate::policy::is_dyld_shared_cache(magic)
+    {
         return None;
     }
-    let (offset, size) = select_slice(&mut reader, len, cpu)?;
+    let (offset, size) = crate::binfmt::macho_slice(&cache, len, cpu.cputype())?;
     if size < 32 || offset.saturating_add(size) > len {
         return None;
     }
-    reader.seek(SeekFrom::Start(offset)).ok()?;
-    let mut header_buf = [0u8; 32];
-    reader.read_exact(&mut header_buf).ok()?;
-    let header = Header64::read(&header_buf)?;
-    if header.sizeofcmds > 1024 * 1024 {
-        return None;
-    }
-    let mut commands = vec![0u8; header.sizeofcmds];
-    reader.read_exact(&mut commands).ok()?;
-    let (text_vmaddr, text_vmsize, end_vmaddr) =
-        walk_segments(&commands, header.ncmds, header.flags)?;
+    let slice_ref = cache.range(offset, size);
+    let (header, _) = crate::binfmt::macho_commands(slice_ref, 1024 * 1024)?;
+    let ncmds = header.ncmds.get(LittleEndian) as usize;
+    let sizeofcmds = header.sizeofcmds.get(LittleEndian) as usize;
+    let flags = header.flags.get(LittleEndian).0;
+    let commands = slice_ref.read_bytes_at(32, sizeofcmds as u64).ok()?;
+    let (text_vmaddr, text_vmsize, end_vmaddr) = walk_segments(commands, ncmds, flags)?;
     let symbols = if include_symbols {
-        match find_symtab(&commands, header.ncmds) {
-            Some(symtab) => read_symbols(&mut reader, offset, size, &symtab)?,
-            None => Vec::new(),
-        }
+        read_symbols(slice_ref)?
     } else {
         Vec::new()
     };
     let lines = if include_symbols {
-        read_dwarf_lines(&mut reader, offset, size, &commands, header.ncmds).unwrap_or_default()
+        read_dwarf_lines(slice_ref).unwrap_or_default()
     } else {
         LineTable::default()
     };
-    let unwind = read_macho_unwind(
-        &mut reader,
-        offset,
-        size,
-        text_vmaddr,
-        &commands,
-        header.ncmds,
-    );
+    let unwind = read_macho_unwind(slice_ref, text_vmaddr);
     let slide = load_addr.wrapping_sub(text_vmaddr);
     let mut runtime = Vec::with_capacity(symbols.len());
     for (unslid, name, lang) in symbols {
@@ -457,38 +448,6 @@ pub(crate) struct Symtab {
     pub strsize: u32,
 }
 
-fn select_slice<R: Read + Seek>(reader: &mut R, len: u64, cpu: MachCpu) -> Option<(u64, u64)> {
-    let mut magic_buf = [0u8; 4];
-    reader.seek(SeekFrom::Start(0)).ok()?;
-    reader.read_exact(&mut magic_buf).ok()?;
-    let le = u32::from_le_bytes(magic_buf);
-    let be = u32::from_be_bytes(magic_buf);
-    if le == MH_MAGIC_64 {
-        return Some((0, len));
-    }
-    if be != FAT_MAGIC {
-        return None;
-    }
-    let mut count_buf = [0u8; 4];
-    reader.read_exact(&mut count_buf).ok()?;
-    let nfat = u32::from_be_bytes(count_buf);
-    if nfat == 0 || nfat > 64 {
-        return None;
-    }
-    let want = cpu.cputype();
-    for _ in 0..nfat {
-        let mut arch = [0u8; 20];
-        reader.read_exact(&mut arch).ok()?;
-        let cputype = u32::from_be_bytes(arch[0..4].try_into().ok()?);
-        let offset = u64::from(u32::from_be_bytes(arch[8..12].try_into().ok()?));
-        let size = u64::from(u32::from_be_bytes(arch[12..16].try_into().ok()?));
-        if cputype == want {
-            return Some((offset, size));
-        }
-    }
-    None
-}
-
 /// `__TEXT` `(vmaddr, vmsize)` plus the unslid end of the image's owned segments.
 fn walk_segments(commands: &[u8], ncmds: usize, flags: u32) -> Option<(u64, u64, u64)> {
     let mut text_vmaddr = None;
@@ -536,41 +495,48 @@ pub(crate) fn find_symtab(commands: &[u8], ncmds: usize) -> Option<Symtab> {
     None
 }
 
-fn read_symbols<R: Read + Seek>(
-    reader: &mut R,
-    slice_offset: u64,
-    slice_size: u64,
-    symtab: &Symtab,
+fn read_symbols<'data, R: object::ReadRef<'data>>(
+    slice_ref: R,
 ) -> Option<Vec<(u64, String, Runtime)>> {
-    if symtab.nsyms > 2_000_000 || symtab.strsize > 64 * 1024 * 1024 {
+    use object::LittleEndian;
+    use object::macho;
+    use object::read::macho::{LoadCommandVariant, Nlist as _};
+
+    let (_, mut commands) = crate::binfmt::macho_commands(slice_ref, 1024 * 1024)?;
+    let mut symtab_cmd = None;
+    while let Some(cmd) = commands.next().ok()? {
+        if let LoadCommandVariant::Symtab(symtab) = cmd.variant().ok()? {
+            symtab_cmd = Some(symtab);
+            break;
+        }
+    }
+    let Some(symtab_cmd) = symtab_cmd else {
+        return Some(Vec::new());
+    };
+    let nsyms = symtab_cmd.nsyms.get(LittleEndian);
+    let strsize = symtab_cmd.strsize.get(LittleEndian);
+    if nsyms > 2_000_000 || strsize > 64 * 1024 * 1024 {
         return None;
     }
-    let sym_bytes = u64::from(symtab.nsyms).checked_mul(16)?;
-    let sym_at = slice_offset.checked_add(symtab.symoff)?;
-    let str_at = slice_offset.checked_add(symtab.stroff)?;
-    if sym_at.checked_add(sym_bytes)? > slice_offset.saturating_add(slice_size) {
-        return None;
-    }
-    if str_at.checked_add(u64::from(symtab.strsize))? > slice_offset.saturating_add(slice_size) {
-        return None;
-    }
-    reader.seek(SeekFrom::Start(str_at)).ok()?;
-    let mut strings = vec![0u8; symtab.strsize as usize];
-    reader.read_exact(&mut strings).ok()?;
-    reader.seek(SeekFrom::Start(sym_at)).ok()?;
-    let mut raw = vec![0u8; sym_bytes as usize];
-    reader.read_exact(&mut raw).ok()?;
+    let symtab = symtab_cmd
+        .symbols::<macho::MachHeader64<LittleEndian>, _>(LittleEndian, slice_ref)
+        .ok()?;
+    let strings = symtab.strings();
     let mut symbols = Vec::new();
-    let (entries, _) = raw.as_chunks::<16>();
-    for entry in entries {
-        let n_strx = u32::from_le_bytes(entry[0..4].try_into().ok()?) as usize;
-        let n_type = entry[4];
-        let n_sect = entry[5];
-        let n_value = u64::from_le_bytes(entry[8..16].try_into().ok()?);
+    for entry in symtab.symbols() {
+        let n_type = entry.n_type().0;
+        let n_sect = entry.n_sect();
+        let n_value = entry.n_value(LittleEndian);
         if n_sect == 0 || n_value == 0 || n_type & N_STAB != 0 || n_type & N_TYPE != N_SECT {
             continue;
         }
-        let Some(raw_name) = cstr_at(&strings, n_strx) else {
+        let Ok(raw_bytes) = entry.name(LittleEndian, strings) else {
+            continue;
+        };
+        if raw_bytes.is_empty() {
+            continue;
+        }
+        let Ok(raw_name) = std::str::from_utf8(raw_bytes) else {
             continue;
         };
         let Presented { name, runtime, .. } = symbol::present_macho_symbol(raw_name);
@@ -579,48 +545,42 @@ fn read_symbols<R: Read + Seek>(
     Some(symbols)
 }
 
-fn read_macho_unwind<R: Read + Seek>(
-    reader: &mut R,
-    slice_offset: u64,
-    slice_size: u64,
+fn read_macho_unwind<'data, R: object::ReadRef<'data>>(
+    slice_ref: R,
     base_svma: u64,
-    commands: &[u8],
-    ncmds: usize,
 ) -> MachoUnwind {
+    use object::LittleEndian;
+    use object::read::macho::{LoadCommandVariant, Section as _, Segment as _};
+
     let mut unwind = MachoUnwind {
         base_svma,
         ..Default::default()
     };
+    let Some((_, mut commands)) = crate::binfmt::macho_commands(slice_ref, 1024 * 1024) else {
+        return unwind;
+    };
     let mut text_sec = None;
     let mut unwind_sec = None;
     let mut eh_sec = None;
-    for command in LoadCommands::new(commands, ncmds) {
-        if command.cmd != LC_SEGMENT_64 || command.data.len() < 64 {
-            continue;
-        }
-        let Ok(nsects_bytes) = command.data[56..60].try_into() else {
+    while let Ok(Some(cmd)) = commands.next() {
+        let Ok(LoadCommandVariant::Segment64(seg, sec_data)) = cmd.variant() else {
             continue;
         };
-        let nsects = u32::from_le_bytes(nsects_bytes) as usize;
-        let Some(needed) = 64usize.checked_add(nsects.saturating_mul(80)) else {
+        let Ok(sects) = seg.sections(LittleEndian, sec_data) else {
             continue;
         };
-        if command.data.len() < needed {
-            continue;
-        }
-        for idx in 0..nsects {
-            let sec = &command.data[64 + idx * 80..64 + (idx + 1) * 80];
-            let sect = segname(&sec[0..16]);
-            let seg = segname(&sec[16..32]);
-            let addr = u64::from_le_bytes(sec[32..40].try_into().unwrap());
-            let size = u64::from_le_bytes(sec[40..48].try_into().unwrap());
-            let offset = u64::from(u32::from_le_bytes(sec[48..52].try_into().unwrap()));
-            let flags = u32::from_le_bytes(sec[64..68].try_into().unwrap());
+        for sec in sects {
+            let size = sec.size(LittleEndian);
+            let flags = sec.flags(LittleEndian).0;
             if size == 0 || (flags & 0xff) == S_ZEROFILL {
                 continue;
             }
+            let addr = sec.addr(LittleEndian);
+            let offset = u64::from(sec.offset.get(LittleEndian));
             let range = addr..addr.saturating_add(size);
-            match (seg, sect) {
+            let seg_name = crate::binfmt::macho_name(sec.segname());
+            let sect_name = crate::binfmt::macho_name(sec.sectname());
+            match (seg_name, sect_name) {
                 ("__TEXT", "__text") if unwind.text_svma.is_none() => {
                     unwind.text_svma = Some(range);
                     text_sec = Some(MachSection { offset, size });
@@ -646,21 +606,18 @@ fn read_macho_unwind<R: Read + Seek>(
         }
     }
     if let Some(sec) = unwind_sec {
-        unwind.unwind_info =
-            read_mach_section(reader, slice_offset, slice_size, sec, MAX_UNWIND_INFO_BYTES)
-                .map(crate::walk::SectionBytes::new);
+        unwind.unwind_info = read_mach_section(slice_ref, sec, MAX_UNWIND_INFO_BYTES)
+            .map(crate::walk::SectionBytes::new);
     }
     if let Some(sec) = eh_sec {
-        unwind.eh_frame =
-            read_mach_section(reader, slice_offset, slice_size, sec, MAX_EH_FRAME_BYTES)
-                .map(crate::walk::SectionBytes::new);
+        unwind.eh_frame = read_mach_section(slice_ref, sec, MAX_EH_FRAME_BYTES)
+            .map(crate::walk::SectionBytes::new);
     }
     if unwind.has_unwind_data()
         && let Some(sec) = text_sec
     {
-        unwind.text =
-            read_mach_section(reader, slice_offset, slice_size, sec, MAX_TEXT_UNWIND_BYTES)
-                .map(crate::walk::SectionBytes::new);
+        unwind.text = read_mach_section(slice_ref, sec, MAX_TEXT_UNWIND_BYTES)
+            .map(crate::walk::SectionBytes::new);
     }
     unwind
 }
@@ -674,22 +631,14 @@ fn read_dsym_lines(binary_path: &Path, cpu: MachCpu) -> Option<LineTable> {
         .join("Resources")
         .join("DWARF")
         .join(file_name);
-    let mut file = std::fs::File::open(dwarf_path).ok()?;
+    let file = std::fs::File::open(dwarf_path).ok()?;
     let len = file.metadata().ok()?.len();
-    let (offset, size) = select_slice(&mut file, len, cpu)?;
+    let cache = object::ReadCache::new(file);
+    let (offset, size) = crate::binfmt::macho_slice(&cache, len, cpu.cputype())?;
     if size < 32 || offset.saturating_add(size) > len {
         return None;
     }
-    file.seek(SeekFrom::Start(offset)).ok()?;
-    let mut header_buf = [0u8; 32];
-    file.read_exact(&mut header_buf).ok()?;
-    let header = Header64::read(&header_buf)?;
-    if header.sizeofcmds > 1024 * 1024 {
-        return None;
-    }
-    let mut commands = vec![0u8; header.sizeofcmds];
-    file.read_exact(&mut commands).ok()?;
-    read_dwarf_lines(&mut file, offset, size, &commands, header.ncmds)
+    read_dwarf_lines(cache.range(offset, size))
 }
 
 #[derive(Clone, Copy)]
@@ -698,40 +647,33 @@ struct MachSection {
     size: u64,
 }
 
-fn read_dwarf_lines<R: Read + Seek>(
-    reader: &mut R,
-    slice_offset: u64,
-    slice_size: u64,
-    commands: &[u8],
-    ncmds: usize,
-) -> Option<LineTable> {
+fn read_dwarf_lines<'data, R: object::ReadRef<'data>>(slice_ref: R) -> Option<LineTable> {
+    use object::LittleEndian;
+    use object::read::macho::{LoadCommandVariant, Section as _, Segment as _};
+
+    let (_, mut commands) = crate::binfmt::macho_commands(slice_ref, 1024 * 1024)?;
     let mut line_sec = None;
     let mut line_str_sec = None;
     let mut str_sec = None;
-    for command in LoadCommands::new(commands, ncmds) {
-        if command.cmd != LC_SEGMENT_64 || command.data.len() < 64 {
+    while let Some(cmd) = commands.next().ok()? {
+        let Ok(LoadCommandVariant::Segment64(seg, sec_data)) = cmd.variant() else {
             continue;
-        }
-        let nsects = u32::from_le_bytes(command.data[56..60].try_into().ok()?) as usize;
-        let needed = 64usize.checked_add(nsects.checked_mul(80)?)?;
-        if command.data.len() < needed {
+        };
+        let Ok(sects) = seg.sections(LittleEndian, sec_data) else {
             continue;
-        }
-        for idx in 0..nsects {
-            let sec = &command.data[64 + idx * 80..64 + (idx + 1) * 80];
-            let sect = segname(&sec[0..16]);
-            let seg = segname(&sec[16..32]);
-            if seg != "__DWARF" {
+        };
+        for sec in sects {
+            if crate::binfmt::macho_name(sec.segname()) != "__DWARF" {
                 continue;
             }
-            let size = u64::from_le_bytes(sec[40..48].try_into().ok()?);
-            let offset = u64::from(u32::from_le_bytes(sec[48..52].try_into().ok()?));
-            let flags = u32::from_le_bytes(sec[64..68].try_into().ok()?);
+            let size = sec.size(LittleEndian);
+            let flags = sec.flags(LittleEndian).0;
             if size == 0 || (flags & 0xff) == S_ZEROFILL {
                 continue;
             }
+            let offset = u64::from(sec.offset.get(LittleEndian));
             let entry = MachSection { offset, size };
-            match sect {
+            match crate::binfmt::macho_name(sec.sectname()) {
                 "__debug_line" if line_sec.is_none() => line_sec = Some(entry),
                 "__debug_line_str" if line_str_sec.is_none() => line_str_sec = Some(entry),
                 "__debug_str" if str_sec.is_none() => str_sec = Some(entry),
@@ -740,22 +682,12 @@ fn read_dwarf_lines<R: Read + Seek>(
         }
     }
     let line_sec = line_sec?;
-    let debug_line = read_mach_section(
-        reader,
-        slice_offset,
-        slice_size,
-        line_sec,
-        MAX_LINE_SECTION_BYTES,
-    )?;
+    let debug_line = read_mach_section(slice_ref, line_sec, MAX_LINE_SECTION_BYTES)?;
     let debug_line_str = line_str_sec
-        .and_then(|sec| {
-            read_mach_section(reader, slice_offset, slice_size, sec, MAX_STR_SECTION_BYTES)
-        })
+        .and_then(|sec| read_mach_section(slice_ref, sec, MAX_STR_SECTION_BYTES))
         .unwrap_or_default();
     let debug_str = str_sec
-        .and_then(|sec| {
-            read_mach_section(reader, slice_offset, slice_size, sec, MAX_STR_SECTION_BYTES)
-        })
+        .and_then(|sec| read_mach_section(slice_ref, sec, MAX_STR_SECTION_BYTES))
         .unwrap_or_default();
     let table = LineTable::parse(
         DwarfLineSections {
@@ -768,38 +700,15 @@ fn read_dwarf_lines<R: Read + Seek>(
     (!table.is_empty()).then_some(table)
 }
 
-fn read_mach_section<R: Read + Seek>(
-    reader: &mut R,
-    slice_offset: u64,
-    slice_size: u64,
+fn read_mach_section<'data, R: object::ReadRef<'data>>(
+    slice_ref: R,
     sec: MachSection,
     cap: u64,
 ) -> Option<Vec<u8>> {
     if sec.size == 0 || sec.size > cap {
         return None;
     }
-    let start = slice_offset.checked_add(sec.offset)?;
-    let end = start.checked_add(sec.size)?;
-    if end > slice_offset.saturating_add(slice_size) {
-        return None;
-    }
-    let mut buf = vec![0u8; sec.size as usize];
-    reader.seek(SeekFrom::Start(start)).ok()?;
-    reader.read_exact(&mut buf).ok()?;
-    Some(buf)
-}
-
-fn cstr_at(strings: &[u8], offset: usize) -> Option<&str> {
-    let rest = strings.get(offset..)?;
-    let end = rest
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(rest.len());
-    let bytes = &rest[..end];
-    if bytes.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(bytes).ok()
+    Some(slice_ref.read_bytes_at(sec.offset, sec.size).ok()?.to_vec())
 }
 
 pub(crate) fn segname(bytes: &[u8]) -> &str {

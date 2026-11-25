@@ -22,6 +22,9 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# Enable in-process `anyprof update` (axoupdater + tokio) in release archives,
+# keeping source `cargo install` / workspace builds free of async/TLS deps by default.
+features = ["self-update"]
 # The viewer is first-party HTML, CSS, and JavaScript. It does not embed
 # speedscope or Source Code Pro, so those license files are not packaged.
 

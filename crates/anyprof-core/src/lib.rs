@@ -44,11 +44,13 @@ mod profile;
 mod stop;
 
 pub use backend::{
-    Backend, Capabilities, DEVTOOLS_SAMPLING_INTERVAL, PERF_SAMPLING_INTERVAL, RecordOptions,
-    Registry, Session, Target, interval_for_frequency,
+    Backend, Capabilities, DEVTOOLS_SAMPLING_INTERVAL, LanguageUnwind, PERF_SAMPLING_INTERVAL,
+    RecordOptions, Registry, Session, Target, interval_for_frequency,
 };
 pub use error::Error;
 pub use format::Format;
+#[cfg(unix)]
+pub use process::send_sigusr1;
 pub use process::{ProcessSnapshot, executable_file, inspect, process_exists};
 pub use profile::{Frame, MAX_TIMED_SAMPLES, Profile, Runtime, Stack, TimedSample};
 pub use stop::{SignalAction, StopGate};

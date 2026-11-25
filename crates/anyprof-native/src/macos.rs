@@ -15,7 +15,6 @@
 //! a warning is logged. Linux records kernel frames with perf events. Windows
 //! x64 samples user frames only, the same as macOS.
 
-use std::ffi::c_char;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -57,11 +56,6 @@ use mach2::thread_status::ARM_THREAD_STATE64 as THREAD_STATE;
 #[cfg(target_arch = "x86_64")]
 use mach2::thread_status::x86_THREAD_STATE64 as THREAD_STATE;
 
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidpath(pid: i32, buffer: *mut c_char, buffersize: u32) -> i32;
-}
-
 unsafe extern "C" {
     fn thread_info(
         target_act: thread_act_t,
@@ -72,7 +66,12 @@ unsafe extern "C" {
     fn mach_port_deallocate(task: mach_port_t, name: mach_port_t) -> kern_return_t;
 }
 
-pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
+pub fn record(
+    target: &Target,
+    opts: &RecordOptions,
+    session_stop: &anyprof_core::StopGate,
+    ready_tx: &std::sync::mpsc::SyncSender<Result<(), Error>>,
+) -> Result<Profile, Error> {
     if opts.include_kernel {
         tracing::warn!("ignoring -k/--kernel: the macOS native sampler collects user frames only");
     }
@@ -87,13 +86,13 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         return Err(Error::backend("native", message));
     }
 
-    let task = Task::attach(target.pid)?;
+    let mut task = Task::attach(target.pid)?;
     let mut unwinder = MachUnwinder::new();
     let mut unwind_cache = MachUnwindCache::new_in();
     let mut go_images = Vec::new();
     let mut python = None;
     let mut java = None;
-    let mut symbols = SymbolTable::new(target.pid);
+    let mut symbols = SymbolTable::new(target.pid, opts.language_unwind);
     symbols.sync_from_task(
         task.port,
         &mut unwinder,
@@ -106,13 +105,14 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         images = symbols.images.len(),
         "native unwind tables prepared"
     );
+    let _ = ready_tx.send(Ok(()));
 
     let started = Instant::now();
     let mut next = started;
     let mut collector = SampleCollector::new();
-    let mut cache_activated = false;
+    let mut reattaches = 0u32;
     loop {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             break;
         }
         if opts
@@ -136,6 +136,9 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             java.as_ref(),
         ) {
             Ok(stacks) => {
+                if !stop_requested(opts, session_stop) {
+                    symbols.activate_shared_cache_for_hits(&mut unwinder, &stacks);
+                }
                 let offset_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 for hit in stacks {
                     if hit.stack.recordable() {
@@ -151,16 +154,42 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
                 return Err(Error::backend("native", err));
             }
             Err(SampleFault::Tick(err)) => {
+                // When sampling a freshly spawned child (`anyprof rec -- <cmd>`),
+                // XNU can replace the child's Mach `task_t` port as `execve` /
+                // `amfid` completes, invalidating an early send right while `pid`
+                // is still alive. Re-acquire the task port so sampling continues.
+                if reattaches < 16
+                    && !stop_requested(opts, session_stop)
+                    && anyprof_core::process_exists(target.pid)
+                    && let Ok(new_task) = Task::attach(target.pid)
+                {
+                    let port_changed = new_task.port != task.port;
+                    reattaches += 1;
+                    tracing::debug!(
+                        pid = target.pid,
+                        reattaches,
+                        port_changed,
+                        %err,
+                        "re-attached Mach task port after tick fault on live pid"
+                    );
+                    task = new_task;
+                    if port_changed {
+                        unwinder = MachUnwinder::new();
+                        unwind_cache = MachUnwindCache::new_in();
+                        go_images.clear();
+                        python = None;
+                        java = None;
+                        symbols = SymbolTable::new(target.pid, opts.language_unwind);
+                    }
+                    std::thread::sleep(interval.min(Duration::from_millis(5)));
+                    continue;
+                }
                 tracing::debug!(pid = target.pid, %err, "native sample failed");
                 if collector.is_empty() && started.elapsed() < Duration::from_millis(50) {
                     return Err(Error::backend("native", err));
                 }
                 break;
             }
-        }
-        if !cache_activated && !opts.stop.stop_requested() {
-            cache_activated = true;
-            symbols.activate_shared_cache(&mut unwinder);
         }
         next += interval;
         let now = Instant::now();
@@ -173,7 +202,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
                 next = end;
             }
         }
-        wait_until(next, opts);
+        wait_until(next, opts, session_stop);
         if opts
             .duration
             .is_some_and(|limit| started.elapsed() >= limit)
@@ -181,6 +210,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             break;
         }
     }
+    let elapsed = started.elapsed();
 
     symbols.sync_from_task(
         task.port,
@@ -197,14 +227,18 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         comm,
         collector,
         &mut symbols,
-        started.elapsed(),
+        elapsed,
         interval,
     ))
 }
 
-fn wait_until(deadline: Instant, opts: &RecordOptions) {
+fn stop_requested(opts: &RecordOptions, session_stop: &anyprof_core::StopGate) -> bool {
+    opts.stop.stop_requested() || session_stop.stop_requested()
+}
+
+fn wait_until(deadline: Instant, opts: &RecordOptions, session_stop: &anyprof_core::StopGate) {
     while Instant::now() < deadline {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -996,6 +1030,7 @@ struct TrackedImage {
 struct SymbolTable {
     pid: u32,
     cpu: MachCpu,
+    language_unwind: anyprof_core::LanguageUnwind,
     shared_cache: Option<Option<&'static crate::dyld_cache::DyldSharedCache>>,
     info_addr: Option<u64>,
     seen_dyld_count: Option<u32>,
@@ -1005,10 +1040,11 @@ struct SymbolTable {
 }
 
 impl SymbolTable {
-    fn new(pid: u32) -> Self {
+    fn new(pid: u32, language_unwind: anyprof_core::LanguageUnwind) -> Self {
         Self {
             pid,
             cpu: MachCpu::host(),
+            language_unwind,
             shared_cache: None,
             info_addr: None,
             seen_dyld_count: None,
@@ -1069,10 +1105,10 @@ impl SymbolTable {
         }
 
         if added_any {
-            if python.is_none() {
+            if self.language_unwind.allows_python() && python.is_none() {
                 *python = python::attach_mach(&self.raw_images);
             }
-            if java.is_none() {
+            if self.language_unwind.allows_java() && java.is_none() {
                 *java = java::attach_mach(&self.raw_images, &mut |addr, buf| {
                     read_task(task, addr, buf)
                 });
@@ -1080,15 +1116,39 @@ impl SymbolTable {
         }
     }
 
-    fn activate_shared_cache(&mut self, unwinder: &mut MachUnwinder) {
+    fn activate_shared_cache_for_hits(&mut self, unwinder: &mut MachUnwinder, hits: &[ThreadHit]) {
+        let mut hit_indices = Vec::new();
+        for hit in hits {
+            let CountedStack::Addresses { frames, .. } = &hit.stack else {
+                continue;
+            };
+            for (frame_idx, &addr) in frames.iter().enumerate() {
+                let probe = policy::symbol_lookup_address(addr, frame_idx == 0);
+                if let Some(img_idx) = self.images.iter().position(|entry| {
+                    matches!(entry.source, ImageSource::PendingCache(_))
+                        && (entry.symbols.contains(probe) || entry.symbols.contains(addr))
+                }) && !hit_indices.contains(&img_idx)
+                {
+                    hit_indices.push(img_idx);
+                }
+            }
+        }
+        if hit_indices.is_empty() {
+            return;
+        }
         let cpu = self.cpu;
         let Some(cache) = *self
             .shared_cache
             .get_or_insert_with(|| crate::dyld_cache::DyldSharedCache::host(cpu))
         else {
+            for idx in hit_indices {
+                self.images[idx].source = ImageSource::None;
+                self.images[idx].symbols_loaded = true;
+            }
             return;
         };
-        for entry in &mut self.images {
+        for idx in hit_indices {
+            let entry = &mut self.images[idx];
             let ImageSource::PendingCache(path) = &entry.source else {
                 continue;
             };
@@ -1113,7 +1173,11 @@ impl SymbolTable {
         if path.is_file() {
             let file_unwind = ImageSymbols::parse_unwind_file(path, remote.load, &module, self.cpu);
             let rust_image = crate::rust_image::file_is_rust(path);
-            let go = attach_go(&remote.path, remote.load);
+            let go = self
+                .language_unwind
+                .allows_go()
+                .then(|| attach_go(&remote.path, remote.load))
+                .flatten();
             if let Some(mut parsed) = file_unwind {
                 parsed.rust_image = rust_image;
                 parsed.go = go;
@@ -1131,24 +1195,6 @@ impl SymbolTable {
                     symbols: image,
                     source: ImageSource::PendingCache(remote.path),
                     symbols_loaded: false,
-                });
-            }
-            return None;
-        }
-
-        if let Some(Some(cache)) = self.shared_cache {
-            if let Some(parsed) = cache.load_unwind(&remote.path, remote.load, &module) {
-                return Some(TrackedImage {
-                    symbols: parsed,
-                    source: ImageSource::SharedCache(remote.path),
-                    symbols_loaded: false,
-                });
-            }
-            if remote.end > remote.load {
-                return Some(TrackedImage {
-                    symbols: ImageSymbols::range_only(remote.load, remote.end, module),
-                    source: ImageSource::None,
-                    symbols_loaded: true,
                 });
             }
             return None;
@@ -1371,24 +1417,7 @@ fn read_remote_cstr(task: task_t, addr: u64) -> Option<String> {
 }
 
 fn pid_path(pid: u32) -> Option<String> {
-    let mut buf = [0u8; 4096];
-    let n = unsafe {
-        proc_pidpath(
-            pid as i32,
-            buf.as_mut_ptr() as *mut c_char,
-            buf.len() as u32,
-        )
-    };
-    if n <= 0 {
-        return None;
-    }
-    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
-    let text = std::str::from_utf8(&buf[..end]).ok()?;
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
+    anyprof_core::executable_file(pid).and_then(|path| path.into_os_string().into_string().ok())
 }
 
 fn module_name(path: &str) -> String {
