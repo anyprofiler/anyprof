@@ -845,12 +845,13 @@ function openSourceForFrame(frameId, nodeId) {
   renderInspector();
 }
 
-function renderTree(host) {
+function renderTree(host, focusId) {
   const pane = host || $("pane");
   const previous = pane.querySelector(".scroll");
-  const scrollTop = previous ? previous.scrollTop : 0;
+  let scrollTop = previous ? previous.scrollTop : 0;
   clear(pane);
-  if (!state.tree.nodes.length || !flatten().length) {
+  const initialFlat = flatten();
+  if (!state.tree.nodes.length || !initialFlat.length) {
     pane.append(el("div", "empty", state.query ? "No functions match." : "No samples in this range."));
     return;
   }
@@ -865,10 +866,23 @@ function renderTree(host) {
   scroll.append(top, rows, bottom);
   table.append(scroll);
   pane.append(table);
-  const paint = () => {
+  const viewH = scroll.clientHeight || 240;
+  if (focusId != null) {
+    const idx = initialFlat.findIndex((item) => item.id === focusId);
+    if (idx >= 0) {
+      const targetTop = idx * ROW;
+      if (targetTop < scrollTop || targetTop + ROW > scrollTop + viewH) {
+        scrollTop = Math.max(0, targetTop - Math.floor(viewH / 3));
+      }
+    }
+  }
+  const maxTop = Math.max(0, initialFlat.length * ROW - viewH);
+  scrollTop = Math.min(scrollTop, maxTop);
+  const paint = (overrideTop) => {
     const flat = flatten();
     const height = scroll.clientHeight || 400;
-    const start = Math.max(0, Math.floor(scroll.scrollTop / ROW) - 4);
+    const effectiveTop = typeof overrideTop === "number" ? overrideTop : scroll.scrollTop;
+    const start = Math.max(0, Math.floor(effectiveTop / ROW) - 4);
     const count = Math.ceil(height / ROW) + 12;
     const slice = flat.slice(start, start + count);
     top.style.height = start * ROW + "px";
@@ -876,8 +890,8 @@ function renderTree(host) {
     clear(rows);
     for (const node of slice) rows.append(treeRow(node));
   };
-  scroll.addEventListener("scroll", paint);
-  paint();
+  scroll.addEventListener("scroll", () => paint());
+  paint(scrollTop);
   scroll.scrollTop = scrollTop;
 }
 
@@ -1021,16 +1035,7 @@ function focusNodeInTree(node) {
   }
   const treeHost = document.querySelector(".flame-tree");
   if (treeHost) {
-    renderTree(treeHost);
-    const flat = state.flat;
-    const idx = flat.findIndex((item) => item.id === node.id);
-    const scroller = treeHost.querySelector(".scroll");
-    if (scroller && idx >= 0) {
-      const targetTop = idx * ROW;
-      if (targetTop < scroller.scrollTop || targetTop + ROW > scroller.scrollTop + scroller.clientHeight) {
-        scroller.scrollTop = Math.max(0, targetTop - Math.floor(scroller.clientHeight / 3));
-      }
-    }
+    renderTree(treeHost, node.id);
   }
   renderInspector();
 }

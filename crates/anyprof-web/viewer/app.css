@@ -674,6 +674,7 @@ mark {
 .flame-tree {
   flex: 1;
   min-height: 80px;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   border-top: 1px solid var(--line);
