@@ -223,6 +223,13 @@ impl Routes {
                 },
                 Err(message) => Reply::json_error(422, message),
             },
+            Some("source") => match &self.trace {
+                Ok(trace) => match query::source_json(trace, query) {
+                    Ok(body) => Reply::json(200, &body),
+                    Err(message) => Reply::json_error(400, &message),
+                },
+                Err(message) => Reply::json_error(422, message),
+            },
             Some(name) => self.asset(name, accepts_gzip),
         }
     }
@@ -728,5 +735,90 @@ mod tests {
             panic!("second bind on the same port should fail");
         };
         assert!(err.to_string().contains(&first.port().to_string()), "{err}");
+    }
+
+    #[test]
+    fn source_endpoint_reads_profile_referenced_files_and_refuses_traversal() {
+        let dir = std::env::temp_dir().join(format!("anyprof-web-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("app.py");
+        std::fs::write(
+            &src_path,
+            "def entry():\n    return hot()\ndef hot():\n    return 42\n",
+        )
+        .unwrap();
+        let file_str = src_path.to_string_lossy().replace('\\', "/");
+        let speedscope = serde_json::json!({
+            "$schema": "https://www.speedscope.app/file-format-schema.json",
+            "shared": {
+                "frames": [
+                    { "name": "[python] entry", "file": file_str, "line": 2 },
+                    { "name": "[python] hot", "file": file_str, "line": 4 },
+                    { "name": "[node] timer", "file": "node:internal/timers", "line": 10 },
+                    { "name": "[python] sneaky", "file": "/tmp/anyprof/../etc/passwd", "line": 1 }
+                ]
+            },
+            "profiles": [{
+                "type": "sampled",
+                "name": "main",
+                "unit": "none",
+                "startValue": 0,
+                "endValue": 5,
+                "samples": [[0, 1], [2], [3]],
+                "weights": [3, 1, 1]
+            }]
+        })
+        .to_string();
+
+        let routes = Routes::new(Token::from_hex(TOKEN), "demo.json", speedscope.into_bytes());
+        let session = get(&routes, &format!("/t/{TOKEN}/session"));
+        let session_val: serde_json::Value = serde_json::from_slice(session.body.as_ref()).unwrap();
+        let frames = session_val["frames"].as_array().unwrap();
+        let find_frame = |name: &str| -> usize {
+            frames
+                .iter()
+                .position(|f| f["name"].as_str() == Some(name))
+                .unwrap()
+        };
+
+        let hot_id = find_frame("hot");
+        let reply = get(&routes, &format!("/t/{TOKEN}/source?frame={hot_id}"));
+        assert_eq!(reply.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(reply.body.as_ref()).unwrap();
+        assert_eq!(body["available"], true, "{body}");
+        assert_eq!(body["line"], 4);
+        assert_eq!(body["totalLines"], 4);
+        let lines = body["lines"].as_array().unwrap();
+        assert_eq!(lines[1]["line"], 2);
+        assert_eq!(lines[1]["weight"], 3);
+        assert_eq!(lines[1]["self"], 0);
+        assert_eq!(lines[3]["line"], 4);
+        assert_eq!(lines[3]["weight"], 3);
+        assert_eq!(lines[3]["self"], 3);
+
+        let virtual_id = find_frame("timer");
+        let v_reply = get(&routes, &format!("/t/{TOKEN}/source?frame={virtual_id}"));
+        assert_eq!(v_reply.status, 200);
+        let v_body: serde_json::Value = serde_json::from_slice(v_reply.body.as_ref()).unwrap();
+        assert_eq!(v_body["available"], false);
+
+        let trav_id = find_frame("sneaky");
+        let t_reply = get(&routes, &format!("/t/{TOKEN}/source?frame={trav_id}"));
+        assert_eq!(t_reply.status, 200);
+        let t_body: serde_json::Value = serde_json::from_slice(t_reply.body.as_ref()).unwrap();
+        assert_eq!(t_body["available"], false);
+        assert!(
+            t_body["reason"].as_str().unwrap().contains(".."),
+            "{t_body}"
+        );
+
+        assert_eq!(get(&routes, &format!("/t/{TOKEN}/source")).status, 400);
+        assert_eq!(
+            get(&routes, &format!("/t/{TOKEN}/source?frame=9999")).status,
+            400
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

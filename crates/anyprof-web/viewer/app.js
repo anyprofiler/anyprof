@@ -1,31 +1,50 @@
 "use strict";
 
-// Profile text is written with textContent or canvas fillText. Nothing from
-// the file is parsed as HTML.
+// Profile text and local source lines are written strictly via textContent or
+// canvas fillText. Nothing from the profile or source file is parsed as HTML.
 
-const ROW = 20;
+const ROW = 21;
 const TRACK = 26;
 const GUTTER = 128;
 const FLAME_ROW = 18;
-const FLAME_LEVELS = 40;
-const PALETTE = [
-  [186, 214, 232],
-  [176, 210, 204],
-  [214, 206, 176],
-  [196, 196, 214],
-  [176, 204, 186],
-  [214, 190, 184],
-];
+const FLAME_LEVELS = 512;
+
+const FLAME_LIGHT = {
+  node: [[238, 188, 104], [232, 174, 88], [242, 198, 122], [224, 164, 78]],
+  browser: [[238, 188, 104], [232, 174, 88], [242, 198, 122], [224, 164, 78]],
+  python: [[118, 202, 176], [102, 190, 164], [134, 210, 186], [92, 178, 152]],
+  rust: [[232, 154, 122], [222, 138, 106], [240, 168, 138], [212, 128, 96]],
+  go: [[120, 194, 228], [104, 182, 220], [138, 204, 234], [94, 170, 210]],
+  java: [[178, 156, 226], [164, 140, 218], [190, 170, 232], [152, 128, 208]],
+  kernel: [[234, 140, 132], [224, 124, 116], [240, 156, 148], [214, 114, 106]],
+  native: [[144, 182, 224], [130, 170, 216], [158, 192, 230], [118, 158, 206]],
+  meta: [[172, 184, 204], [162, 176, 198]],
+};
+
+const FLAME_DARK = {
+  node: [[166, 116, 38], [152, 104, 32], [178, 126, 46], [140, 94, 28]],
+  browser: [[166, 116, 38], [152, 104, 32], [178, 126, 46], [140, 94, 28]],
+  python: [[38, 128, 106], [32, 116, 96], [46, 140, 116], [28, 104, 86]],
+  rust: [[164, 84, 54], [150, 74, 46], [176, 94, 62], [138, 66, 40]],
+  go: [[40, 118, 162], [34, 106, 148], [48, 130, 174], [30, 96, 136]],
+  java: [[108, 82, 168], [96, 72, 156], [120, 92, 180], [88, 64, 144]],
+  kernel: [[164, 68, 64], [150, 58, 54], [176, 78, 72], [138, 50, 48]],
+  native: [[54, 102, 158], [46, 92, 146], [64, 114, 170], [40, 82, 134]],
+  meta: [[68, 84, 112], [60, 76, 104]],
+};
 
 const state = {
   session: null,
   tree: null,
+  byId: new Map(),
   byParent: new Map(),
   expanded: new Set(),
   flat: [],
   selectedNode: null,
   selectedFrame: null,
+  zoomNode: null,
   pane: "tree",
+  previousPane: "tree",
   invert: false,
   hideSystem: false,
   query: "",
@@ -35,7 +54,9 @@ const state = {
   view: null,
   selection: null,
   generation: 0,
+  sourceGen: 0,
   timeline: null,
+  flameHeight: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -51,6 +72,13 @@ function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
+function isDark() {
+  const mode = document.documentElement.dataset.theme || "system";
+  if (mode === "dark") return true;
+  if (mode === "light") return false;
+  return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+}
+
 function formatNs(ns) {
   const value = Number(ns);
   if (!Number.isFinite(value)) return "0 ns";
@@ -62,8 +90,6 @@ function formatNs(ns) {
   return sign + Math.round(abs) + " ns";
 }
 
-// One unit for the whole visible range, chosen so a tick step is at least 1
-// of that unit. A 0–2 s range is 0/500/1000/1500/2000 ms, not a mix of ns and s.
 function timeScale(start, end) {
   const span = Math.max(1, Number(end) - Number(start));
   const step = span / 4;
@@ -141,6 +167,35 @@ function weightLabel() {
 
 function frameOf(id) {
   return state.session.frames[id] || { name: "unknown", system: false };
+}
+
+function shortFile(raw) {
+  if (!raw) return "";
+  if (raw.startsWith("node:") || raw.startsWith("wasm:") || raw.startsWith("<")) return raw;
+  const normalized = raw.replace(/^file:\/\/(localhost)?/, "").replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : raw;
+}
+
+function formatLocationShort(frame) {
+  if (frame.file) {
+    let loc = shortFile(frame.file);
+    if (frame.line) loc += ":" + frame.line;
+    return loc;
+  }
+  if (frame.module) return shortFile(frame.module);
+  return "";
+}
+
+function formatLocationFull(frame) {
+  if (frame.file) {
+    let loc = frame.file.replace(/^file:\/\/(localhost)?/, "");
+    if (frame.line) loc += ":" + frame.line;
+    if (frame.column) loc += ":" + frame.column;
+    return loc;
+  }
+  if (frame.module) return frame.module;
+  return "";
 }
 
 function highlight(text, query) {
@@ -261,6 +316,7 @@ function renderOverview() {
     box.append(copy);
     overview.append(box);
     document.documentElement.dataset.timeline = "0";
+    renderTrackFilter();
     return;
   }
   document.documentElement.dataset.timeline = "1";
@@ -334,6 +390,10 @@ function renderOverview() {
   const rows = el("div");
   rows.id = "timeline-rows";
   wrap.append(rows);
+  const tip = el("div", "tip");
+  tip.id = "timeline-tip";
+  tip.hidden = true;
+  wrap.append(tip);
   overview.append(wrap);
   renderTrackFilter();
 }
@@ -357,11 +417,18 @@ function renderTrackFilter() {
   for (const thread of threads) {
     const button = el("button", null, thread.name);
     button.type = "button";
+    button.title = thread.name;
     button.setAttribute("aria-pressed", state.tracks.has(thread.id) ? "true" : "false");
     button.addEventListener("click", () => {
-      if (state.tracks.has(thread.id)) state.tracks.delete(thread.id);
-      else state.tracks.add(thread.id);
-      button.setAttribute("aria-pressed", state.tracks.has(thread.id) ? "true" : "false");
+      if (state.tracks.has(thread.id) && state.tracks.size > 1) state.tracks.delete(thread.id);
+      else if (state.tracks.has(thread.id)) {
+        for (const t of threads) state.tracks.add(t.id);
+      } else {
+        state.tracks.add(thread.id);
+      }
+      for (const [idx, btn] of [...group.querySelectorAll("button")].entries()) {
+        btn.setAttribute("aria-pressed", state.tracks.has(threads[idx].id) ? "true" : "false");
+      }
       refreshTree();
     });
     group.append(button);
@@ -392,17 +459,7 @@ async function refreshTimeline() {
   }
   state.timeline = body;
   drawTimeline();
-  const full = state.session.timeline;
-  const zoomed = view.start !== full.start || view.end !== full.end;
-  const reset = $("reset-range");
-  const zoom = $("zoom-range");
-  if (reset) reset.hidden = !(zoomed || state.selection);
-  if (zoom) zoom.hidden = !state.selection;
-  const label = $("range-label");
-  if (label) {
-    const shown = state.selection || view;
-    label.textContent = formatRange(shown.start, shown.end);
-  }
+  updateRangeControls();
 }
 
 function cssColor(name, fallback) {
@@ -436,10 +493,10 @@ function drawTimeline() {
   canvas.style.height = height + "px";
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-  const mark = cssColor("--mark", "#7eb6ea");
-  const track = cssColor("--track", "#f4f8fc");
-  const line = cssColor("--line", "#d8d8dc");
-  const ink = cssColor("--muted", "#6e6e73");
+  const mark = cssColor("--mark", "#4c8fd6");
+  const track = cssColor("--track", "#f3f6fa");
+  const line = cssColor("--line", "#d2d2d7");
+  const ink = cssColor("--muted", "#5c5c63");
   const rows = data.rows || [];
   let max = 1;
   for (const row of rows) for (const value of row) if (Number(value) > max) max = Number(value);
@@ -462,18 +519,19 @@ function drawTimeline() {
     const y = index * TRACK;
     const row = rows[index] || [];
     const bucketWidth = plotWidth / Math.max(1, row.length);
-    // A mark stays narrower than its slot, so a full series stays a comb.
-    const markWidth = Math.min(2, Math.max(1, bucketWidth * 0.28));
+    // Keep each mark narrower than its slot so a uniform series stays a crisp comb.
+    const markWidth = Math.min(2.5, Math.max(1, bucketWidth * 0.34));
+    const maxBar = TRACK - 6;
     row.forEach((value, bucket) => {
       if (!value) return;
-      const ratio = Math.max(0, Math.min(1, Number(value) / max));
-      const bar = 3 + 7 * ratio;
+      const share = Math.max(0, Math.min(1, Number(value) / max));
+      const bar = 3 + (maxBar - 3) * share;
       ctx.save();
-      ctx.globalAlpha = 0.42 + 0.58 * ratio;
+      ctx.globalAlpha = 0.48 + 0.52 * share;
       ctx.fillStyle = mark;
       ctx.fillRect(
         gutter + bucket * bucketWidth + (bucketWidth - markWidth) / 2,
-        y + TRACK - 4 - bar,
+        y + TRACK - 3 - bar,
         markWidth,
         bar
       );
@@ -506,7 +564,7 @@ function paintSelection(ctx, data, gutter, plotWidth, height, span, edges) {
   ctx.rect(gutter, 0, plotWidth, height);
   ctx.clip();
   if (!edges) {
-    ctx.fillStyle = "rgba(10, 95, 212, 0.08)";
+    ctx.fillStyle = "rgba(10, 95, 212, 0.10)";
     ctx.fillRect(left, 0, wide, height);
   } else {
     ctx.strokeStyle = "rgba(10, 95, 212, 0.9)";
@@ -559,20 +617,51 @@ function bindTimelineDrag(canvas) {
     origin = tickAt(event);
     dragged = false;
     dragging = true;
+    const tip = $("timeline-tip");
+    if (tip) tip.hidden = true;
     try {
       canvas.setPointerCapture(event.pointerId);
     } catch (_) {
-      /* capture is optional; moves over the canvas still select */
+      /* capture is optional */
     }
   });
   canvas.addEventListener("pointermove", (event) => {
-    if (!dragging) return;
-    const next = tickAt(event);
-    if (next !== origin) dragged = true;
-    const start = Math.min(origin, next);
-    const end = Math.max(origin, next);
-    if (end > start) state.selection = { start, end };
-    drawTimeline();
+    const data = state.timeline;
+    if (!data) return;
+    if (dragging) {
+      const next = tickAt(event);
+      if (next !== origin) dragged = true;
+      const start = Math.min(origin, next);
+      const end = Math.max(origin, next);
+      if (end > start) state.selection = { start, end };
+      drawTimeline();
+      return;
+    }
+    const tip = $("timeline-tip");
+    if (!tip) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left - GUTTER;
+    const y = event.clientY - rect.top;
+    const plot = Math.max(1, rect.width - GUTTER);
+    const rowIdx = Math.floor(y / TRACK);
+    const row = (data.rows || [])[rowIdx];
+    if (x < 0 || x > plot || !row || !row.length) {
+      tip.hidden = true;
+      return;
+    }
+    const bucket = Math.min(row.length - 1, Math.max(0, Math.floor((x / plot) * row.length)));
+    const span = Math.max(1, Number(data.end) - Number(data.start));
+    const bStart = Math.round(Number(data.start) + (span * bucket) / row.length);
+    const bEnd = Math.round(Number(data.start) + (span * (bucket + 1)) / row.length);
+    const thread = state.session.threads[rowIdx];
+    tip.hidden = false;
+    tip.textContent = (thread ? thread.name + "  ·  " : "") + formatRange(bStart, bEnd) + "  ·  " + formatWeight(row[bucket]);
+    tip.style.left = Math.min(event.clientX + 12, window.innerWidth - 360) + "px";
+    tip.style.top = event.clientY + 14 + "px";
+  });
+  canvas.addEventListener("pointerleave", () => {
+    const tip = $("timeline-tip");
+    if (tip) tip.hidden = true;
   });
   const finish = () => {
     if (!dragging) return;
@@ -627,7 +716,10 @@ async function refreshTree() {
   }
   state.tree = body;
   indexTree();
-  if (!state.tree.nodes.some((node) => node.id === state.selectedNode)) {
+  if (state.zoomNode != null && !state.byId.has(state.zoomNode)) {
+    state.zoomNode = null;
+  }
+  if (!state.byId.has(state.selectedNode)) {
     state.selectedNode = null;
     state.selectedFrame = null;
     const roots = kidsOf("root");
@@ -643,8 +735,10 @@ async function refreshTree() {
 }
 
 function indexTree() {
+  state.byId = new Map();
   state.byParent = new Map();
   for (const node of state.tree.nodes) {
+    state.byId.set(node.id, node);
     const key = node.parent == null ? "root" : node.parent;
     if (!state.byParent.has(key)) state.byParent.set(key, []);
     state.byParent.get(key).push(node);
@@ -671,6 +765,11 @@ function compareNodes(a, b) {
     const bn = frameOf(b.frame).name;
     return an < bn ? -dir : an > bn ? dir : a.id - b.id;
   }
+  if (state.sortKey === "loc") {
+    const al = formatLocationShort(frameOf(a.frame));
+    const bl = formatLocationShort(frameOf(b.frame));
+    return al < bl ? -dir : al > bl ? dir : b.weight - a.weight || a.id - b.id;
+  }
   if (state.sortKey === "self") return (a.self - b.self) * dir || b.weight - a.weight || a.id - b.id;
   return (a.weight - b.weight) * dir || (b.self - a.self) || a.id - b.id;
 }
@@ -681,9 +780,14 @@ function kidsOf(key) {
   return list;
 }
 
-function nameMatches(frameId) {
+function frameMatches(frameId) {
   if (!state.query) return true;
-  return frameOf(frameId).name.toLowerCase().includes(state.query.toLowerCase());
+  const needle = state.query.toLowerCase();
+  const frame = frameOf(frameId);
+  if (frame.name.toLowerCase().includes(needle)) return true;
+  if (frame.file && frame.file.toLowerCase().includes(needle)) return true;
+  if (frame.module && frame.module.toLowerCase().includes(needle)) return true;
+  return false;
 }
 
 function flatten() {
@@ -718,7 +822,7 @@ function matchingIds() {
       }
       continue;
     }
-    let hit = nameMatches(item.node.frame);
+    let hit = frameMatches(item.node.frame);
     for (const kid of kids) if (show.has(kid.id)) hit = true;
     if (hit) show.add(item.node.id);
   }
@@ -728,15 +832,26 @@ function matchingIds() {
 function renderPane() {
   if (state.pane === "flame") renderFlame();
   else if (state.pane === "functions") renderFunctions();
+  else if (state.pane === "source") renderSource();
   else renderTree();
 }
 
-function renderTree(host) {
+function openSourceForFrame(frameId, nodeId) {
+  if (frameId == null) return;
+  state.selectedFrame = frameId;
+  if (nodeId != null) state.selectedNode = nodeId;
+  if (state.pane !== "source") state.previousPane = state.pane;
+  setPane("source");
+  renderInspector();
+}
+
+function renderTree(host, focusId) {
   const pane = host || $("pane");
   const previous = pane.querySelector(".scroll");
-  const scrollTop = previous ? previous.scrollTop : 0;
+  let scrollTop = previous ? previous.scrollTop : 0;
   clear(pane);
-  if (!state.tree.nodes.length || !flatten().length) {
+  const initialFlat = flatten();
+  if (!state.tree.nodes.length || !initialFlat.length) {
     pane.append(el("div", "empty", state.query ? "No functions match." : "No samples in this range."));
     return;
   }
@@ -751,10 +866,23 @@ function renderTree(host) {
   scroll.append(top, rows, bottom);
   table.append(scroll);
   pane.append(table);
-  const paint = () => {
+  const viewH = scroll.clientHeight || 240;
+  if (focusId != null) {
+    const idx = initialFlat.findIndex((item) => item.id === focusId);
+    if (idx >= 0) {
+      const targetTop = idx * ROW;
+      if (targetTop < scrollTop || targetTop + ROW > scrollTop + viewH) {
+        scrollTop = Math.max(0, targetTop - Math.floor(viewH / 3));
+      }
+    }
+  }
+  const maxTop = Math.max(0, initialFlat.length * ROW - viewH);
+  scrollTop = Math.min(scrollTop, maxTop);
+  const paint = (overrideTop) => {
     const flat = flatten();
     const height = scroll.clientHeight || 400;
-    const start = Math.max(0, Math.floor(scroll.scrollTop / ROW) - 4);
+    const effectiveTop = typeof overrideTop === "number" ? overrideTop : scroll.scrollTop;
+    const start = Math.max(0, Math.floor(effectiveTop / ROW) - 4);
     const count = Math.ceil(height / ROW) + 12;
     const slice = flat.slice(start, start + count);
     top.style.height = start * ROW + "px";
@@ -762,8 +890,8 @@ function renderTree(host) {
     clear(rows);
     for (const node of slice) rows.append(treeRow(node));
   };
-  scroll.addEventListener("scroll", paint);
-  paint();
+  scroll.addEventListener("scroll", () => paint());
+  paint(scrollTop);
   scroll.scrollTop = scrollTop;
 }
 
@@ -777,13 +905,22 @@ function columnHeader() {
   const name = el("button", "name-head", headerLabel("name", "Symbol"));
   name.type = "button";
   name.addEventListener("click", () => setSort("name"));
+  const loc = el("button", "loc-head", headerLabel("loc", "Location"));
+  loc.type = "button";
+  loc.addEventListener("click", () => setSort("loc"));
   const weight = el("button", null, headerLabel("weight", "Weight"));
   weight.type = "button";
   weight.addEventListener("click", () => setSort("weight"));
   const self = el("button", null, headerLabel("self", "Self"));
   self.type = "button";
   self.addEventListener("click", () => setSort("self"));
-  header.append(name, weight, self, el("span", "num", "%"));
+  const pct = el("button", null, "%");
+  pct.type = "button";
+  pct.addEventListener("click", () => setSort("weight"));
+  const selfPct = el("button", null, "Self %");
+  selfPct.type = "button";
+  selfPct.addEventListener("click", () => setSort("self"));
+  header.append(name, loc, weight, self, pct, selfPct);
   return header;
 }
 
@@ -791,9 +928,38 @@ function setSort(key) {
   if (state.sortKey === key) state.sortDir *= -1;
   else {
     state.sortKey = key;
-    state.sortDir = key === "name" ? 1 : -1;
+    state.sortDir = (key === "name" || key === "loc") ? 1 : -1;
   }
   renderPane();
+}
+
+function metricCell(value, total, barClass) {
+  const cell = el("span", "num");
+  const share = total > 0 ? Math.min(100, Math.max(0, (Number(value) / Number(total)) * 100)) : 0;
+  if (share >= 0.5) {
+    const bar = el("span", "cell-bar " + barClass);
+    bar.style.width = share.toFixed(1) + "%";
+    cell.append(bar);
+  }
+  cell.append(document.createTextNode(formatWeight(value)));
+  return cell;
+}
+
+function locationCell(frame, frameId, nodeId) {
+  const short = formatLocationShort(frame);
+  const full = formatLocationFull(frame);
+  const cell = el("span", "loc-cell" + (frame.file ? " loc-link" : ""));
+  if (short) {
+    cell.append(highlight(short, state.query));
+    cell.title = frame.file ? full + " (click to view source)" : full;
+  }
+  if (frame.file) {
+    cell.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openSourceForFrame(frameId, nodeId);
+    });
+  }
+  return cell;
 }
 
 function treeRow(node) {
@@ -813,7 +979,12 @@ function treeRow(node) {
       event.stopPropagation();
       if (state.expanded.has(node.id)) state.expanded.delete(node.id);
       else state.expanded.add(node.id);
-      renderTree();
+      if (state.pane === "flame") {
+        const host = document.querySelector(".flame-tree");
+        if (host) renderTree(host);
+      } else {
+        renderTree();
+      }
     });
     name.append(twist);
   } else {
@@ -822,16 +993,22 @@ function treeRow(node) {
   const frame = frameOf(node.frame);
   const label = el("span", "label");
   label.append(highlight(frame.name, state.query));
-  if (frame.runtime && frame.runtime !== "native") {
-    label.append(" ");
-    label.append(el("span", "muted", frame.runtime));
-  }
   name.append(label);
-  row.append(name);
-  row.append(el("span", "num", formatWeight(node.weight)));
-  row.append(el("span", "num", formatWeight(node.self)));
-  row.append(el("span", "num", formatPercent(node.weight, state.tree.total)));
+  if (frame.runtime && frame.runtime !== "native") {
+    name.append(el("span", "rt-badge", frame.runtime));
+  }
+  row.append(
+    name,
+    locationCell(frame, node.frame, node.id),
+    metricCell(node.weight, state.tree.total, "cell-bar-weight"),
+    metricCell(node.self, state.tree.total, "cell-bar-self"),
+    el("span", "num", formatPercent(node.weight, state.tree.total)),
+    el("span", "num", formatPercent(node.self, state.tree.total))
+  );
   row.addEventListener("click", () => selectNode(node));
+  row.addEventListener("dblclick", () => {
+    if (frame.file) openSourceForFrame(node.frame, node.id);
+  });
   return row;
 }
 
@@ -839,20 +1016,36 @@ function selectNode(node) {
   state.selectedNode = node.id;
   state.selectedFrame = node.frame;
   for (const row of document.querySelectorAll(".row, .fn-row, .inspector li")) {
-    const selected = row.dataset.node === String(node.id) || row.dataset.frame === String(node.frame);
-    row.setAttribute("aria-selected", selected && (row.dataset.node === String(node.id) || !row.dataset.node) ? "true" : "false");
+    const selected = row.dataset.node === String(node.id) || (!row.dataset.node && row.dataset.frame === String(node.frame));
+    row.setAttribute("aria-selected", selected ? "true" : "false");
   }
   renderInspector();
   if (state.pane === "flame") drawFlame();
+}
+
+function focusNodeInTree(node) {
+  state.selectedNode = node.id;
+  state.selectedFrame = node.frame;
+  let cur = node.parent != null ? state.byId.get(node.parent) : null;
+  const seen = new Set();
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    state.expanded.add(cur.id);
+    cur = cur.parent != null ? state.byId.get(cur.parent) : null;
+  }
+  const treeHost = document.querySelector(".flame-tree");
+  if (treeHost) {
+    renderTree(treeHost, node.id);
+  }
+  renderInspector();
 }
 
 function renderFunctions() {
   const pane = $("pane");
   clear(pane);
   const rows = state.tree.functions.slice();
-  const query = state.query.toLowerCase();
-  const filtered = query
-    ? rows.filter((row) => frameOf(row.frame).name.toLowerCase().includes(query))
+  const filtered = state.query
+    ? rows.filter((row) => frameMatches(row.frame))
     : rows;
   filtered.sort((a, b) => {
     if (state.sortKey === "name") {
@@ -860,8 +1053,13 @@ function renderFunctions() {
       const bn = frameOf(b.frame).name;
       return an < bn ? -state.sortDir : an > bn ? state.sortDir : 0;
     }
-    if (state.sortKey === "self") return (a.self - b.self) * state.sortDir;
-    return (a.weight - b.weight) * state.sortDir;
+    if (state.sortKey === "loc") {
+      const al = formatLocationShort(frameOf(a.frame));
+      const bl = formatLocationShort(frameOf(b.frame));
+      return al < bl ? -state.sortDir : al > bl ? state.sortDir : b.weight - a.weight;
+    }
+    if (state.sortKey === "self") return (a.self - b.self) * state.sortDir || b.weight - a.weight;
+    return (a.weight - b.weight) * state.sortDir || b.self - a.self;
   });
   if (!filtered.length) {
     pane.append(el("div", "empty", "No functions match."));
@@ -886,6 +1084,7 @@ function renderFunctions() {
     bottom.style.height = Math.max(0, filtered.length - (start + slice.length)) * ROW + "px";
     clear(body);
     for (const row of slice) {
+      const frame = frameOf(row.frame);
       const line = el("div", "fn-row row");
       line.dataset.testid = "function-row";
       line.dataset.frame = String(row.frame);
@@ -893,23 +1092,221 @@ function renderFunctions() {
       const name = el("div", "name-cell");
       name.style.paddingLeft = "8px";
       const label = el("span", "label");
-      label.append(highlight(frameOf(row.frame).name, state.query));
+      label.append(highlight(frame.name, state.query));
       name.append(label);
-      line.append(name);
-      line.append(el("span", "num", formatWeight(row.weight)));
-      line.append(el("span", "num", formatWeight(row.self)));
-      line.append(el("span", "num", formatPercent(row.weight, state.tree.total)));
+      if (frame.runtime && frame.runtime !== "native") {
+        name.append(el("span", "rt-badge", frame.runtime));
+      }
+      line.append(
+        name,
+        locationCell(frame, row.frame, null),
+        metricCell(row.weight, state.tree.total, "cell-bar-weight"),
+        metricCell(row.self, state.tree.total, "cell-bar-self"),
+        el("span", "num", formatPercent(row.weight, state.tree.total)),
+        el("span", "num", formatPercent(row.self, state.tree.total))
+      );
       line.addEventListener("click", () => {
         state.selectedFrame = row.frame;
-        state.selectedNode = null;
+        const candidate = state.tree.nodes.find((item) => item.frame === row.frame);
+        state.selectedNode = candidate ? candidate.id : null;
         renderFunctions();
         renderInspector();
+      });
+      line.addEventListener("dblclick", () => {
+        if (frame.file) openSourceForFrame(row.frame, null);
       });
       body.append(line);
     }
   };
   scroll.addEventListener("scroll", paint);
   paint();
+}
+
+async function renderSource() {
+  const pane = $("pane");
+  clear(pane);
+  const wrap = el("div", "source-pane");
+  wrap.dataset.testid = "source-view";
+  pane.append(wrap);
+
+  if (state.selectedFrame == null) {
+    wrap.append(el("div", "empty", "Select a function in Call Tree, Flame Graph, or Functions to inspect its source."));
+    return;
+  }
+
+  const head = el("div", "source-head");
+  head.dataset.testid = "source-header";
+  const titleWrap = el("div", "source-title-wrap");
+  const frame = frameOf(state.selectedFrame);
+  const short = formatLocationShort(frame) || frame.name;
+  const full = formatLocationFull(frame);
+  titleWrap.append(el("div", "source-title", frame.name + (short ? "  ·  " + short : "")));
+  if (full) titleWrap.append(el("div", "source-path", full));
+  head.append(titleWrap);
+
+  const back = el("button", "mini", "← Back");
+  back.type = "button";
+  back.dataset.testid = "source-back";
+  back.addEventListener("click", () => setPane(state.previousPane || "tree"));
+  head.append(back);
+  wrap.append(head);
+
+  const gen = ++state.sourceGen;
+  const params = treeParams();
+  params.set("frame", String(state.selectedFrame));
+  let body;
+  try {
+    const resp = await fetch("source?" + params.toString());
+    body = await resp.json();
+    if (gen !== state.sourceGen || state.pane !== "source") return;
+    if (!resp.ok) {
+      wrap.append(el("div", "error", body.error || "Could not load source."));
+      return;
+    }
+  } catch (err) {
+    if (gen !== state.sourceGen) return;
+    wrap.append(el("div", "error", String(err && err.message ? err.message : err)));
+    return;
+  }
+
+  if (!body.available) {
+    const card = el("div", "source-unavailable");
+    card.dataset.testid = "source-unavailable";
+    card.append(el("h3", null, full || frame.name));
+    card.append(el("p", null, body.reason || "Source file is not available on local disk."));
+    if (body.hotLines && body.hotLines.length) {
+      const hotWrap = el("div", "source-hot-list");
+      hotWrap.append(el("p", null, "Recorded sample weights by line in this file:"));
+      for (const item of body.hotLines) {
+        hotWrap.append(el(
+          "div",
+          "source-path",
+          "Line " + item.line + "  ·  Weight " + formatWeight(item.weight) + "  ·  Self " + formatWeight(item.self)
+        ));
+      }
+      card.append(hotWrap);
+    }
+    wrap.append(card);
+    return;
+  }
+
+  const cols = el("div", "source-cols");
+  cols.append(
+    el("span", null, "Line"),
+    el("span", null, "Weight"),
+    el("span", null, "Self"),
+    el("span", null, "Source")
+  );
+  wrap.append(cols);
+
+  const scroll = el("div", "source-scroll");
+  scroll.dataset.testid = "source-rows";
+  let targetEl = null;
+  const total = state.tree ? state.tree.total : 0;
+
+  for (const item of body.lines || []) {
+    const classes = ["source-row"];
+    if (item.weight > 0 || item.self > 0) classes.push("source-hot");
+    if (body.line && item.line === body.line) classes.push("source-target");
+    const row = el("div", classes.join(" "));
+    row.dataset.testid = "source-line";
+    row.dataset.line = String(item.line);
+
+    const ln = el("span", "source-ln", String(item.line));
+    const wCell = el("span", "source-metric");
+    if (item.weight > 0) {
+      const pct = total > 0 ? Math.min(100, (item.weight / total) * 100) : 0;
+      if (pct >= 0.5) {
+        const bar = el("span", "cell-bar cell-bar-weight");
+        bar.style.width = pct.toFixed(1) + "%";
+        wCell.append(bar);
+      }
+      wCell.append(document.createTextNode(formatWeight(item.weight)));
+    }
+    const sCell = el("span", "source-metric");
+    if (item.self > 0) {
+      const pct = total > 0 ? Math.min(100, (item.self / total) * 100) : 0;
+      if (pct >= 0.5) {
+        const bar = el("span", "cell-bar cell-bar-self");
+        bar.style.width = pct.toFixed(1) + "%";
+        sCell.append(bar);
+      }
+      sCell.append(document.createTextNode(formatWeight(item.self)));
+    }
+    const code = el("span", "source-code");
+    code.append(highlight(item.text, state.query));
+    row.append(ln, wCell, sCell, code);
+    scroll.append(row);
+    if (body.line && item.line === body.line) targetEl = row;
+  }
+  wrap.append(scroll);
+  if (targetEl) {
+    requestAnimationFrame(() => {
+      targetEl.scrollIntoView({ block: "center" });
+    });
+  }
+}
+
+function zoomAncestors(nodeId) {
+  const chain = [];
+  const seen = new Set();
+  let cur = state.byId.get(nodeId);
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    chain.push(cur);
+    cur = cur.parent != null ? state.byId.get(cur.parent) : null;
+  }
+  chain.reverse();
+  return chain;
+}
+
+function renderFlameZoomBar(bar) {
+  clear(bar);
+  const crumbs = el("div", "flame-crumbs");
+  if (state.zoomNode == null || !state.byId.has(state.zoomNode)) {
+    crumbs.append(el("span", "muted", "Click any bar to zoom into its subtree  ·  Esc resets"));
+    bar.append(crumbs);
+    return;
+  }
+  const allBtn = el("button", "flame-crumb", "All");
+  allBtn.type = "button";
+  allBtn.addEventListener("click", () => {
+    state.zoomNode = null;
+    updateFlameView();
+  });
+  crumbs.append(allBtn);
+
+  const chain = zoomAncestors(state.zoomNode);
+  for (let i = 0; i < chain.length; i += 1) {
+    const node = chain[i];
+    const last = i === chain.length - 1;
+    crumbs.append(el("span", "flame-sep", "›"));
+    const label = frameOf(node.frame).name + (last ? " (" + formatPercent(node.weight, state.tree.total) + ")" : "");
+    const btn = el("button", "flame-crumb" + (last ? " active" : ""), label);
+    btn.type = "button";
+    btn.addEventListener("click", () => {
+      state.zoomNode = last ? null : node.id;
+      focusNodeInTree(node);
+      updateFlameView();
+    });
+    crumbs.append(btn);
+  }
+  bar.append(crumbs);
+
+  const reset = el("button", "mini", "Reset zoom");
+  reset.type = "button";
+  reset.dataset.testid = "flame-reset";
+  reset.addEventListener("click", () => {
+    state.zoomNode = null;
+    updateFlameView();
+  });
+  bar.append(reset);
+}
+
+function updateFlameView() {
+  const bar = $("flame-zoom-bar");
+  if (bar) renderFlameZoomBar(bar);
+  drawFlame();
 }
 
 function renderFlame() {
@@ -924,7 +1321,17 @@ function renderFlame() {
     return;
   }
   const column = el("div", "flame-column");
+  const zoomBar = el("div", "flame-bar");
+  zoomBar.id = "flame-zoom-bar";
+  zoomBar.dataset.testid = "flame-zoom-bar";
+  renderFlameZoomBar(zoomBar);
+
   const band = el("div", "flame-band");
+  band.id = "flame-band";
+  if (state.flameHeight != null) {
+    band.style.height = state.flameHeight + "px";
+    band.style.maxHeight = state.flameHeight + "px";
+  }
   const host = el("div", "flame-host");
   const canvas = document.createElement("canvas");
   canvas.id = "flame";
@@ -934,6 +1341,7 @@ function renderFlame() {
   tip.hidden = true;
   host.append(tip);
   band.append(host);
+
   const levels = state.tree.nodes.reduce((max, node) => Math.max(max, node.depth), 0) + 1;
   if (levels > FLAME_LEVELS) {
     band.append(el(
@@ -942,17 +1350,106 @@ function renderFlame() {
       "The flame graph shows the first " + FLAME_LEVELS + " of " + levels + " levels. The call tree lists every frame, and weights are unchanged."
     ));
   }
+
+  const splitter = el("div", "splitter splitter-y");
+  splitter.id = "split-flame";
+  splitter.dataset.testid = "split-flame";
+  splitter.setAttribute("role", "separator");
+  splitter.setAttribute("aria-orientation", "horizontal");
+  splitter.setAttribute("aria-label", "Resize flame graph");
+  bindFlameSplitter(splitter, band);
+
   const tree = el("div", "flame-tree");
-  column.append(band, tree);
+  column.append(zoomBar, band, splitter, tree);
   pane.append(column);
   drawFlame();
   renderTree(tree);
 }
 
-function flameRects(rowH, pixelWidth) {
+function bindFlameSplitter(splitter, band) {
+  splitter.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startY = event.clientY;
+    const startH = band.getBoundingClientRect().height;
+    const move = (ev) => {
+      const paneH = ($("pane") || document.body).getBoundingClientRect().height || 500;
+      const next = Math.max(96, Math.min(paneH - 110, startH + (ev.clientY - startY)));
+      state.flameHeight = next;
+      band.style.height = next + "px";
+      band.style.maxHeight = next + "px";
+      drawFlame();
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  });
+}
+
+function flameLayout(rowH, pixelWidth) {
   const rects = [];
   const minimum = 0.5 / Math.max(1, pixelWidth);
   const show = state.query ? matchingIds() : null;
+  let maxLevel = 0;
+
+  if (state.zoomNode != null && state.byId.has(state.zoomNode)) {
+    const chain = zoomAncestors(state.zoomNode);
+    const zoomRoot = chain[chain.length - 1];
+    for (let i = 0; i < chain.length - 1 && i < FLAME_LEVELS; i += 1) {
+      rects.push({
+        node: chain[i],
+        x: 0,
+        y: i * rowH,
+        width: 1,
+        height: Math.max(8, rowH - 1),
+        isContext: true,
+      });
+      if (i > maxLevel) maxLevel = i;
+    }
+    const startLevel = Math.min(FLAME_LEVELS - 1, chain.length - 1);
+    const pending = [{
+      node: zoomRoot,
+      x: 0,
+      y: startLevel * rowH,
+      width: 1,
+      level: startLevel,
+    }];
+    while (pending.length) {
+      const item = pending.pop();
+      if (item.level >= FLAME_LEVELS) continue;
+      if (item.level > maxLevel) maxLevel = item.level;
+      rects.push({
+        node: item.node,
+        x: item.x,
+        y: item.y,
+        width: item.width,
+        height: Math.max(8, rowH - 1),
+        isContext: false,
+      });
+      const kids = kidsOf(item.node.id).filter((kid) => !show || show.has(kid.id));
+      let childCursor = item.x;
+      const next = [];
+      for (const kid of kids) {
+        const childWidth = item.node.weight ? (item.width * kid.weight) / item.node.weight : 0;
+        if (childWidth >= minimum) {
+          next.push({
+            node: kid,
+            x: childCursor,
+            y: item.y + rowH,
+            width: childWidth,
+            level: item.level + 1,
+          });
+        }
+        childCursor += childWidth;
+      }
+      for (let index = next.length - 1; index >= 0; index -= 1) pending.push(next[index]);
+    }
+    return { rects, levels: maxLevel + 1 };
+  }
+
   const roots = kidsOf("root").filter((node) => !show || show.has(node.id));
   const total = roots.reduce((sum, node) => sum + node.weight, 0) || 1;
   const pending = [];
@@ -965,12 +1462,14 @@ function flameRects(rowH, pixelWidth) {
   while (pending.length) {
     const item = pending.pop();
     if (item.level >= FLAME_LEVELS) continue;
+    if (item.level > maxLevel) maxLevel = item.level;
     rects.push({
       node: item.node,
       x: item.x,
       y: item.y,
       width: item.width,
       height: Math.max(8, rowH - 1),
+      isContext: false,
     });
     const kids = kidsOf(item.node.id).filter((kid) => !show || show.has(kid.id));
     let childCursor = item.x;
@@ -990,7 +1489,16 @@ function flameRects(rowH, pixelWidth) {
     }
     for (let index = next.length - 1; index >= 0; index -= 1) pending.push(next[index]);
   }
-  return rects;
+  return { rects, levels: maxLevel + 1 };
+}
+
+function flameColor(frame, dark) {
+  const table = dark ? FLAME_DARK : FLAME_LIGHT;
+  const isMeta = frame.name === "(idle)" || frame.name === "(program)";
+  const bucket = isMeta
+    ? table.meta
+    : (table[frame.runtime] || table.native);
+  return bucket[hash(frame.name) % bucket.length];
 }
 
 function drawFlame() {
@@ -998,12 +1506,11 @@ function drawFlame() {
   if (!canvas) return;
   const host = canvas.parentElement;
   const width = Math.max(1, host.clientWidth);
-  const levels = state.tree.nodes.reduce((max, node) => Math.max(max, node.depth), 0) + 1;
-  const shown = Math.min(levels, FLAME_LEVELS);
   const rowH = FLAME_ROW;
-  const rects = flameRects(rowH, width);
-  const height = Math.max(rowH, shown * rowH);
+  const { rects, levels } = flameLayout(rowH, width);
+  const height = Math.max(rowH, levels * rowH);
   const ratio = window.devicePixelRatio || 1;
+  const dark = isDark();
   canvas.width = Math.floor(width * ratio);
   canvas.height = Math.floor(height * ratio);
   canvas.style.width = width + "px";
@@ -1011,28 +1518,40 @@ function drawFlame() {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
+  const selectBg = cssColor("--select", dark ? "#0a84ff" : "#0a5fd4");
+  const textColor = dark ? "#f5f5f7" : "#18181b";
+
   for (const rect of rects) {
     const pixel = rect.width * width;
     if (pixel < 0.5) continue;
     const frame = frameOf(rect.node.frame);
-    const color = PALETTE[hash(frame.name) % PALETTE.length];
-    const selected = rect.node.frame === state.selectedFrame;
+    const color = flameColor(frame, dark);
+    const selected = rect.node.id === state.selectedNode || (state.selectedNode == null && rect.node.frame === state.selectedFrame);
+    const matched = state.query ? frameMatches(rect.node.frame) : true;
     const barH = Math.max(8, rect.height - 1);
+
+    ctx.save();
+    if (rect.isContext) ctx.globalAlpha = 0.58;
+    else if (state.query && !matched) ctx.globalAlpha = 0.42;
+
     ctx.fillStyle = selected
-      ? cssColor("--select", "#0a5fd4")
+      ? selectBg
       : "rgb(" + color[0] + "," + color[1] + "," + color[2] + ")";
     ctx.fillRect(rect.x * width + 0.5, rect.y + 0.5, Math.max(0, pixel - 1), barH);
-    if (pixel > 36) {
-      ctx.fillStyle = selected ? "#fff" : "#1d1d1f";
+
+    if (pixel > 32) {
+      ctx.fillStyle = selected ? "#ffffff" : textColor;
       ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-      ctx.save();
       ctx.beginPath();
       ctx.rect(rect.x * width + 2, rect.y, Math.max(0, pixel - 4), barH);
       ctx.clip();
-      ctx.fillText(frame.name, rect.x * width + 4, rect.y + Math.min(barH - 4, 13));
-      ctx.restore();
+      const loc = formatLocationShort(frame);
+      const caption = (pixel > 150 && loc) ? (frame.name + " (" + loc + ")") : frame.name;
+      ctx.fillText(caption, rect.x * width + 4, rect.y + Math.min(barH - 4, 13));
     }
+    ctx.restore();
   }
+
   const tip = host.querySelector(".tip");
   canvas.onmousemove = (event) => {
     const hit = hitFlame(rects, event, width);
@@ -1041,9 +1560,14 @@ function drawFlame() {
       return;
     }
     const frame = frameOf(hit.node.frame);
+    const loc = formatLocationShort(frame);
+    const parts = [frame.name];
+    if (loc) parts.push(loc);
+    parts.push(formatWeight(hit.node.weight) + " (" + formatPercent(hit.node.weight, state.tree.total) + ")");
+    if (hit.node.self > 0) parts.push("self " + formatWeight(hit.node.self));
     tip.hidden = false;
-    tip.textContent = frame.name + "  " + formatWeight(hit.node.weight) + "  " + formatPercent(hit.node.weight, state.tree.total);
-    tip.style.left = Math.min(event.clientX + 12, window.innerWidth - 440) + "px";
+    tip.textContent = parts.join("  ·  ");
+    tip.style.left = Math.min(event.clientX + 12, window.innerWidth - 460) + "px";
     tip.style.top = event.clientY + 14 + "px";
   };
   canvas.onmouseleave = () => {
@@ -1052,10 +1576,19 @@ function drawFlame() {
   canvas.onclick = (event) => {
     const hit = hitFlame(rects, event, width);
     if (!hit) return;
-    state.selectedNode = hit.node.id;
-    state.selectedFrame = hit.node.frame;
-    drawFlame();
-    renderInspector();
+    if (state.zoomNode === hit.node.id) {
+      state.zoomNode = null;
+    } else {
+      state.zoomNode = hit.node.id;
+    }
+    focusNodeInTree(hit.node);
+    updateFlameView();
+  };
+  canvas.ondblclick = (event) => {
+    const hit = hitFlame(rects, event, width);
+    if (!hit) return;
+    const frame = frameOf(hit.node.frame);
+    if (frame.file) openSourceForFrame(hit.node.frame, hit.node.id);
   };
 }
 
@@ -1078,8 +1611,7 @@ function hash(text) {
 
 function pathThroughSelection() {
   if (state.selectedNode == null || !state.tree) return null;
-  const byId = new Map(state.tree.nodes.map((node) => [node.id, node]));
-  const selected = byId.get(state.selectedNode);
+  const selected = state.byId.get(state.selectedNode);
   if (!selected) return null;
   const seen = new Set();
   const up = [];
@@ -1088,7 +1620,7 @@ function pathThroughSelection() {
     seen.add(cursor.id);
     up.push(cursor);
     if (cursor.parent == null) break;
-    cursor = byId.get(cursor.parent);
+    cursor = state.byId.get(cursor.parent);
   }
   up.reverse();
   const down = [];
@@ -1112,10 +1644,13 @@ function renderInspector() {
   const through = pathThroughSelection();
   const label = $("heaviest-label");
   const scope = $("heaviest-scope");
-  const frames = through
-    ? through.map((node) => node.frame)
+  const items = through
+    ? through.map((node) => ({ frameId: node.frame, nodeId: node.id, weight: node.weight }))
     : state.tree
-      ? state.tree.heaviest
+      ? state.tree.heaviest.map((frameId) => {
+          const row = (state.tree.functions || []).find((f) => f.frame === frameId);
+          return { frameId, nodeId: null, weight: row ? row.weight : 0 };
+        })
       : [];
   if (label) label.textContent = through ? "Heaviest path" : "Heaviest stack";
   if (scope) {
@@ -1123,48 +1658,78 @@ function renderInspector() {
       ? "Through the selected function"
       : "Heaviest stack in this view";
   }
-  if (!frames.length) {
+  if (!items.length) {
     heavy.append(el("li", "muted", "No stack"));
   } else {
-    frames.forEach((frameId, index) => {
-      const item = el("li", null, frameOf(frameId).name);
-      item.dataset.frame = String(frameId);
-      item.setAttribute("aria-selected", frameId === state.selectedFrame ? "true" : "false");
+    for (const entry of items) {
+      const frame = frameOf(entry.frameId);
+      const item = el("li", null, frame.name);
+      item.dataset.frame = String(entry.frameId);
+      if (entry.nodeId != null) item.dataset.node = String(entry.nodeId);
+      if (state.tree && state.tree.total > 0 && entry.weight > 0) {
+        item.dataset.share = formatPercent(entry.weight, state.tree.total);
+      }
+      const fullLoc = formatLocationFull(frame);
+      item.title = fullLoc ? frame.name + " — " + fullLoc : frame.name;
+      const isSelected = entry.nodeId != null
+        ? entry.nodeId === state.selectedNode
+        : entry.frameId === state.selectedFrame;
+      item.setAttribute("aria-selected", isSelected ? "true" : "false");
       item.addEventListener("click", () => {
-        state.selectedFrame = frameId;
-        const node = state.tree.nodes.find((candidate) => candidate.frame === frameId);
-        state.selectedNode = node ? node.id : null;
+        state.selectedFrame = entry.frameId;
+        if (entry.nodeId != null) {
+          state.selectedNode = entry.nodeId;
+        } else {
+          const node = state.tree.nodes.find((candidate) => candidate.frame === entry.frameId);
+          state.selectedNode = node ? node.id : null;
+        }
         renderPane();
         renderInspector();
       });
-      item.prepend(el("span", "muted", index === 0 ? "" : ""));
       heavy.append(item);
-    });
+    }
   }
+
   const detail = $("detail");
+  const srcBtn = $("open-source-btn");
   clear(detail);
   if (state.selectedFrame == null) {
+    if (srcBtn) srcBtn.hidden = true;
     detail.append(el("p", "muted", "Select a function."));
     return;
   }
   const frame = frameOf(state.selectedFrame);
+  if (srcBtn) {
+    srcBtn.hidden = !frame.file;
+    srcBtn.onclick = () => openSourceForFrame(state.selectedFrame, state.selectedNode);
+  }
   const row = (state.tree.functions || []).find((item) => item.frame === state.selectedFrame);
-  const node = state.tree.nodes.find((item) => item.id === state.selectedNode);
+  const node = state.byId.get(state.selectedNode);
   addDetail(detail, "Name", frame.name);
   addDetail(detail, "Runtime", frame.runtime || "native");
   if (frame.file) {
-    let where = frame.file;
-    if (frame.line) where += ":" + frame.line;
-    if (frame.column) where += ":" + frame.column;
-    addDetail(detail, "Source", where);
+    const short = formatLocationShort(frame);
+    const full = formatLocationFull(frame);
+    detail.append(el("dt", null, "Source"));
+    const dd = el("dd");
+    const link = el("span", "source-dd-short", short);
+    link.title = "Click to open Source view";
+    link.addEventListener("click", () => openSourceForFrame(state.selectedFrame, state.selectedNode));
+    dd.append(link);
+    if (full && full !== short) {
+      dd.append(el("span", "source-dd-full", full));
+    }
+    detail.append(dd);
   }
   if (frame.module) addDetail(detail, "Module", frame.module);
+  if (frame.address) addDetail(detail, "Address", frame.address);
   addDetail(detail, "System library", frame.system ? "yes" : "no");
-  const weight = row ? row.weight : node ? node.weight : 0;
-  const self = row ? row.self : node ? node.self : 0;
+  const weight = node ? node.weight : row ? row.weight : 0;
+  const self = node ? node.self : row ? row.self : 0;
   addDetail(detail, "Weight", formatWeight(weight));
   addDetail(detail, "Self", formatWeight(self));
   addDetail(detail, "Share", formatPercent(weight, state.tree.total));
+  addDetail(detail, "Self share", formatPercent(self, state.tree.total));
 }
 
 function addDetail(detail, name, value) {
@@ -1175,6 +1740,9 @@ function addDetail(detail, name, value) {
 }
 
 function setPane(name) {
+  if (state.pane !== name && state.pane !== "source") {
+    state.previousPane = state.pane;
+  }
   state.pane = name;
   for (const button of document.querySelectorAll(".tabs button")) {
     button.setAttribute("aria-selected", button.dataset.pane === name ? "true" : "false");
@@ -1194,7 +1762,18 @@ function onKey(event) {
       state.query = "";
       $("search").value = "";
       renderPane();
-    } else if (state.selection || (state.view && state.session.timeline && (state.view.start !== state.session.timeline.start || state.view.end !== state.session.timeline.end))) {
+    } else if (state.pane === "flame" && state.zoomNode != null) {
+      state.zoomNode = null;
+      updateFlameView();
+    } else if (state.pane === "source") {
+      setPane(state.previousPane || "tree");
+    } else if (
+      state.selection ||
+      (state.view &&
+        state.session &&
+        state.session.timeline &&
+        (state.view.start !== state.session.timeline.start || state.view.end !== state.session.timeline.end))
+    ) {
       state.selection = null;
       state.view = { start: state.session.timeline.start, end: state.session.timeline.end };
       refreshTimeline();
@@ -1208,33 +1787,58 @@ function onKey(event) {
     $("invert").click();
     return;
   }
-  if (state.pane !== "tree") return;
+  if (event.key === "Enter" && state.selectedFrame != null) {
+    const frame = frameOf(state.selectedFrame);
+    if (frame.file) {
+      event.preventDefault();
+      openSourceForFrame(state.selectedFrame, state.selectedNode);
+      return;
+    }
+  }
+  if (state.pane !== "tree" && state.pane !== "flame") return;
   const flat = state.flat;
   const index = flat.findIndex((node) => node.id === state.selectedNode);
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
     event.preventDefault();
-    const next = event.key === "ArrowDown" ? Math.min(flat.length - 1, index + 1) : Math.max(0, index < 0 ? 0 : index - 1);
+    const next = event.key === "ArrowDown"
+      ? Math.min(flat.length - 1, index + 1)
+      : Math.max(0, index < 0 ? 0 : index - 1);
     if (flat[next]) {
       selectNode(flat[next]);
       const row = document.querySelector('.row[data-node="' + flat[next].id + '"]');
       if (row) row.scrollIntoView({ block: "nearest" });
-      else renderTree();
+      else if (state.pane === "flame") {
+        const host = document.querySelector(".flame-tree");
+        if (host) renderTree(host);
+      } else {
+        renderTree();
+      }
     }
   } else if (event.key === "ArrowRight" && index >= 0) {
     event.preventDefault();
     const node = flat[index];
     if ((state.byParent.get(node.id) || []).length && !state.expanded.has(node.id)) {
       state.expanded.add(node.id);
-      renderTree();
+      if (state.pane === "flame") {
+        const host = document.querySelector(".flame-tree");
+        if (host) renderTree(host);
+      } else {
+        renderTree();
+      }
     }
   } else if (event.key === "ArrowLeft" && index >= 0) {
     event.preventDefault();
     const node = flat[index];
     if (state.expanded.has(node.id)) {
       state.expanded.delete(node.id);
-      renderTree();
+      if (state.pane === "flame") {
+        const host = document.querySelector(".flame-tree");
+        if (host) renderTree(host);
+      } else {
+        renderTree();
+      }
     } else if (node.parent != null) {
-      const parent = state.tree.nodes.find((candidate) => candidate.id === node.parent);
+      const parent = state.byId.get(node.parent);
       if (parent) selectNode(parent);
     }
   }
@@ -1259,7 +1863,7 @@ function bindSplitter(splitter, axis) {
         overview.style.height = next + "px";
         overview.style.maxHeight = next + "px";
       } else {
-        const next = Math.max(200, Math.min(window.innerWidth * 0.5, startSize - delta));
+        const next = Math.max(210, Math.min(window.innerWidth * 0.5, startSize - delta));
         inspector.style.width = next + "px";
       }
       if (state.pane === "flame") drawFlame();
@@ -1288,6 +1892,7 @@ async function main() {
     state.invert = !state.invert;
     $("invert").setAttribute("aria-pressed", state.invert ? "true" : "false");
     state.expanded.clear();
+    state.zoomNode = null;
     refreshTree();
   });
   $("hide-system").addEventListener("click", () => {
@@ -1295,6 +1900,7 @@ async function main() {
     state.hideSystem = !state.hideSystem;
     $("hide-system").setAttribute("aria-pressed", state.hideSystem ? "true" : "false");
     state.expanded.clear();
+    state.zoomNode = null;
     refreshTree();
   });
   window.addEventListener("resize", () => {
