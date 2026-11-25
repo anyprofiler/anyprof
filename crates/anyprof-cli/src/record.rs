@@ -10,12 +10,12 @@ use anyprof_core::{
 };
 use anyprof_export::SampleCounts;
 
-use crate::cli::{ProfileFormat, RecordArgs};
+use crate::cli::{BackendName, ProfileFormat, RecordArgs};
 use crate::output::{self, OutputRequest};
 use crate::registry::default_registry;
 use crate::{interrupt, view};
 
-pub fn run(args: RecordArgs) -> anyhow::Result<()> {
+pub fn run(args: RecordArgs, verbose: u8) -> anyhow::Result<()> {
     validate(&args)?;
     let registry = default_registry();
     let (backend, pid) = if args.browser {
@@ -25,7 +25,7 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
         (backend, 0)
     } else {
         let pid = args.pid.ok_or_else(|| anyhow!("--pid is required"))?;
-        let backend = select(&registry, pid, args.backend.as_deref())?;
+        let backend = select(&registry, pid, args.backend.map(BackendName::as_str))?;
         (backend, pid)
     };
     let requested_interval = requested_interval(&args);
@@ -61,7 +61,7 @@ pub fn run(args: RecordArgs) -> anyhow::Result<()> {
         "starting profile"
     );
 
-    let session = watch_recording(&label, args.duration, || {
+    let session = watch_recording(&label, args.duration, verbose, || {
         backend.start(
             &Target { pid },
             &RecordOptions {
@@ -125,9 +125,17 @@ fn recording_label(backend: &str, args: &RecordArgs, pid: u32) -> String {
     }
 }
 
-fn watch_recording<T>(label: &str, limit: Option<Duration>, sample: impl FnOnce() -> T) -> T {
+fn watch_recording<T>(
+    label: &str,
+    limit: Option<Duration>,
+    verbose: u8,
+    sample: impl FnOnce() -> T,
+) -> T {
     let tty = std::io::stderr().is_terminal();
-    if !tty {
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let redraw = should_redraw_status(tty, verbose, rust_log.as_deref())
+        && !tracing::enabled!(tracing::Level::INFO);
+    if !redraw {
         eprintln!("Recording {label}... (Ctrl+C to stop)");
         return sample();
     }
@@ -146,6 +154,36 @@ fn watch_recording<T>(label: &str, limit: Option<Duration>, sample: impl FnOnce(
     let _ = painter.join();
     paint("");
     result
+}
+
+/// Whether stderr should continuously overwrite the recording status line.
+///
+/// Disabled when stderr is not a terminal or when `-v` / `RUST_LOG` enables
+/// `info`, `debug`, or `trace` output that `\r\x1b[2K` would erase.
+fn should_redraw_status(is_tty: bool, verbose: u8, rust_log: Option<&str>) -> bool {
+    if !is_tty || verbose > 0 {
+        return false;
+    }
+    !rust_log.is_some_and(rust_log_enables_verbose)
+}
+
+fn rust_log_enables_verbose(raw: &str) -> bool {
+    for directive in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let level = directive
+            .rsplit_once('=')
+            .map_or(directive, |(_, rhs)| rhs.trim());
+        if matches!(
+            level.to_ascii_lowercase().as_str(),
+            "info" | "debug" | "trace"
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn status_line(label: &str, elapsed: Duration, limit: Option<Duration>) -> String {
@@ -284,11 +322,12 @@ fn validate(args: &RecordArgs) -> anyhow::Result<()> {
         if args.pid.is_some() {
             return Err(anyhow!("--browser profiles a tab; omit --pid"));
         }
-        if let Some(name) = args.backend.as_deref()
-            && name != "browser"
+        if let Some(backend) = args.backend
+            && backend != BackendName::Browser
         {
             return Err(anyhow!(
-                "--browser cannot be combined with --backend {name}"
+                "--browser cannot be combined with --backend {}",
+                backend.as_str()
             ));
         }
     }
@@ -313,8 +352,8 @@ fn select<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_interval, format_clock, idle_percent, requested_interval, status_line,
-        uninformative_reason, validate,
+        describe_interval, format_clock, idle_percent, requested_interval, should_redraw_status,
+        status_line, uninformative_reason, validate,
     };
     use crate::cli::RecordArgs;
     use anyprof_core::{Frame, Profile, Runtime, Stack};
@@ -509,5 +548,23 @@ mod tests {
         let just_over = profile(&[(&["(idle)"], 96), (&["handle"], 5)]);
         let message = reason(&just_over).unwrap();
         assert!(message.contains("96 of 101 samples (95.1%)"), "{message}");
+    }
+
+    #[test]
+    fn status_redraw_stops_when_verbose_or_rust_log_writes_to_stderr() {
+        assert!(should_redraw_status(true, 0, None));
+        assert!(should_redraw_status(true, 0, Some("")));
+        assert!(should_redraw_status(true, 0, Some("warn")));
+        assert!(should_redraw_status(true, 0, Some("error,anyprof=warn")));
+        assert!(!should_redraw_status(false, 0, None));
+        assert!(!should_redraw_status(true, 1, None));
+        assert!(!should_redraw_status(true, 2, None));
+        assert!(!should_redraw_status(true, 0, Some("info")));
+        assert!(!should_redraw_status(true, 0, Some("debug")));
+        assert!(!should_redraw_status(
+            true,
+            0,
+            Some("warn,anyprof_native=trace")
+        ));
     }
 }

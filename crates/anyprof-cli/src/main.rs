@@ -23,7 +23,7 @@ fn try_main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
     match cli.command {
-        Command::Record(args) => record::run(args),
+        Command::Record(args) => record::run(args, cli.verbose),
         Command::Convert(args) => convert::run(args),
         Command::View(args) => view::run(args),
         Command::Update => update::run(),

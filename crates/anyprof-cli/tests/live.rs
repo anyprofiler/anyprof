@@ -229,9 +229,11 @@ fn cpuprofile_of_a_busy_node_is_a_real_v8_profile() {
     let bytes = std::fs::read(&output_path).expect("read cpuprofile");
     assert_devtools_profile(&bytes, &script_name);
     // DevTools records a median of about 125us. The old 99 Hz default was 10101us.
-    // V8's sampler timer is coarser on Windows: a 100us request has produced a
-    // 2ms median there, so that bound only rules out the old default.
-    let bound = if cfg!(windows) { 5_000 } else { 1_000 };
+    // V8's sampler timer is coarser on Windows (a 100us request has produced a
+    // 2ms median) and shared macOS runners can jitter above 1ms (`macos-latest`
+    // run 45543522998 recorded 1375us across 1633 samples), so 3ms still rules
+    // out the 10ms default and stays below the `-F 200` (5ms) check below.
+    let bound = if cfg!(windows) { 5_000 } else { 3_000 };
     let median = median_time_delta_us(&bytes);
     assert!(
         median < bound,

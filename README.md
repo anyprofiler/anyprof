@@ -102,13 +102,13 @@ Prebuilt binaries are on [GitHub Releases](https://github.com/anyprofiler/anypro
 macOS and Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/download/v0.1.9/anyprof-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/download/v0.1.9/anyprof-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anyprof/releases/latest/download/anyprof-cli-installer.ps1 | iex"
 ```
 
 The installer puts `anyprof` in Cargo's bin directory (`~/.cargo/bin`) and adds that directory to `PATH` when it is missing.
@@ -187,7 +187,7 @@ anyprof rec -p 1234 -d 10s -w
 | `-F, --frequency <HZ>` | Samples per second, from 1 to 1000000 (one sample per microsecond). The default depends on the backend (see below). An explicit value wins. Cannot be combined with `--interval`. |
 | `--interval <DURATION>` | Time between samples, for example `100us`, `1ms`, or `10ms`. The same setting as `-F`, written as a period. Node and browser round it to whole microseconds. |
 | `-k, --kernel` | Ask for kernel frames when the backend supports them. Linux x86_64 records them. Other Linux architectures do not advertise kernel frames, because sampling there is not implemented. macOS and Windows x64 ignore the flag and record user frames. Node and browser profiles do not include kernel frames. |
-| `-b, --backend <node\|browser\|rust\|go\|native>` | Skip auto-detection. |
+| `-b, --backend <node\|browser\|rust\|go\|python\|java\|native>` | Skip auto-detection. |
 | `-w, --web` | After writing the file, open it in the built-in viewer, the same as `anyprof view <file>`. `--no-open`, `--port`, and `--web-timeout` (see [Viewing profiles](#viewing-profiles)) require `--web`. |
 | `-v`, `-vv`, `-vvv` | Log more (`info`, `debug`, `trace`). `RUST_LOG` is used when `-v` is not passed. `-h` and `-V` are help and version. |
 
@@ -202,7 +202,7 @@ At 100us a mostly idle server still records the sub-millisecond work of each req
 
 After recording, anyprof warns on stderr when the profile has 0 samples. It also warns when more than 95% of samples are V8's `(idle)` or `(program)` nodes and fewer than 100 samples caught JavaScript, native code, or the garbage collector. That means the process was waiting and the profile shows almost none of its work. Record again while the process is under load, for example by sending it requests during the recording. A mostly idle server that still handled some requests, such as 300 JavaScript samples out of 90,000, does not warn. The profile is always written.
 
-While stderr is a terminal, `record` redraws one status line (`Recording node pid 1234... 00:12 elapsed (Ctrl+C to stop)`, or with time left when `-d` is set). A pipe or file gets a single start line.
+While stderr is a terminal and `-v` (or an `info`/`debug`/`trace` `RUST_LOG`) is not active, `record` redraws one status line (`Recording node pid 1234... 00:12 elapsed (Ctrl+C to stop)`, or with time left when `-d` is set). A pipe, a file, or verbose logging gets a single start line so log output is not overwritten.
 
 Default format when `-f` is omitted and `-o` is not a recognized file name:
 
@@ -376,6 +376,7 @@ The live test spawns `node --inspect-port=127.0.0.1:<port>` without telling the 
 | `crates/anyprof-rust` | Rust backend. Detection and the `rust` name; sampling is the native sampler |
 | `crates/anyprof-go` | Go backend (pclntab unwind on the native sampler) |
 | `crates/anyprof-python` | CPython backend (interpreter frames on the native sampler) |
+| `crates/anyprof-java` | HotSpot Java backend (code-cache and interpreter methods on the native sampler) |
 | `crates/anyprof-export` | collapsed, speedscope, pprof, and `.cpuprofile` |
 | `crates/anyprof-web` | `anyprof view`: localhost server, local viewer, browser opener |
 | `crates/anyprof-cli` | the `anyprof` binary |

@@ -112,7 +112,8 @@ pub struct RecordArgs {
     /// Otherwise a file path's extension is used (`.cpuprofile`, `.pb.gz`,
     /// `.pprof`, `.speedscope.json`, `.collapsed`, `.folded`, `.txt`). A
     /// directory, or no `-o`, uses the backend default: cpuprofile for Node and
-    /// browser, pprof for Rust, Go, and native, and speedscope for Python.
+    /// browser, pprof for Rust, Go, and native, and speedscope for Python and
+    /// Java.
     #[arg(short = 'f', long, value_enum)]
     pub format: Option<ProfileFormat>,
 
@@ -120,8 +121,8 @@ pub struct RecordArgs {
     ///
     /// 1000000 Hz (one sample per microsecond) is the finest rate. Defaults
     /// depend on the backend: Node and browser sample every 100us (10000 Hz),
-    /// the same rate as a Chrome DevTools recording, and Rust, Go, Python, and
-    /// native sample at 99 Hz. Conflicts with `--interval`.
+    /// the same rate as a Chrome DevTools recording, and Rust, Go, Python,
+    /// Java, and native sample at 99 Hz. Conflicts with `--interval`.
     #[arg(
         short = 'F',
         long,
@@ -146,9 +147,9 @@ pub struct RecordArgs {
     #[arg(short = 'k', long)]
     pub kernel: bool,
 
-    /// Force a backend (`node`, `browser`, `rust`, `go`, `python`, `java`, or `native`) instead of auto-detecting.
-    #[arg(short = 'b', long, value_name = "NAME")]
-    pub backend: Option<String>,
+    /// Force a backend instead of auto-detecting.
+    #[arg(short = 'b', long, value_enum, value_name = "NAME")]
+    pub backend: Option<BackendName>,
 
     /// Inspector or remote-debugging endpoint: a port, `host:port`, `http://` URL, or `ws://` URL.
     ///
@@ -258,6 +259,33 @@ fn parse_frequency(raw: &str) -> Result<u32, String> {
     Ok(hertz)
 }
 
+/// Runtime backend `record` can force with `--backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BackendName {
+    Node,
+    Browser,
+    Rust,
+    Go,
+    Python,
+    Java,
+    Native,
+}
+
+impl BackendName {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Browser => "browser",
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Python => "python",
+            Self::Java => "java",
+            Self::Native => "native",
+        }
+    }
+}
+
 /// Encodings `record` and `convert` accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProfileFormat {
@@ -332,7 +360,7 @@ impl From<anyprof_core::Format> for ProfileFormat {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ProfileFormat, infer_format};
+    use super::{BackendName, Cli, Command, ProfileFormat, infer_format};
     use clap::Parser;
     use std::time::Duration;
 
@@ -421,7 +449,7 @@ mod tests {
         assert_eq!(args.format, Some(ProfileFormat::Pprof));
         assert_eq!(args.frequency, Some(199));
         assert!(args.kernel);
-        assert_eq!(args.backend.as_deref(), Some("native"));
+        assert_eq!(args.backend, Some(BackendName::Native));
         assert_eq!(args.duration, None);
         assert!(args.output.is_some());
     }
@@ -519,7 +547,7 @@ mod tests {
         assert_eq!(args.duration, Some(Duration::from_secs(10)));
         assert_eq!(args.format, Some(ProfileFormat::Cpuprofile));
         assert_eq!(args.frequency, Some(50));
-        assert_eq!(args.backend.as_deref(), Some("node"));
+        assert_eq!(args.backend, Some(BackendName::Node));
         assert_eq!(args.inspect.as_deref(), Some("9229"));
         assert!(args.kernel);
         assert_eq!(
@@ -620,6 +648,29 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            Cli::try_parse_from(["anyprof", "record", "--pid", "1", "--backend", "ruby"]).is_err()
+        );
+        for (raw, expected) in [
+            ("node", BackendName::Node),
+            ("browser", BackendName::Browser),
+            ("rust", BackendName::Rust),
+            ("go", BackendName::Go),
+            ("python", BackendName::Python),
+            ("java", BackendName::Java),
+            ("native", BackendName::Native),
+        ] {
+            let cli = if raw == "browser" {
+                Cli::try_parse_from(["anyprof", "rec", "-B", "-b", raw]).unwrap()
+            } else {
+                Cli::try_parse_from(["anyprof", "rec", "-p", "1", "-b", raw]).unwrap()
+            };
+            let Command::Record(args) = cli.command else {
+                panic!("expected record");
+            };
+            assert_eq!(args.backend, Some(expected));
+            assert_eq!(expected.as_str(), raw);
+        }
     }
 
     #[test]
