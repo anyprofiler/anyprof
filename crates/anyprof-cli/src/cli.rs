@@ -161,6 +161,13 @@ pub struct RecordArgs {
     #[arg(short = 't', long, value_name = "URL_TITLE_OR_ID")]
     pub tab: Option<String>,
 
+    /// Leave the Node.js inspector listening after sampling when anyprof activated it.
+    ///
+    /// By default, an inspector that anyprof turned on is closed when sampling
+    /// ends, while an inspector that was already open stays open.
+    #[arg(long)]
+    pub keep_inspector: bool,
+
     /// After writing the profile, open it in the built-in viewer.
     ///
     /// Same as running `anyprof view` on the written file.
@@ -717,5 +724,20 @@ mod tests {
                 "{name} should select update"
             );
         }
+    }
+
+    #[test]
+    fn keep_inspector_flag_parses_and_defaults_to_false() {
+        let cli = Cli::try_parse_from(["anyprof", "rec", "-p", "42"]).unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record");
+        };
+        assert!(!args.keep_inspector);
+
+        let cli = Cli::try_parse_from(["anyprof", "rec", "-p", "42", "--keep-inspector"]).unwrap();
+        let Command::Record(args) = cli.command else {
+            panic!("expected record");
+        };
+        assert!(args.keep_inspector);
     }
 }

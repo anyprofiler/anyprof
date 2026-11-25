@@ -16,6 +16,30 @@ use crate::error::Error;
 /// produces about 2.5 MiB of JSON per minute, so this covers well over an hour.
 const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
+/// JavaScript expression that closes the Node.js inspector across CommonJS and
+/// ES module processes without throwing into user code.
+const CLOSE_INSPECTOR_EXPR: &str = r#"(() => {
+  try {
+    const mod = typeof process === "object" && process !== null
+      ? (typeof process.getBuiltinModule === "function"
+        ? process.getBuiltinModule("node:inspector")
+        : (typeof require === "function"
+          ? require("node:inspector")
+          : (process.mainModule && typeof process.mainModule.require === "function"
+            ? process.mainModule.require("node:inspector")
+            : null)))
+      : null;
+    if (mod && typeof mod.close === "function") {
+      mod.close();
+      return true;
+    }
+    import("node:inspector").then((m) => m.close()).catch(() => {});
+    return false;
+  } catch (_) {
+    return false;
+  }
+})()"#;
+
 /// Run the V8 CPU profiler and return the `.cpuprofile` JSON object.
 ///
 /// `expected_pid`, when set, is checked with `Runtime.evaluate` of `process.pid`
@@ -26,12 +50,15 @@ const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 /// is called before `Profiler.start`). Sampling ends when `duration` elapses, or
 /// sooner when `stop` is signaled. `None` waits until `stop`. `Profiler.stop`
 /// and `Profiler.disable` run on every path after `Profiler.start`, including
-/// errors, so the target is not left with the profiler attached.
+/// errors, so the target is not left with the profiler attached. When
+/// `close_inspector` is true, `inspector.close()` is evaluated afterwards so a
+/// Node.js inspector that anyprof activated does not remain open.
 pub fn capture_cpu_profile(
     websocket_url: &str,
     duration: Option<Duration>,
     interval_us: u32,
     expected_pid: Option<u32>,
+    close_inspector: bool,
     stop: &StopGate,
 ) -> Result<Vec<u8>, Error> {
     if duration.is_some_and(|duration| duration.is_zero()) {
@@ -54,14 +81,23 @@ pub fn capture_cpu_profile(
         }
         tracing::info!(pid = actual, %websocket_url, "inspector process.pid matches");
     }
-    // V8 ignores a sampling interval set after Profiler.start. The unit is microseconds.
-    rpc.call(
-        &mut socket,
-        "Profiler.setSamplingInterval",
-        json!({ "interval": interval_us }),
-    )?;
-    rpc.call(&mut socket, "Profiler.enable", json!({}))?;
-    rpc.call(&mut socket, "Profiler.start", json!({}))?;
+    let started_result = (|| -> Result<(), Error> {
+        // V8 ignores a sampling interval set after Profiler.start. The unit is microseconds.
+        rpc.call(
+            &mut socket,
+            "Profiler.setSamplingInterval",
+            json!({ "interval": interval_us }),
+        )?;
+        rpc.call(&mut socket, "Profiler.enable", json!({}))?;
+        rpc.call(&mut socket, "Profiler.start", json!({}))?;
+        Ok(())
+    })();
+    if let Err(err) = started_result {
+        if close_inspector {
+            close_node_inspector(&mut rpc, &mut socket);
+        }
+        return Err(err);
+    }
     tracing::info!(%websocket_url, ?duration, interval_us, "CPU profiler started");
     let waited = wait_for_samples(&mut socket, duration, stop);
     // Stop even when the wait failed, and before returning, so Ctrl+C and
@@ -69,6 +105,9 @@ pub fn capture_cpu_profile(
     stop.begin_stopping();
     let stopped = rpc.call(&mut socket, "Profiler.stop", json!({}));
     let _ = rpc.call(&mut socket, "Profiler.disable", json!({}));
+    if close_inspector {
+        close_node_inspector(&mut rpc, &mut socket);
+    }
     waited?;
     let stopped = stopped?;
     let profile = stopped
@@ -77,6 +116,27 @@ pub fn capture_cpu_profile(
         .ok_or_else(|| Error::message("Profiler.stop did not return a profile"))?;
     serde_json::to_vec(&profile)
         .map_err(|err| Error::message(format!("encoding cpuprofile JSON: {err}")))
+}
+
+fn close_node_inspector(
+    rpc: &mut Rpc,
+    socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+) {
+    if let Some(tcp) = plain_tcp(socket.get_mut()) {
+        let _ = tcp.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = tcp.set_write_timeout(Some(Duration::from_millis(500)));
+    }
+    // `inspector.close()` stops the listening port and closes active inspector
+    // sessions immediately, typically dropping the websocket before sending a
+    // JSON-RPC reply.
+    let _ = rpc.call(
+        socket,
+        "Runtime.evaluate",
+        json!({
+            "expression": CLOSE_INSPECTOR_EXPR,
+            "returnByValue": true,
+        }),
+    );
 }
 
 fn node_process_pid(
