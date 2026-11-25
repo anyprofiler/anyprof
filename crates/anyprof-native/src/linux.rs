@@ -1,4 +1,4 @@
-//! Linux x86_64 on-CPU sampler.
+//! Linux `x86_64` and `aarch64` on-CPU sampler.
 //!
 //! `perf_event_open` of `PERF_COUNT_SW_TASK_CLOCK` fires only while that
 //! thread is scheduled, so an idle thread contributes no samples and the
@@ -30,10 +30,20 @@ use crate::go_sym::{self, GoImage, GoMachine};
 use crate::java::JavaVm;
 use crate::kallsyms::{self, Kallsym};
 use crate::maps::{self, MapSpan};
-use crate::perf_parse::{self, ParsedSample, X86_USER_REGS};
+use crate::perf_parse::{self, ParsedSample};
 use crate::policy::{self, LinuxDenial, SampleCollector};
 use crate::python::{self, CountedStack, PythonVm};
 use crate::walk::{self, walk_frame_pointer};
+
+#[cfg(target_arch = "x86_64")]
+const USER_REGS: u64 = perf_parse::X86_USER_REGS;
+#[cfg(target_arch = "aarch64")]
+const USER_REGS: u64 = perf_parse::ARM64_USER_REGS;
+
+#[cfg(target_arch = "x86_64")]
+const HOST_GO_MACHINE: GoMachine = GoMachine::X86_64;
+#[cfg(target_arch = "aarch64")]
+const HOST_GO_MACHINE: GoMachine = GoMachine::Arm64;
 
 const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
@@ -41,7 +51,7 @@ const SAMPLE_TYPE: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5) | (1 << 12) |
 const ATTR_SIZE: u32 = 96;
 const FLAG_FD_CLOEXEC: u64 = 1 << 3;
 // `PERF_EVENT_IOC_ENABLE` / `DISABLE` (`_IO('$', 0)` and `_IO('$', 1)`).
-// `libc::Ioctl` is `c_ulong` with glibc and `c_int` with musl on x86_64.
+// `libc::Ioctl` is `c_ulong` with glibc and `c_int` with musl on Linux.
 // A `u64` request compiles for glibc and fails for musl.
 const IOC_ENABLE: libc::Ioctl = 0x2400;
 const IOC_DISABLE: libc::Ioctl = 0x2401;
@@ -52,13 +62,13 @@ const DATA_SIZE: usize = 1048;
 const RECORD_SAMPLE: u32 = 9;
 const RECORD_LOST: u32 = 2;
 const RECORD_LOST_SAMPLES: u32 = 13;
-const EM_X86_64: u16 = 62;
 const ELFCLASS64: u8 = 2;
 
 /// `perf_event_attr` through `PERF_ATTR_SIZE_VER3` (96 bytes).
 ///
-/// The flags word is little-endian, matching the kernel bitfield on x86_64.
-/// The event is created disabled and enabled after the ring exists.
+/// The flags word is little-endian, matching the kernel bitfield on 64-bit
+/// little-endian Linux (`x86_64` and `aarch64`). The event is created disabled
+/// and enabled after the ring exists.
 #[repr(C)]
 struct PerfEventAttr {
     type_: u32,
@@ -308,7 +318,7 @@ fn event_attr(period: u64, stack: u32, include_kernel: bool) -> PerfEventAttr {
         config1: 0,
         config2: 0,
         branch_sample_type: 0,
-        sample_regs_user: X86_USER_REGS,
+        sample_regs_user: USER_REGS,
         sample_stack_user: stack,
         clockid: 0,
     }
@@ -642,7 +652,7 @@ fn drain_mapped(mapped: &Mapped) -> (Vec<ParsedSample>, u64) {
             break;
         };
         if kind == RECORD_SAMPLE {
-            if let Some(sample) = perf_parse::parse_sample_timed(&record, X86_USER_REGS, true) {
+            if let Some(sample) = perf_parse::parse_sample_timed(&record, USER_REGS, true) {
                 samples.push(sample);
             }
         } else if kind == RECORD_LOST && record.len() >= 24 {
@@ -817,18 +827,23 @@ where
     } else {
         Vec::new()
     };
-    if include_kernel && kernel.is_empty() && sample.ip >= 0xffff_8000_0000_0000 {
+    if include_kernel && kernel.is_empty() && perf_parse::is_kernel_address(sample.ip) {
         kernel.push(sample.ip);
     }
     kernel.truncate(walk::MAX_FRAMES);
 
     let pc = sample
         .user_ip
+        .map(walk::strip_pac_code)
         .filter(|&ip| walk::plausible_user_address(ip))
-        .or_else(|| walk::plausible_user_address(sample.ip).then_some(sample.ip))
+        .or_else(|| {
+            let ip = walk::strip_pac_code(sample.ip);
+            walk::plausible_user_address(ip).then_some(ip)
+        })
         .unwrap_or(0);
     let fp = sample.user_fp.unwrap_or(0);
     let sp = sample.user_sp.unwrap_or(0);
+    let lr = sample.user_lr.map(walk::strip_pac_code).unwrap_or(0);
     let stack = sample.stack.as_slice();
     if let Some(vm) = java {
         let mut read_java = |addr: u64, buf: &mut [u8]| {
@@ -861,21 +876,24 @@ where
         go_images,
         pc,
         sp,
-        0,
-        GoMachine::X86_64,
+        lr,
+        HOST_GO_MACHINE,
         |addr, buf| read_copied_stack(stack, sp, addr, buf),
-        |addr| addr,
+        walk::strip_pac_code,
     );
     let mut user = if let Some(frames) = go_walk {
         frames
     } else {
-        let walked = walk_frame_pointer(pc, fp, 0, |addr, buf| {
+        let walked = walk_frame_pointer(pc, fp, lr, |addr, buf| {
             read_copied_stack(stack, sp, addr, buf)
         });
         perf_parse::choose_user_frames(walked, user_chain)
     };
-    if user.is_empty() && walk::plausible_user_address(sample.ip) {
-        user.push(sample.ip);
+    if user.is_empty() {
+        let raw_ip = walk::strip_pac_code(sample.ip);
+        if walk::plausible_user_address(raw_ip) {
+            user.push(raw_ip);
+        }
     }
     user.truncate(walk::MAX_FRAMES);
     if kernel.is_empty() && user.is_empty() {
@@ -1060,14 +1078,15 @@ fn image_from_elf(mapped_path: &str, open_path: &Path, group: &[MapSpan]) -> Use
     let Some(elf) = elf::parse_path(open_path) else {
         return UserImage::range_only(start, end, module);
     };
-    if !elf::is_x86_64(&elf) {
+    if !elf::is_host_linux_elf(&elf) {
         return UserImage::range_only(start, end, module);
     }
     let anchor = group
         .iter()
         .find(|span| span.executable)
         .unwrap_or(&group[0]);
-    let Some(bias) = elf::load_bias(anchor.start, anchor.offset, &elf.loads) else {
+    let Some(bias) = elf::load_bias(anchor.start, anchor.offset, &elf.loads, page_size() as u64)
+    else {
         return UserImage::range_only(start, end, module);
     };
     let mut image = UserImage::from_elf(start, end, module, &elf, bias);
@@ -1101,13 +1120,15 @@ fn reject_foreign_elf(pid: u32) -> Result<(), Error> {
     }
     let class = bytes[4];
     let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-    if class == ELFCLASS64 && machine == EM_X86_64 {
+    if class == ELFCLASS64 && machine == elf::HOST_ELF_MACHINE {
         return Ok(());
     }
     Err(Error::backend(
         "native",
         format!(
-            "cannot sample pid {pid}: native sampling on Linux walks x86_64 frame pointers; this process is ELF class {class} machine {machine}"
+            "cannot sample pid {pid}: native sampling on Linux {} expects 64-bit ELF machine {}; this process is ELF class {class} machine {machine}",
+            std::env::consts::ARCH,
+            elf::HOST_ELF_MACHINE
         ),
     ))
 }
@@ -1317,6 +1338,7 @@ mod tests {
             user_ip: Some(fixture.leaf_pc),
             user_sp: Some(sp),
             user_fp: Some(sp + 16),
+            user_lr: None,
             stack: fixture.build_copied_stack(sp),
         };
         let mut dirty_live_read = |addr: u64, buf: &mut [u8]| {
@@ -1386,11 +1408,31 @@ mod tests {
             user_ip: Some(0x5555_0000_1100),
             user_sp: Some(sp),
             user_fp: Some(sp),
+            user_lr: None,
             stack,
         };
         let (frames, kernel_len) = native_stack(&sample, false);
         assert_eq!(kernel_len, 0);
         assert_eq!(frames, vec![0x5555_0000_1100, ret]);
+    }
+
+    #[test]
+    fn user_lr_supplies_the_caller_for_a_frameless_leaf() {
+        let sample = ParsedSample {
+            ip: 0x5555_0000_1100,
+            pid: 1,
+            tid: 1,
+            time: None,
+            callchain: vec![0x5555_0000_1100],
+            user_ip: Some(0x5555_0000_1100),
+            user_sp: Some(0x7fff_0000_1000),
+            user_fp: Some(0x7fff_0000_2000),
+            user_lr: Some(0x5555_0000_2200),
+            stack: Vec::new(),
+        };
+        let (frames, kernel_len) = native_stack(&sample, false);
+        assert_eq!(kernel_len, 0);
+        assert_eq!(frames, vec![0x5555_0000_1100, 0x5555_0000_2200]);
     }
 
     #[test]
@@ -1410,6 +1452,7 @@ mod tests {
             user_ip: Some(0x5555_0000_1100),
             user_sp: None,
             user_fp: None,
+            user_lr: None,
             stack: Vec::new(),
         };
         let (frames, kernel_len) = native_stack(&sample, true);

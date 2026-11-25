@@ -6,19 +6,63 @@
 //! slot is a return address, so symbol lookup subtracts one byte later.
 
 #![cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
     allow(dead_code)
 )]
 
 /// Most frames recorded for one sample.
 pub(crate) const MAX_FRAMES: usize = 64;
 
+/// Upper bound of the user-space virtual address range.
+///
+/// `x86_64` user canonical addresses sit below `1 << 47`. Linux `aarch64` uses
+/// 48-bit (`0x0000_ffff_...`) or 52-bit LPA2 (`0x000f_ffff_...`) TTBR0 user
+/// addresses, so `1 << 52` covers both while staying well below TTBR1 kernel
+/// space (`0xfff0_0000_0000_0000..`).
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) const USER_ADDR_LIMIT: u64 = 0x0010_0000_0000_0000;
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+pub(crate) const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// Strip pointer-authentication bits from a user-space instruction / return
+/// address on Linux `aarch64` (`-mbranch-protection=standard` / `paciasp`).
+///
+/// Uses `hint #7` (`xpaclri`) on `x30`: on Armv8.3+ CPUs with `FEAT_PAuth` it
+/// zeroes the PAC bits above `VA_BITS - 1` without trapping on invalid keys,
+/// and on Armv8.0-8.2 CPUs without `FEAT_PAuth` it executes as an architectural
+/// `nop`. Kernel TTBR1 addresses (`bit 55 == 1`) are returned unchanged.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) fn strip_pac_code(addr: u64) -> u64 {
+    if addr == 0 || (addr & (1 << 55)) != 0 {
+        return addr;
+    }
+    let stripped: u64;
+    // SAFETY: `hint #7` (`xpaclri`) only modifies `x30` (declared via `inout`),
+    // touches neither memory nor flags, and is a `nop` prior to Armv8.3-A.
+    unsafe {
+        core::arch::asm!(
+            "hint #7",
+            inout("x30") addr => stripped,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    stripped
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+pub(crate) fn strip_pac_code(addr: u64) -> u64 {
+    addr
+}
+
 /// A user-space instruction pointer or saved return address.
 ///
-/// The upper half of the canonical x86_64 address space belongs to the
-/// kernel. Context markers used by perf sit even higher and are not code.
+/// The upper half of the canonical address space belongs to the kernel.
+/// Context markers used by perf sit even higher and are not code.
 pub(crate) fn plausible_user_address(addr: u64) -> bool {
-    addr > 0x1000 && addr < 0x0000_8000_0000_0000
+    addr > 0x1000 && addr < USER_ADDR_LIMIT
 }
 
 /// Instruction pointers `StackWalk64` may store as user frames.
@@ -57,6 +101,8 @@ pub(crate) fn walk_frame_pointer(
     lr: u64,
     mut read: impl FnMut(u64, &mut [u8]) -> bool,
 ) -> Vec<u64> {
+    let pc = strip_pac_code(pc);
+    let lr = strip_pac_code(lr);
     let mut frames = Vec::new();
     if plausible_user_address(pc) {
         frames.push(pc);
@@ -69,7 +115,7 @@ pub(crate) fn walk_frame_pointer(
             break;
         }
         let next_fp = u64::from_le_bytes(record[0..8].try_into().unwrap());
-        let ret = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        let ret = strip_pac_code(u64::from_le_bytes(record[8..16].try_into().unwrap()));
         if !plausible_user_address(ret) {
             break;
         }

@@ -1,7 +1,7 @@
 //! Native (C and C++) CPU sampling backend.
 //!
 //! macOS samples on-CPU stacks through Mach (`task_for_pid`, frame pointers,
-//! Mach-O symbols) and needs root. Linux x86_64 samples through
+//! Mach-O symbols) and needs root. Linux `x86_64` and `aarch64` sample through
 //! `perf_event_open` task-clock events and can include kernel frames. Windows
 //! x64 suspends threads that are actually running and walks them with
 //! `StackWalk64`. Other architectures compile and `start` returns not
@@ -55,7 +55,10 @@ pub use rust_image::file_is_rust;
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -71,13 +74,16 @@ use anyprof_core::{
 #[cfg(all(windows, not(target_arch = "x86_64")))]
 const NOT_IMPLEMENTED: &str = "native on-CPU sampling on Windows is implemented for x64; this build is another architecture (macOS Mach sampling is implemented)";
 
-/// Detail for [`Error::NotImplemented`] on Linux builds that are not x86_64.
-#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
-const NOT_IMPLEMENTED: &str = "native on-CPU sampling on Linux is implemented for x86_64; this build is another architecture (macOS Mach sampling is implemented)";
+/// Detail for [`Error::NotImplemented`] on Linux builds that are not x86_64 or aarch64.
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+const NOT_IMPLEMENTED: &str = "native on-CPU sampling on Linux is implemented for x86_64 and aarch64; this build is another architecture (macOS Mach sampling is implemented)";
 
 /// Detail for [`Error::NotImplemented`] on platforms without a sampler yet.
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-const NOT_IMPLEMENTED: &str = "native on-CPU sampling is not built on this platform (macOS Mach sampling is implemented; Windows x64 and Linux x86_64 sampling are implemented)";
+const NOT_IMPLEMENTED: &str = "native on-CPU sampling is not built on this platform (macOS Mach sampling is implemented; Windows x64 and Linux x86_64/aarch64 sampling are implemented)";
 
 /// Native (C, C++, Rust, and other non-language-runtime) sampler.
 #[derive(Debug, Default)]
@@ -99,10 +105,13 @@ impl Backend for NativeBackend {
             on_cpu: true,
             off_cpu: false,
             mixed_stacks: false,
-            // Kernel stacks exist only in the Linux x86_64 perf sampler.
+            // Kernel stacks exist only in the Linux x86_64/aarch64 perf sampler.
             // Other Linux architectures return not implemented from `start`
             // and do not advertise `-k`.
-            kernel_frames: cfg!(all(target_os = "linux", target_arch = "x86_64")),
+            kernel_frames: cfg!(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
             // macOS `task_for_pid` needs root for an ordinary process.
             // Windows same-user sampling does not. Linux same-user user-space
             // sampling does not when `perf_event_paranoid` is 2 or lower;
@@ -144,7 +153,10 @@ impl Backend for NativeBackend {
             );
             Ok(Box::new(ReadySession { profile }))
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             let profile = linux::record(target, opts)?;
             tracing::info!(
@@ -168,7 +180,10 @@ impl Backend for NativeBackend {
         }
         #[cfg(not(any(
             target_os = "macos",
-            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
             all(windows, target_arch = "x86_64"),
         )))]
         {
@@ -243,7 +258,10 @@ mod tests {
         assert_eq!(caps.needs_root, cfg!(target_os = "macos"));
         assert_eq!(
             caps.kernel_frames,
-            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            cfg!(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))
         );
         assert_eq!(
             NativeBackend.default_sampling_interval().as_micros(),
@@ -278,9 +296,12 @@ mod tests {
         );
     }
 
-    /// Linux x86_64 either samples this process or explains `perf_event_open`.
+    /// Linux x86_64/aarch64 either samples this process or explains `perf_event_open`.
     /// Task-clock events do not suspend the target, so self-sampling is safe.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn linux_samples_or_explains_perf_event_open() {
         let result = NativeBackend.start(
@@ -305,8 +326,11 @@ mod tests {
         }
     }
 
-    /// `-k` is a real request on Linux x86_64. Paranoid 2 refuses kernel samples.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    /// `-k` is a real request on Linux x86_64/aarch64. Paranoid 2 refuses kernel samples.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn kernel_flag_is_a_real_perf_request() {
         let result = NativeBackend.start(
@@ -358,7 +382,10 @@ mod tests {
     /// Platforms without a sampler still compile and refuse.
     #[cfg(not(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     )))]
     #[test]
@@ -409,7 +436,10 @@ mod tests {
 
     #[cfg(not(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     )))]
     #[test]

@@ -11,7 +11,10 @@
 //! fields are absent.
 
 #![cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
     allow(dead_code)
 )]
 
@@ -23,6 +26,15 @@ const ABI_NONE: u64 = 0;
 /// `PERF_CONTEXT_MAX`. Values at or above this are call-chain markers.
 const PERF_CONTEXT_MAX: u64 = u64::MAX - 4094;
 
+/// Lowest kernel TTBR1 / high-canonical address on this Linux architecture.
+///
+/// Linux `aarch64` starts TTBR1 at `0xffff_0000_0000_0000` (`VA_BITS=48`) or
+/// `0xfff0_0000_0000_0000` (`VA_BITS=52`). `x86_64` starts at `0xffff_8000_0000_0000`.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const KERNEL_ADDR_MIN: u64 = 0xfff0_0000_0000_0000;
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+const KERNEL_ADDR_MIN: u64 = 0xffff_8000_0000_0000;
+
 /// `PERF_CONTEXT_KERNEL` and the guest equivalent.
 pub(crate) const CONTEXT_KERNEL: u64 = u64::MAX - 127;
 const CONTEXT_GUEST_KERNEL: u64 = u64::MAX - 2175;
@@ -30,9 +42,14 @@ const CONTEXT_GUEST_KERNEL: u64 = u64::MAX - 2175;
 pub(crate) const CONTEXT_USER: u64 = u64::MAX - 511;
 const CONTEXT_GUEST_USER: u64 = u64::MAX - 2559;
 
+/// Whether `ip` is a kernel instruction address rather than user code or a perf context marker.
+pub(crate) fn is_kernel_address(ip: u64) -> bool {
+    (KERNEL_ADDR_MIN..PERF_CONTEXT_MAX).contains(&ip)
+}
+
 /// Flags word of `perf_event_attr` for this sampler.
 ///
-/// Bit positions were checked against `linux/perf_event.h` on x86_64:
+/// Bit positions match `uapi/linux/perf_event.h` on little-endian 64-bit Linux:
 /// `disabled` is bit 0, `exclude_kernel` bit 5, `exclude_hv` bit 6,
 /// `exclude_callchain_kernel` bit 21. The event starts disabled and is
 /// enabled with `PERF_EVENT_IOC_ENABLE` after the ring buffer exists.
@@ -46,11 +63,15 @@ pub(crate) fn event_flags(include_kernel: bool) -> u64 {
     flags
 }
 
-/// User registers this sampler requests: `bp`, then `sp`, then `ip`.
-///
-/// The kernel writes set bits from low to high. Those three bits are
-/// `PERF_REG_X86_BP` (6), `PERF_REG_X86_SP` (7), and `PERF_REG_X86_IP` (8).
+/// User registers requested on `x86_64`: `bp` (6), `sp` (7), `ip` (8).
+#[allow(dead_code)]
 pub(crate) const X86_USER_REGS: u64 = (1 << 6) | (1 << 7) | (1 << 8);
+
+/// User registers requested on `aarch64` (`uapi/asm/perf_regs.h`):
+/// `PERF_REG_ARM64_FP` (`x29`, 29), `PERF_REG_ARM64_LR` (`x30`, 30),
+/// `PERF_REG_ARM64_SP` (31), and `PERF_REG_ARM64_PC` (32).
+#[allow(dead_code)]
+pub(crate) const ARM64_USER_REGS: u64 = (1 << 29) | (1 << 30) | (1 << 31) | (1 << 32);
 
 /// One sample after the header has been checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +93,8 @@ pub(crate) struct ParsedSample {
     pub user_sp: Option<u64>,
     /// User frame pointer.
     pub user_fp: Option<u64>,
+    /// User link register (`x30`) on `aarch64`, when saved.
+    pub user_lr: Option<u64>,
     /// Bytes copied from the user stack, starting at `user_sp`.
     pub stack: Vec<u8>,
 }
@@ -107,7 +130,7 @@ pub(crate) fn split_callchain(ips: &[u64]) -> (Vec<u64>, Vec<u64>) {
             Mode::User => push_user(&mut user, ip),
             Mode::Other => {}
             Mode::Unknown => {
-                if ip >= 0xffff_8000_0000_0000 {
+                if is_kernel_address(ip) {
                     push_kernel(&mut kernel, ip);
                 } else {
                     push_user(&mut user, ip);
@@ -119,12 +142,13 @@ pub(crate) fn split_callchain(ips: &[u64]) -> (Vec<u64>, Vec<u64>) {
 }
 
 fn push_kernel(out: &mut Vec<u64>, ip: u64) {
-    if (0xffff_8000_0000_0000..PERF_CONTEXT_MAX).contains(&ip) {
+    if is_kernel_address(ip) {
         out.push(ip);
     }
 }
 
 fn push_user(out: &mut Vec<u64>, ip: u64) {
+    let ip = crate::walk::strip_pac_code(ip);
     if plausible_user_address(ip) {
         out.push(ip);
     }
@@ -192,18 +216,29 @@ pub(crate) fn parse_sample_timed(
         callchain.push(read_u64(record, &mut cursor)?);
     }
     let abi = read_u64(record, &mut cursor)?;
-    let (user_fp, user_sp, user_ip) = if abi == ABI_NONE {
-        (None, None, None)
+    let (user_fp, user_lr, user_sp, user_ip) = if abi == ABI_NONE {
+        (None, None, None, None)
     } else {
         let count = regs_mask.count_ones() as usize;
         let mut regs = Vec::with_capacity(count);
         for _ in 0..count {
             regs.push(read_u64(record, &mut cursor)?);
         }
-        let fp = reg_value(regs_mask, &regs, 6);
-        let sp = reg_value(regs_mask, &regs, 7);
-        let ip = reg_value(regs_mask, &regs, 8);
-        (fp, sp, ip)
+        if regs_mask == ARM64_USER_REGS {
+            (
+                reg_value(regs_mask, &regs, 29),
+                reg_value(regs_mask, &regs, 30),
+                reg_value(regs_mask, &regs, 31),
+                reg_value(regs_mask, &regs, 32),
+            )
+        } else {
+            (
+                reg_value(regs_mask, &regs, 6),
+                None,
+                reg_value(regs_mask, &regs, 7),
+                reg_value(regs_mask, &regs, 8),
+            )
+        }
     };
     let stack_size = read_u64(record, &mut cursor)?;
     let stack = if stack_size == 0 {
@@ -226,6 +261,7 @@ pub(crate) fn parse_sample_timed(
         user_ip,
         user_sp,
         user_fp,
+        user_lr,
         stack,
     })
 }
@@ -274,8 +310,8 @@ fn read_bytes<'a>(buf: &'a [u8], cursor: &mut usize, len: usize) -> Option<&'a [
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_KERNEL, CONTEXT_USER, X86_USER_REGS, choose_user_frames, event_flags, parse_sample,
-        read_ring, split_callchain,
+        ARM64_USER_REGS, CONTEXT_KERNEL, CONTEXT_USER, X86_USER_REGS, choose_user_frames,
+        event_flags, parse_sample, read_ring, split_callchain,
     };
 
     #[test]
@@ -318,10 +354,45 @@ mod tests {
         assert_eq!(parsed.user_ip, Some(0x5555_0000_1000));
         assert_eq!(parsed.user_sp, Some(sp));
         assert_eq!(parsed.user_fp, Some(sp));
+        assert_eq!(parsed.user_lr, None);
         assert_eq!(parsed.stack.len(), 32);
         let (kernel, user) = split_callchain(&parsed.callchain);
         assert!(kernel.is_empty());
         assert_eq!(user, vec![0x5555_0000_1000]);
+    }
+
+    #[test]
+    fn arm64_user_sample_round_trips_fp_lr_sp_and_pc_in_bit_order() {
+        let fp = 0x0000_ffff_c000_1020u64;
+        let lr = 0x0000_aaaa_b000_2200u64;
+        let sp = 0x0000_ffff_c000_1000u64;
+        let pc = 0x0000_aaaa_b000_1100u64;
+        let mut record = Vec::new();
+        record.extend_from_slice(&9u32.to_le_bytes());
+        record.extend_from_slice(&2u16.to_le_bytes());
+        let size_at = record.len();
+        record.extend_from_slice(&0u16.to_le_bytes());
+        record.extend_from_slice(&pc.to_le_bytes());
+        record.extend_from_slice(&7u32.to_le_bytes());
+        record.extend_from_slice(&8u32.to_le_bytes());
+        record.extend_from_slice(&0u64.to_le_bytes()); // empty callchain
+        record.extend_from_slice(&2u64.to_le_bytes()); // PERF_SAMPLE_REGS_ABI_64
+        // Kernel emits bits 29 (FP), 30 (LR), 31 (SP), 32 (PC) in ascending order.
+        record.extend_from_slice(&fp.to_le_bytes());
+        record.extend_from_slice(&lr.to_le_bytes());
+        record.extend_from_slice(&sp.to_le_bytes());
+        record.extend_from_slice(&pc.to_le_bytes());
+        record.extend_from_slice(&0u64.to_le_bytes()); // stack size 0
+        let size = record.len() as u16;
+        record[size_at..size_at + 2].copy_from_slice(&size.to_le_bytes());
+
+        let parsed = parse_sample(&record, ARM64_USER_REGS).unwrap();
+        assert_eq!(parsed.pid, 7);
+        assert_eq!(parsed.tid, 8);
+        assert_eq!(parsed.user_fp, Some(fp));
+        assert_eq!(parsed.user_lr, Some(lr));
+        assert_eq!(parsed.user_sp, Some(sp));
+        assert_eq!(parsed.user_ip, Some(pc));
     }
 
     #[test]

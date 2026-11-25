@@ -1,11 +1,14 @@
-//! Live Linux x86_64 samples of native processes.
+//! Live Linux `x86_64` and `aarch64` samples of native processes.
 //!
 //! These tests attach with `perf_event_open` to programs this test compiled.
 //! They skip when that syscall is refused, unless `ANYPROF_REQUIRE_NATIVE=1`,
 //! which is what Ubuntu CI sets after lowering `kernel.perf_event_paranoid`.
 //! A green run with the variable unset is not evidence that sampling works.
 
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -539,12 +542,10 @@ fn compile(source: &Path, binary: &Path, extra: &[&str]) -> bool {
             "-std=c++17",
             "-O0",
             "-fno-omit-frame-pointer",
+            "-mno-omit-leaf-frame-pointer",
             "-fno-optimize-sibling-calls",
             "-g",
         ]);
-        if compiler == "clang++" {
-            command.arg("-mno-omit-leaf-frame-pointer");
-        }
         command.args(extra).arg("-o").arg(binary).arg(source);
         match command.output() {
             Ok(output) if output.status.success() => return true,

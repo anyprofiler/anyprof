@@ -408,7 +408,10 @@ pub(crate) fn windows_open_denied(
 #[cfg_attr(
     not(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     )),
     allow(dead_code)
@@ -425,7 +428,10 @@ pub(crate) struct SampleCollector {
 #[cfg_attr(
     not(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     )),
     allow(dead_code)

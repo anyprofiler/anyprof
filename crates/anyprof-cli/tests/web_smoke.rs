@@ -29,8 +29,8 @@ const DEADLINE: Duration = Duration::from_secs(60);
 fn viewer_renders_profiles_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         assert!(
-            std::env::var_os("ANYPROF_REQUIRE_CHROME").is_none(),
-            "ANYPROF_REQUIRE_CHROME is set but no Chrome was found (set ANYPROF_CHROME)"
+            std::env::var("ANYPROF_REQUIRE_CHROME").ok().as_deref() != Some("1"),
+            "ANYPROF_REQUIRE_CHROME=1 is set but no Chrome was found (set ANYPROF_CHROME)"
         );
         eprintln!("skipping: no Chrome found (set ANYPROF_CHROME to run this test)");
         return;

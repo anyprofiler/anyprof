@@ -56,12 +56,9 @@ const BUILD_INFO: &[u8] = b"\xff Go buildinf:";
 
 /// amd64 pushes the return PC. arm64 keeps it in LR or in the slot at SP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum GoMachine {
     X86_64,
-    #[cfg_attr(
-        not(all(target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )]
     Arm64,
 }
 

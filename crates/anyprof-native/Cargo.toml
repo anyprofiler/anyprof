@@ -7,7 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Native CPU sampling backend for anyprof. macOS uses Mach, Windows x64 uses StackWalk64, and Linux x86_64 uses perf events."
+description = "Native CPU sampling backend for anyprof. macOS uses Mach, Windows x64 uses StackWalk64, and Linux x86_64/aarch64 uses perf events."
 
 [dependencies]
 anyprof-core.workspace = true

@@ -4,7 +4,10 @@
 //! when they have a path that is a real file. The sampler groups the lines.
 
 #![cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
     allow(dead_code)
 )]
 

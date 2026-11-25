@@ -22,7 +22,7 @@ jobs:
         # macos-latest is arm64. macos-15-intel is x86_64. A green arm64
         # job is not Intel coverage. Go 1.22 keeps the header textStart.
         # Go 1.26 writes that word as zero; both are live-sampled.
-        os: [macos-latest, macos-15-intel, windows-latest, ubuntu-latest]
+        os: [macos-latest, macos-15-intel, windows-latest, ubuntu-latest, ubuntu-24.04-arm]
         go: ["1.22.x", "1.26.x"]
     steps:
       - uses: actions/checkout@v4
@@ -30,11 +30,12 @@ jobs:
         with:
           toolchain: 1.99.1
           components: rustfmt, clippy
-      - name: Install the musl target
+      - name: Install the musl target (x86_64)
         if: matrix.os == 'ubuntu-latest'
-        # The x86_64 sampler is not compiled for aarch64, so an arm64 musl
-        # release build does not catch an x86_64 musl type error.
         run: rustup target add x86_64-unknown-linux-musl
+      - name: Install the musl target (aarch64)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: rustup target add aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
@@ -73,18 +74,20 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Check x86_64 musl
-        if: matrix.os == 'ubuntu-latest'
+      - name: Check Linux musl
+        if: startsWith(matrix.os, 'ubuntu-')
         # Type-check the release target. musl-gcc is only for the updater's C
         # build script. This does not link the binary or run cargo-dist.
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          cargo check --workspace --locked --target x86_64-unknown-linux-musl
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
+          if [ "$(uname -m)" = "aarch64" ]; then
+            CC_aarch64_unknown_linux_musl=musl-gcc cargo check --workspace --locked --target aarch64-unknown-linux-musl
+          else
+            CC_x86_64_unknown_linux_musl=musl-gcc cargo check --workspace --locked --target x86_64-unknown-linux-musl
+          fi
       - name: Check CPython offsets against the installed headers
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu-')
         # The frame walk's constants are checked here, not by cargo test, so
         # the MSRV job does not need a C compiler. anyprof does not change
         # ptrace_scope; this step only reads headers.
@@ -106,7 +109,7 @@ jobs:
           check "$PY312"
           check "$PY313"
       - name: Refuse an unrelated Python read at ptrace_scope 1
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu-')
         # The image default is 1. This step forces that value if a runner
         # image changes it, then requires the permission error. anyprof does
         # not write the sysctl. The next step sets 0 so the suite can read
@@ -125,7 +128,7 @@ jobs:
           echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
           cargo test -p anyprof-python --test live --locked -- --exact supported::unrelated_same_user_read_follows_ptrace_scope
       - name: Refuse an unrelated Java read at ptrace_scope 1
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu-')
         # Same scope as the Python step. A HotSpot frame read is
         # process_vm_readv. The test double-forks java so this process is
         # not an ancestor. anyprof does not write the sysctl.
@@ -143,7 +146,7 @@ jobs:
           echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
           cargo test -p anyprof-java --test live --locked -- --exact supported::unrelated_same_user_read_follows_ptrace_scope
       - name: Sample a spawned Python child at ptrace_scope 1
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu-')
         # Because anyprof spawns the child directly, Yama ptrace_scope 1 allows
         # parent->child process_vm_readv without sudo or lowering ptrace_scope.
         env:
@@ -159,7 +162,7 @@ jobs:
           echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope)"
           cargo test -p anyprof-cli --test spawn_live --locked -- --exact spawn_python_captures_interpreter_frames_as_parent
       - name: Allow per-process perf sampling and Python and Java frame reads
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu-')
         run: |
           sudo sysctl kernel.perf_event_paranoid=1
           sudo sysctl kernel.kptr_restrict=0
@@ -175,8 +178,8 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
         env:
-          # The runner images ship Chrome; the viewer smoke test must not skip.
-          ANYPROF_REQUIRE_CHROME: "1"
+          # x86_64/macOS/Windows runner images ship Chrome; ubuntu-24.04-arm does not.
+          ANYPROF_REQUIRE_CHROME: ${{ matrix.os != 'ubuntu-24.04-arm' && '1' || '0' }}
           ANYPROF_SMOKE_ARTIFACTS: ${{ runner.temp }}/web-smoke
           # macOS samples C++, Rust, and Go under sudo. Ubuntu samples them
           # after the sysctl step. Windows samples them as the same user. A

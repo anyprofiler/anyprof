@@ -35,21 +35,27 @@ use anyprof_native::NativeBackend;
 
 /// Detail for [`Error::NotImplemented`] on Windows builds that are not x64.
 #[cfg(all(windows, not(target_arch = "x86_64")))]
-const NOT_IMPLEMENTED: &str = "Python on-CPU sampling uses the native Windows sampler, which is implemented for x64; this build is another architecture (macOS Mach sampling and Linux x86_64 sampling are implemented)";
+const NOT_IMPLEMENTED: &str = "Python on-CPU sampling uses the native Windows sampler, which is implemented for x64; this build is another architecture (macOS Mach sampling and Linux x86_64/aarch64 sampling are implemented)";
 
-/// Detail for [`Error::NotImplemented`] on Linux builds that are not x86_64.
-#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
-const NOT_IMPLEMENTED: &str = "Python on-CPU sampling uses the native Linux sampler, which is implemented for x86_64; this build is another architecture (macOS Mach sampling and Windows x64 sampling are implemented)";
+/// Detail for [`Error::NotImplemented`] on Linux builds that are not x86_64 or aarch64.
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+const NOT_IMPLEMENTED: &str = "Python on-CPU sampling uses the native Linux sampler, which is implemented for x86_64 and aarch64; this build is another architecture (macOS Mach sampling and Windows x64 sampling are implemented)";
 
 /// Detail for [`Error::NotImplemented`] on platforms without a sampler.
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-const NOT_IMPLEMENTED: &str = "Python on-CPU sampling is not built on this platform (macOS Mach sampling, Windows x64 sampling, and Linux x86_64 sampling are implemented)";
+const NOT_IMPLEMENTED: &str = "Python on-CPU sampling is not built on this platform (macOS Mach sampling, Windows x64 sampling, and Linux x86_64/aarch64 sampling are implemented)";
 
 /// Used only if the native sampler reports not implemented on a platform that
 /// has one. The cfg-specific messages above cover the builds that refuse.
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 const NOT_IMPLEMENTED: &str = "Python on-CPU sampling is not available in this build";
@@ -74,7 +80,7 @@ impl Backend for PythonBackend {
         let native = NativeBackend.capabilities();
         Capabilities {
             // A stack can contain native frames when the leaf is outside the
-            // interpreter image, and kernel frames on Linux x86_64 with `-k`.
+            // interpreter image, and kernel frames on Linux x86_64/aarch64 with `-k`.
             mixed_stacks: true,
             ..native
         }
@@ -111,7 +117,10 @@ fn retarget(err: Error) -> Error {
 pub fn sampler_implemented() -> bool {
     cfg!(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     ))
 }
@@ -146,7 +155,10 @@ mod tests {
         assert_eq!(caps.needs_root, cfg!(target_os = "macos"));
         assert_eq!(
             caps.kernel_frames,
-            cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            cfg!(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))
         );
         assert_eq!(
             PythonBackend.default_format(),
@@ -227,7 +239,10 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn linux_samples_or_explains_perf_event_open_as_python() {
         let result = PythonBackend.start(
@@ -252,7 +267,10 @@ mod tests {
 
     #[cfg(not(any(
         target_os = "macos",
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(windows, target_arch = "x86_64"),
     )))]
     #[test]

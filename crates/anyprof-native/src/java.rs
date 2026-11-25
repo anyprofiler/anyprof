@@ -495,7 +495,10 @@ pub fn pid_is_hotspot(pid: u32) -> bool {
 }
 
 fn open_vm(pid: u32) -> Result<JavaVm, Error> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     {
         open_linux(pid).map_err(|message| Error::backend("java", message))
     }
@@ -516,7 +519,10 @@ fn open_vm(pid: u32) -> Result<JavaVm, Error> {
         .map_err(as_java)
     }
     #[cfg(not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         target_os = "macos",
         all(windows, target_arch = "x86_64"),
     )))]
@@ -537,8 +543,11 @@ fn as_java(err: Error) -> Error {
     }
 }
 
-/// Opens the JVM for a Linux x86_64 process. `None` keeps the native walk.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Opens the JVM for a Linux `x86_64` or `aarch64` process. `None` keeps the native walk.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) fn attach_linux(pid: u32) -> Option<JavaVm> {
     match open_linux(pid) {
         Ok(vm) => Some(vm),
@@ -582,11 +591,26 @@ where
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn open_linux(pid: u32) -> Result<JavaVm, String> {
     let (path, spans) = linux_libjvm(pid)?;
     let file = elf_hotspot(&path)?;
     let arch = file.arch;
+    #[cfg(target_arch = "x86_64")]
+    let host_arch = JvmArch::X86_64;
+    #[cfg(target_arch = "aarch64")]
+    let host_arch = JvmArch::Aarch64;
+    if arch != host_arch {
+        return Err(format!(
+            "libjvm at {} is {}, which does not match this {} build",
+            path.display(),
+            arch.label(),
+            host_arch.label()
+        ));
+    }
     let slide = elf_slide(&spans, file.load_offset, file.load_vaddr).ok_or_else(|| {
         format!(
             "libjvm at {} is mapped, but its load bias could not be resolved",
@@ -1350,14 +1374,16 @@ where
 }
 
 fn canonical_user(addr: u64) -> Option<u64> {
+    let addr = crate::walk::strip_pac_code(addr);
     if plausible_user(addr) {
         return Some(addr);
     }
-    // Apple Silicon return addresses can carry a PAC in the top byte.
-    // x86_64 pointers are not authenticated; masking one would turn a
-    // kernel address into a user-looking value.
+    // Apple Silicon / ARM64 TBI return addresses can carry a PAC or tag in the
+    // top byte while bit 55 remains 0 (TTBR0 user space). x86_64 pointers are
+    // not authenticated; masking a kernel TTBR1 address (bit 55 == 1) is never
+    // allowed.
     #[cfg(target_arch = "aarch64")]
-    {
+    if (addr & (1 << 55)) == 0 {
         let stripped = addr & 0x00ff_ffff_ffff_ffff;
         if plausible_user(stripped) {
             return Some(stripped);
@@ -1367,7 +1393,7 @@ fn canonical_user(addr: u64) -> Option<u64> {
 }
 
 fn plausible_user(addr: u64) -> bool {
-    (0x1_0000..0x0000_8000_0000_0000).contains(&addr)
+    (0x1_0000..crate::walk::USER_ADDR_LIMIT).contains(&addr)
 }
 
 fn read_u64<R>(read: &mut R, addr: u64) -> Option<u64>
@@ -1443,13 +1469,19 @@ fn linux_libjvm(pid: u32) -> Result<(PathBuf, Vec<crate::maps::MapSpan>), String
     Ok((path, owned))
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn probe_linux(pid: u32, addr: u64) -> Result<(), String> {
     let mut buf = [0u8; 8];
     linux_read(pid, addr, &mut buf).map_err(|err| linux_denied(pid, err))
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn linux_read(pid: u32, addr: u64, buf: &mut [u8]) -> Result<(), i32> {
     if buf.is_empty() || addr < 0x1000 {
         return Err(libc::EFAULT);
@@ -1474,7 +1506,10 @@ fn linux_read(pid: u32, addr: u64, buf: &mut [u8]) -> Result<(), i32> {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn linux_denied(pid: u32, err: i32) -> String {
     let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
         .ok()
@@ -1656,12 +1691,18 @@ fn elf_reject(path: &Path) -> String {
     )
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn elf_slide(spans: &[crate::maps::MapSpan], load_offset: u64, load_vaddr: u64) -> Option<u64> {
+    let page_mask = !(crate::elf::system_page_size() - 1);
+    let map_offset = load_offset & page_mask;
+    let map_vaddr = load_vaddr.wrapping_sub(load_offset - map_offset);
     spans
         .iter()
-        .find(|span| span.offset == load_offset)
-        .map(|span| span.start.wrapping_sub(load_vaddr))
+        .find(|span| span.offset == map_offset)
+        .map(|span| span.start.wrapping_sub(map_vaddr))
 }
 
 /// CPU of the Mach-O header mapped at `load`, not of this process.

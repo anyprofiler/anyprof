@@ -16,11 +16,11 @@ This document captures the low-level sampling, stack-unwinding, symbol-resolutio
 - **Pointer authentication (`arm64` / `arm64e`)**: Follows Darwin's `__darwin_arm_thread_state64_ptrauth_strip` conventions. `NO_PTRAUTH` leaves register `pc`/`lr`/`sp`/`fp` untouched; `IB_SIGNED_LR` preserves `lr`; otherwise `xpaci` strips code pointers and `xpacd` strips data pointers (including saved frame records when an `arm64` binary calls into `arm64e` system frameworks) without trapping on invalid signatures.
 - **Symbols**: Parses Mach-O symbol tables (capped at 2,000,000 symbols and 64 MiB string tables). System libraries residing solely in `dyld_shared_cache` (`dyld_v1`) retain module ranges without symbol names.
 
-### Linux (`x86_64`)
+### Linux (`x86_64` & `aarch64`)
 
-- **Attach & sampling**: Opens per-thread `perf_event_open` ring buffers using `PERF_COUNT_SW_TASK_CLOCK` (strictly on-CPU; target threads are never suspended). Self-profiling is supported.
-- **Unwinding**: Walks frame pointers inside the kernel-captured `PERF_SAMPLE_STACK_USER` snapshot (8 KiB), falling back to the kernel's user callchain when the FP walk yields fewer than two frames. Non-leaf return addresses subtract 1 byte before symbol lookup.
-- **Container / namespace resolution**: Mapped binaries and shared libraries in `/proc/<pid>/maps` are opened via `/proc/<pid>/root/...` (rejecting `..` path traversal) while keeping clean host-independent module basenames.
+- **Attach & sampling**: Opens per-thread `perf_event_open` ring buffers using `PERF_COUNT_SW_TASK_CLOCK` (strictly on-CPU; target threads are never suspended). Requests `BP/SP/IP` on `x86_64` and `FP (x29)/LR (x30)/SP/PC` on `aarch64`. Self-profiling is supported.
+- **Unwinding**: Walks frame pointers inside the kernel-captured `PERF_SAMPLE_STACK_USER` snapshot (8 KiB, using `LR` for frameless leaf prologues on `aarch64` and stripping PAC-RET signatures via `xpaclri` / `hint #7`), falling back to the kernel's user callchain when the FP walk yields fewer than two frames. Non-leaf return addresses subtract 1 byte before symbol lookup.
+- **Container / namespace resolution**: Mapped binaries and shared libraries in `/proc/<pid>/maps` are opened via `/proc/<pid>/root/...` (rejecting `..` path traversal) while keeping clean host-independent module basenames. Load biases respect runtime OS page size (`4K`, `16K`, or `64K` on `aarch64`).
 - **Symbols & kernel frames**: Reads ELF `.symtab` then `.dynsym` (up to 4,096 mapped images, including ELF64 extended `e_shnum == 0` section tables) and demangles Itanium C++ and Rust symbols. `-k` / `--kernel` enables kernel callchains and resolves `/proc/kallsyms` when `kernel.perf_event_paranoid <= 1` and `kernel.kptr_restrict == 0`.
 
 ### Windows (`x86_64`)

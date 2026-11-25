@@ -8,26 +8,38 @@ use std::process::Command;
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::path::Path;
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::process::Stdio;
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::time::Duration;
 
 #[cfg(not(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 )))]
 #[test]
@@ -58,7 +70,10 @@ fn rust_record_is_not_implemented_on_this_platform() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 #[test]
@@ -227,7 +242,10 @@ fn record_auto_detects_a_busy_rust_program() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn record(pid: u32, output_dir: &Path) -> std::process::Output {
@@ -253,7 +271,10 @@ fn record(pid: u32, output_dir: &Path) -> std::process::Output {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn parse_wrote(stderr: &str) -> (u64, std::path::PathBuf) {
@@ -275,7 +296,10 @@ fn parse_wrote(stderr: &str) -> (u64, std::path::PathBuf) {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn run_with_timeout(mut command: Command, limit: Duration) -> std::process::Output {
@@ -312,7 +336,10 @@ fn run_with_timeout(mut command: Command, limit: Duration) -> std::process::Outp
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 struct LiveLock {
@@ -320,7 +347,10 @@ struct LiveLock {
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn live_lock() -> LiveLock {
@@ -353,7 +383,10 @@ fn live_lock() -> LiveLock {
 }
 
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 impl Drop for LiveLock {
@@ -364,7 +397,10 @@ impl Drop for LiveLock {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 const BUSY_RS: &str = r#"

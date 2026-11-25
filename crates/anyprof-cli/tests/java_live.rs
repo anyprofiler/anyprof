@@ -8,19 +8,28 @@ use std::process::Command;
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::path::{Path, PathBuf};
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::process::Stdio;
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 use std::time::Duration;
@@ -48,7 +57,10 @@ public class AnyprofSpin {
 
 #[cfg(not(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 )))]
 #[test]
@@ -75,7 +87,10 @@ fn java_record_is_not_implemented_on_this_platform() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 #[test]
@@ -93,7 +108,10 @@ fn record_auto_detects_a_busy_java_program() {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn record_one(java: &Path) {
@@ -225,7 +243,10 @@ fn record_one(java: &Path) {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 /// Homes or binaries from `ANYPROF_JAVA_17`, `ANYPROF_JAVA_21`, and
@@ -291,7 +312,10 @@ fn java_on_path() -> Option<PathBuf> {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn required() -> bool {
@@ -300,7 +324,10 @@ fn required() -> bool {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn record(pid: u32, output_dir: &Path) -> std::process::Output {
@@ -325,7 +352,10 @@ fn record(pid: u32, output_dir: &Path) -> std::process::Output {
 
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "linux", target_arch = "x86_64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     all(windows, target_arch = "x86_64"),
 ))]
 fn parse_wrote(stderr: &str) -> (u64, PathBuf) {
@@ -353,7 +383,11 @@ fn parse_wrote(stderr: &str) -> (u64, PathBuf) {
 #[cfg(all(
     not(target_os = "macos"),
     any(target_os = "linux", windows),
-    any(target_arch = "x86_64", not(target_os = "linux")),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        not(target_os = "linux")
+    ),
 ))]
 fn live_lock() -> LiveLock {
     let path = std::env::temp_dir().join("anyprof-native-live.lock");
@@ -379,7 +413,11 @@ fn live_lock() -> LiveLock {
 #[cfg(all(
     not(target_os = "macos"),
     any(target_os = "linux", windows),
-    any(target_arch = "x86_64", not(target_os = "linux")),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        not(target_os = "linux")
+    ),
 ))]
 struct LiveLock {
     path: PathBuf,
@@ -388,7 +426,11 @@ struct LiveLock {
 #[cfg(all(
     not(target_os = "macos"),
     any(target_os = "linux", windows),
-    any(target_arch = "x86_64", not(target_os = "linux")),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        not(target_os = "linux")
+    ),
 ))]
 impl Drop for LiveLock {
     fn drop(&mut self) {
