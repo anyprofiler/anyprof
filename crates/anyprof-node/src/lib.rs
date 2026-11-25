@@ -95,22 +95,43 @@ impl Backend for NodeBackend {
             ));
         }
 
-        let attached =
-            attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
         let interval_us = sampling_interval_us(
             opts.sampling_interval
                 .unwrap_or_else(|| self.default_sampling_interval()),
         );
+        let mut attached =
+            attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
         let close_inspector = attached.activated_by_us && !opts.keep_inspector;
-        let bytes = capture_cpu_profile(
+        let bytes = match capture_cpu_profile(
             &attached.websocket_url,
             opts.duration,
             interval_us,
             Some(target.pid),
             close_inspector,
             &opts.stop,
-        )
-        .map_err(|err| Error::backend(self.name(), err.to_string()))?;
+        ) {
+            Ok(bytes) => bytes,
+            Err(first_err)
+                if !attached.activated_by_us
+                    && opts.inspect.is_none()
+                    && !opts.stop.stop_requested()
+                    && first_err.to_string().contains("closed the websocket") =>
+            {
+                std::thread::sleep(Duration::from_millis(60));
+                attached = attach::inspector_websocket(target.pid, &snapshot.cmdline, None)?;
+                let close_retry = attached.activated_by_us && !opts.keep_inspector;
+                capture_cpu_profile(
+                    &attached.websocket_url,
+                    opts.duration,
+                    interval_us,
+                    Some(target.pid),
+                    close_retry,
+                    &opts.stop,
+                )
+                .map_err(|err| Error::backend(self.name(), err.to_string()))?
+            }
+            Err(err) => return Err(Error::backend(self.name(), err.to_string())),
+        };
         let mut imported = import_cpuprofile(&bytes, Runtime::Node)
             .map_err(|err| Error::backend(self.name(), err.to_string()))?;
         // Keep Profiler.stop's document so `--format cpuprofile` does not rebuild it.

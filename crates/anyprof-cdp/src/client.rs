@@ -94,7 +94,7 @@ pub fn capture_cpu_profile(
     })();
     if let Err(err) = started_result {
         if close_inspector {
-            close_node_inspector(&mut rpc, &mut socket);
+            close_node_inspector(&mut rpc, &mut socket, websocket_url);
         }
         return Err(err);
     }
@@ -106,7 +106,7 @@ pub fn capture_cpu_profile(
     let stopped = rpc.call(&mut socket, "Profiler.stop", json!({}));
     let _ = rpc.call(&mut socket, "Profiler.disable", json!({}));
     if close_inspector {
-        close_node_inspector(&mut rpc, &mut socket);
+        close_node_inspector(&mut rpc, &mut socket, websocket_url);
     }
     waited?;
     let stopped = stopped?;
@@ -121,10 +121,11 @@ pub fn capture_cpu_profile(
 fn close_node_inspector(
     rpc: &mut Rpc,
     socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+    websocket_url: &str,
 ) {
     if let Some(tcp) = plain_tcp(socket.get_mut()) {
-        let _ = tcp.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = tcp.set_write_timeout(Some(Duration::from_millis(500)));
+        let _ = tcp.set_read_timeout(Some(Duration::from_millis(2000)));
+        let _ = tcp.set_write_timeout(Some(Duration::from_millis(2000)));
     }
     // `inspector.close()` stops the listening port and closes active inspector
     // sessions immediately, typically dropping the websocket before sending a
@@ -137,6 +138,33 @@ fn close_node_inspector(
             "returnByValue": true,
         }),
     );
+    let _ = socket.close(None);
+    wait_for_inspector_port_closed(websocket_url);
+}
+
+fn wait_for_inspector_port_closed(websocket_url: &str) {
+    use std::net::ToSocketAddrs;
+
+    let Some(rest) = websocket_url
+        .strip_prefix("ws://")
+        .or_else(|| websocket_url.strip_prefix("wss://"))
+    else {
+        return;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let Ok(mut addrs) = authority.to_socket_addrs() else {
+        return;
+    };
+    let Some(addr) = addrs.next() else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(25)).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
 }
 
 fn node_process_pid(
