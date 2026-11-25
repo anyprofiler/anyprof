@@ -86,7 +86,7 @@ pub fn record(
         return Err(Error::backend("native", message));
     }
 
-    let task = Task::attach(target.pid)?;
+    let mut task = Task::attach(target.pid)?;
     let mut unwinder = MachUnwinder::new();
     let mut unwind_cache = MachUnwindCache::new_in();
     let mut go_images = Vec::new();
@@ -110,6 +110,7 @@ pub fn record(
     let started = Instant::now();
     let mut next = started;
     let mut collector = SampleCollector::new();
+    let mut reattaches = 0u32;
     loop {
         if stop_requested(opts, session_stop) {
             break;
@@ -153,6 +154,36 @@ pub fn record(
                 return Err(Error::backend("native", err));
             }
             Err(SampleFault::Tick(err)) => {
+                // When sampling a freshly spawned child (`anyprof rec -- <cmd>`),
+                // XNU can replace the child's Mach `task_t` port as `execve` /
+                // `amfid` completes, invalidating an early send right while `pid`
+                // is still alive. Re-acquire the task port so sampling continues.
+                if reattaches < 16
+                    && !stop_requested(opts, session_stop)
+                    && anyprof_core::process_exists(target.pid)
+                    && let Ok(new_task) = Task::attach(target.pid)
+                {
+                    let port_changed = new_task.port != task.port;
+                    reattaches += 1;
+                    tracing::debug!(
+                        pid = target.pid,
+                        reattaches,
+                        port_changed,
+                        %err,
+                        "re-attached Mach task port after tick fault on live pid"
+                    );
+                    task = new_task;
+                    if port_changed {
+                        unwinder = MachUnwinder::new();
+                        unwind_cache = MachUnwindCache::new_in();
+                        go_images.clear();
+                        python = None;
+                        java = None;
+                        symbols = SymbolTable::new(target.pid, opts.language_unwind);
+                    }
+                    std::thread::sleep(interval.min(Duration::from_millis(5)));
+                    continue;
+                }
                 tracing::debug!(pid = target.pid, %err, "native sample failed");
                 if collector.is_empty() && started.elapsed() < Duration::from_millis(50) {
                     return Err(Error::backend("native", err));

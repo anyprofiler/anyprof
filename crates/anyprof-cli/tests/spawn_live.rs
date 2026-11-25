@@ -244,7 +244,7 @@ fn spawn_short_lived_fixture_captures_profile_and_propagates_exit_code() {
     let folded = std::fs::read_to_string(&collapsed).unwrap();
     assert!(
         folded.contains("anyprof_spawn_spin"),
-        "expected anyprof_spawn_spin in spawned profile:\n{folded}"
+        "expected anyprof_spawn_spin in spawned profile:\n{folded}\nstderr:\n{stderr}"
     );
 
     // Non-zero exit code from the spawned child is propagated after saving the profile.
