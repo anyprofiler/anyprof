@@ -13,13 +13,12 @@
 //! a warning is logged. Linux x86_64 records kernel frames with perf events.
 //! Windows x64 samples user frames only, the same as macOS.
 
-use std::collections::HashMap;
 use std::ffi::c_char;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyprof_core::{
-    Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Stack, Target, inspect,
+    Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Target, inspect,
 };
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_types::{task_t, thread_act_array_t, thread_act_t};
@@ -34,7 +33,7 @@ use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 
 use crate::java::{self, JavaVm};
 use crate::macho::{ImageSymbols, MachCpu, segment_bounds};
-use crate::policy::{self, StripKind};
+use crate::policy::{self, SampleCollector, StripKind};
 use crate::python::{self, CountedStack, PythonVm};
 
 const MAX_FRAMES: usize = 64;
@@ -97,7 +96,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
 
     let started = Instant::now();
     let mut next = started;
-    let mut counts: HashMap<CountedStack, u64> = HashMap::new();
+    let mut collector = SampleCollector::new();
     loop {
         if opts.stop.stop_requested() {
             break;
@@ -114,9 +113,10 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             .collect();
         match task.sample_addresses(&go_images, python.as_ref(), java.as_ref()) {
             Ok(stacks) => {
-                for stack in stacks {
-                    if stack.recordable() {
-                        *counts.entry(stack).or_default() += 1;
+                let offset_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                for hit in stacks {
+                    if hit.stack.recordable() {
+                        collector.record(hit.tid, offset_ns, hit.stack, |_| hit.name);
                     }
                 }
             }
@@ -129,7 +129,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             }
             Err(SampleFault::Tick(err)) => {
                 tracing::debug!(pid = target.pid, %err, "native sample failed");
-                if counts.is_empty() && started.elapsed() < Duration::from_millis(50) {
+                if collector.is_empty() && started.elapsed() < Duration::from_millis(50) {
                     return Err(Error::backend("native", err));
                 }
                 break;
@@ -159,7 +159,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
     Ok(finish_profile(
         target.pid,
         comm,
-        counts,
+        collector,
         &symbols,
         started.elapsed(),
         interval,
@@ -182,31 +182,27 @@ fn wait_until(deadline: Instant, opts: &RecordOptions) {
 fn finish_profile(
     pid: u32,
     comm: Option<String>,
-    counts: HashMap<CountedStack, u64>,
+    collector: SampleCollector,
     symbols: &[ImageSymbols],
     elapsed: Duration,
     interval: Duration,
 ) -> Profile {
-    let mut stacks = Vec::with_capacity(counts.len());
-    for (stack, weight) in counts {
-        let frames = match stack {
-            CountedStack::Addresses { frames, .. } => frames
-                .into_iter()
-                .enumerate()
-                .map(|(index, addr)| frame_for(addr, symbols, index == 0))
-                .collect(),
-            CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
-            CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
-        };
-        stacks.push(Stack { frames, weight });
-    }
-    stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));
+    let (stacks, samples) = collector.finish(|stack| match stack {
+        CountedStack::Addresses { frames, .. } => frames
+            .into_iter()
+            .enumerate()
+            .map(|(index, addr)| frame_for(addr, symbols, index == 0))
+            .collect(),
+        CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
+        CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
+    });
     Profile {
         pid,
         comm,
         duration: elapsed,
         period: Some(interval),
         stacks,
+        samples,
         raw_cpuprofile: None,
     }
 }
@@ -286,7 +282,7 @@ impl Task {
         go_images: &[crate::go_sym::GoImage],
         python: Option<&PythonVm>,
         java: Option<&JavaVm>,
-    ) -> Result<Vec<CountedStack>, SampleFault> {
+    ) -> Result<Vec<ThreadHit>, SampleFault> {
         let threads = self.threads()?;
         let running: Vec<thread_act_t> = threads
             .ports
@@ -303,7 +299,7 @@ impl Task {
             // resume in `unwind_thread` happens before `ThreadList` drops the
             // send rights.
             match unwind_thread(self.port, *thread, go_images, python, java) {
-                Ok(Some(frames)) => stacks.push(frames),
+                Ok(Some(hit)) => stacks.push(hit),
                 Ok(None) => {}
                 Err(err) => return Err(err),
             }
@@ -491,13 +487,19 @@ impl Drop for Suspended<'_> {
     }
 }
 
+struct ThreadHit {
+    tid: u64,
+    name: Option<String>,
+    stack: CountedStack,
+}
+
 fn unwind_thread(
     task: task_t,
     thread: thread_act_t,
     go_images: &[crate::go_sym::GoImage],
     python: Option<&PythonVm>,
     java: Option<&JavaVm>,
-) -> Result<Option<CountedStack>, SampleFault> {
+) -> Result<Option<ThreadHit>, SampleFault> {
     let mut resume_failure = None;
     let Some(suspended) = Suspended::new(thread, &mut resume_failure) else {
         return Ok(None);
@@ -514,12 +516,13 @@ fn unwind_thread(
             &mut count,
         )
     };
-    let frames = if kr == KERN_SUCCESS {
+    let hit = if kr == KERN_SUCCESS {
         let (pc, sp, fp, lr) = registers(&state);
         let tid = thread_identifier(thread).unwrap_or(0);
+        let name = thread_name(thread);
         // `frames` is `None` for a leaf outside the code cache and for a
         // blob whose method cannot be read. Both keep the native walk.
-        if let Some(vm) = java
+        let stack = if let Some(vm) = java
             && let Some(java_frames) =
                 vm.frames(pc, sp, fp, &mut |addr, buf| read_task(task, addr, buf))
         {
@@ -544,7 +547,8 @@ fn unwind_thread(
                     kernel_len: 0,
                 })
             }
-        }
+        };
+        stack.map(|stack| ThreadHit { tid, name, stack })
     } else {
         None
     };
@@ -554,7 +558,7 @@ fn unwind_thread(
             "thread_resume failed (kern return {resume_kr}); a target thread may still be suspended"
         )));
     }
-    Ok(frames)
+    Ok(hit)
 }
 
 /// `thread_identifier_info.thread_id`, which CPython stores from `pthread_threadid_np`.
@@ -574,6 +578,21 @@ fn thread_identifier(thread: thread_act_t) -> Option<u64> {
         return None;
     }
     Some(u64::from(info[0] as u32) | (u64::from(info[1] as u32) << 32))
+}
+
+/// `thread_extended_info.pth_name` (64-byte NUL-terminated UTF-8 name at byte offset 48).
+fn thread_name(thread: thread_act_t) -> Option<String> {
+    const THREAD_EXTENDED_INFO: u32 = 5;
+    let mut info = [0i32; 28];
+    let mut count: mach_msg_type_number_t = 28;
+    let kr = unsafe { thread_info(thread, THREAD_EXTENDED_INFO, info.as_mut_ptr(), &mut count) };
+    if kr != KERN_SUCCESS || count < 28 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(info.as_ptr().cast::<u8>().add(48), 64) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let name = std::str::from_utf8(&bytes[..end]).ok()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[cfg(target_arch = "aarch64")]

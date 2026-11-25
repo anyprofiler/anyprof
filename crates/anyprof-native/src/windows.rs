@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use crate::java::{self, JavaVm};
 use crate::python::{self, CountedStack, PythonVm};
 use anyprof_core::{
-    Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Stack, Target, inspect,
+    Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Target, inspect,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
@@ -49,7 +49,7 @@ use windows_sys::Win32::System::Threading::{
     THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::policy::{self, DebugPrivilege};
+use crate::policy::{self, DebugPrivilege, SampleCollector};
 use crate::snapshot::{self, SnapshotError};
 use crate::symbol::{self, frame_runtime};
 
@@ -98,7 +98,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
 
     let started = Instant::now();
     let mut next = started;
-    let mut counts: HashMap<CountedStack, u64> = HashMap::new();
+    let mut collector = SampleCollector::new();
     loop {
         if opts.stop.stop_requested() {
             break;
@@ -117,9 +117,10 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             java.as_ref(),
         ) {
             Ok(stacks) => {
-                for stack in stacks {
+                let offset_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                for (tid, stack) in stacks {
                     if stack.recordable() {
-                        *counts.entry(stack).or_default() += 1;
+                        collector.record(tid, offset_ns, stack, |_| None);
                     }
                 }
             }
@@ -129,7 +130,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             }
             Err(SampleFault::Tick(err)) => {
                 tracing::debug!(pid = target.pid, %err, "native sample failed");
-                if counts.is_empty() && started.elapsed() < Duration::from_millis(50) {
+                if collector.is_empty() && started.elapsed() < Duration::from_millis(50) {
                     return Err(Error::backend("native", err));
                 }
                 break;
@@ -153,7 +154,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let profile = finish_profile(
         target.pid,
         comm,
-        counts,
+        collector,
         process.handle,
         go.as_ref(),
         started.elapsed(),
@@ -361,12 +362,12 @@ fn sample_addresses(
     mut go: Option<&mut GoProc>,
     python: Option<&PythonVm>,
     java: Option<&JavaVm>,
-) -> Result<Vec<CountedStack>, SampleFault> {
+) -> Result<Vec<(u64, CountedStack)>, SampleFault> {
     let running = running_threads(pid)?;
     let mut stacks = Vec::with_capacity(running.len());
     for tid in running {
         match unwind_thread(process, tid, go.as_deref_mut(), python, java) {
-            Ok(Some(frames)) => stacks.push(frames),
+            Ok(Some(frames)) => stacks.push((u64::from(tid), frames)),
             Ok(None) => {}
             Err(err) => return Err(err),
         }
@@ -629,7 +630,7 @@ fn flat(offset: u64) -> ADDRESS64 {
 fn finish_profile(
     pid: u32,
     comm: Option<String>,
-    counts: HashMap<CountedStack, u64>,
+    collector: SampleCollector,
     process: HANDLE,
     go: Option<&GoProc>,
     elapsed: Duration,
@@ -637,28 +638,24 @@ fn finish_profile(
 ) -> Profile {
     let mut rust_files = HashMap::<String, bool>::new();
     let mut pdbs = HashMap::<String, crate::pdb_syms::ImageSymbols>::new();
-    let mut stacks = Vec::with_capacity(counts.len());
-    for (stack, weight) in counts {
-        let frames = match stack {
-            CountedStack::Addresses { frames, .. } => frames
-                .iter()
-                .enumerate()
-                .map(|(index, addr)| {
-                    frame_for(process, *addr, index == 0, go, &mut rust_files, &mut pdbs)
-                })
-                .collect(),
-            CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
-            CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
-        };
-        stacks.push(Stack { frames, weight });
-    }
-    stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));
+    let (stacks, samples) = collector.finish(|stack| match stack {
+        CountedStack::Addresses { frames, .. } => frames
+            .iter()
+            .enumerate()
+            .map(|(index, addr)| {
+                frame_for(process, *addr, index == 0, go, &mut rust_files, &mut pdbs)
+            })
+            .collect(),
+        CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
+        CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
+    });
     Profile {
         pid,
         comm,
         duration: elapsed,
         period: Some(interval),
         stacks,
+        samples,
         raw_cpuprofile: None,
     }
 }

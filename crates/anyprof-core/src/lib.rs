@@ -28,6 +28,7 @@
 //!         frames: vec![Frame::new(Runtime::Native, "main")],
 //!         weight: 3,
 //!     }],
+//!     samples: Vec::new(),
 //!     raw_cpuprofile: None,
 //! };
 //! assert_eq!(profile.total_weight(), 3);
@@ -49,5 +50,5 @@ pub use backend::{
 pub use error::Error;
 pub use format::Format;
 pub use process::{ProcessSnapshot, executable_file, inspect, process_exists};
-pub use profile::{Frame, Profile, Runtime, Stack};
+pub use profile::{Frame, MAX_TIMED_SAMPLES, Profile, Runtime, Stack, TimedSample};
 pub use stop::{SignalAction, StopGate};

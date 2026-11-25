@@ -142,6 +142,7 @@ fn fixture() -> Profile {
                 weight: 4,
             },
         ],
+        samples: Vec::new(),
         raw_cpuprofile: None,
     }
 }

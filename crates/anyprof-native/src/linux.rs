@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyprof_core::{
-    Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Stack, Target, inspect,
+    Error, Frame, PERF_SAMPLING_INTERVAL, Profile, RecordOptions, Runtime, Target, inspect,
     process_exists,
 };
 
@@ -31,13 +31,13 @@ use crate::java::JavaVm;
 use crate::kallsyms::{self, Kallsym};
 use crate::maps::{self, MapSpan};
 use crate::perf_parse::{self, ParsedSample, X86_USER_REGS};
-use crate::policy::{self, LinuxDenial};
+use crate::policy::{self, LinuxDenial, SampleCollector};
 use crate::python::{self, CountedStack, PythonVm};
 use crate::walk::{self, walk_frame_pointer};
 
 const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
-const SAMPLE_TYPE: u64 = (1 << 0) | (1 << 1) | (1 << 5) | (1 << 12) | (1 << 13);
+const SAMPLE_TYPE: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5) | (1 << 12) | (1 << 13);
 const ATTR_SIZE: u32 = 96;
 const FLAG_FD_CLOEXEC: u64 = 1 << 3;
 // `PERF_EVENT_IOC_ENABLE` / `DISABLE` (`_IO('$', 0)` and `_IO('$', 1)`).
@@ -182,7 +182,8 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     let live_vm = python.is_some() || java.is_some();
     let started = Instant::now();
     let mut next_refresh = started;
-    let mut counts: HashMap<CountedStack, u64> = HashMap::new();
+    let mut collector = SampleCollector::new();
+    let mut perf_origin = None;
     let mut lost = 0u64;
     loop {
         if opts.stop.stop_requested() {
@@ -202,7 +203,9 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
                 &go_images,
                 &python,
                 &java,
-                &mut counts,
+                started,
+                &mut perf_origin,
+                &mut collector,
             ));
             next_refresh += interval;
             let now = Instant::now();
@@ -217,7 +220,9 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             &go_images,
             &python,
             &java,
-            &mut counts,
+            started,
+            &mut perf_origin,
+            &mut collector,
         ));
         let mut wake = next_refresh;
         if let Some(limit) = opts.duration {
@@ -240,7 +245,9 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         &go_images,
         &python,
         &java,
-        &mut counts,
+        started,
+        &mut perf_origin,
+        &mut collector,
     ));
     if lost > 0 {
         tracing::warn!(lost, pid = target.pid, "perf ring buffer dropped samples");
@@ -259,7 +266,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
     Ok(finish_profile(
         target.pid,
         comm,
-        counts,
+        collector,
         &images,
         &kernel_symbols,
         started.elapsed(),
@@ -485,6 +492,7 @@ fn map_error(errno: i32) -> String {
 /// The drain happens before the mapping is dropped, so the last samples of a
 /// short-lived thread are kept. A tid is the same thread only when its
 /// `starttime` still matches. A reused tid is drained and opened again.
+#[allow(clippy::too_many_arguments)]
 fn refresh(
     sampler: &mut Sampler,
     pid: u32,
@@ -492,7 +500,9 @@ fn refresh(
     go_images: &[GoImage],
     python: &Option<PythonVm>,
     java: &Option<JavaVm>,
-    counts: &mut HashMap<CountedStack, u64>,
+    started: Instant,
+    perf_origin: &mut Option<u64>,
+    collector: &mut SampleCollector,
 ) -> u64 {
     let Ok(live) = list_threads(pid) else {
         return 0;
@@ -512,7 +522,9 @@ fn refresh(
             go_images,
             python,
             java,
-            counts,
+            started,
+            perf_origin,
+            collector,
         ));
     }
     sampler.events = retained;
@@ -630,7 +642,7 @@ fn drain_mapped(mapped: &Mapped) -> (Vec<ParsedSample>, u64) {
             break;
         };
         if kind == RECORD_SAMPLE {
-            if let Some(sample) = perf_parse::parse_sample(&record, X86_USER_REGS) {
+            if let Some(sample) = perf_parse::parse_sample_timed(&record, X86_USER_REGS, true) {
                 samples.push(sample);
             }
         } else if kind == RECORD_LOST && record.len() >= 24 {
@@ -675,6 +687,7 @@ fn read_header_u64(base: *mut u8, offset: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn take_samples(
     sampler: &Sampler,
     pid: u32,
@@ -682,7 +695,9 @@ fn take_samples(
     go_images: &[GoImage],
     python: &Option<PythonVm>,
     java: &Option<JavaVm>,
-    counts: &mut HashMap<CountedStack, u64>,
+    started: Instant,
+    perf_origin: &mut Option<u64>,
+    collector: &mut SampleCollector,
 ) -> u64 {
     let (samples, lost) = sampler.drain();
     record_samples(
@@ -692,11 +707,14 @@ fn take_samples(
         go_images,
         python,
         java,
-        counts,
+        started,
+        perf_origin,
+        collector,
     );
     lost
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_mapped(
     mapped: &Mapped,
     pid: u32,
@@ -704,7 +722,9 @@ fn ingest_mapped(
     go_images: &[GoImage],
     python: &Option<PythonVm>,
     java: &Option<JavaVm>,
-    counts: &mut HashMap<CountedStack, u64>,
+    started: Instant,
+    perf_origin: &mut Option<u64>,
+    collector: &mut SampleCollector,
 ) -> u64 {
     let (samples, lost) = drain_mapped(mapped);
     record_samples(
@@ -714,11 +734,14 @@ fn ingest_mapped(
         go_images,
         python,
         java,
-        counts,
+        started,
+        perf_origin,
+        collector,
     );
     lost
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_samples(
     samples: Vec<ParsedSample>,
     pid: u32,
@@ -726,8 +749,11 @@ fn record_samples(
     go_images: &[GoImage],
     python: &Option<PythonVm>,
     java: &Option<JavaVm>,
-    counts: &mut HashMap<CountedStack, u64>,
+    started: Instant,
+    perf_origin: &mut Option<u64>,
+    collector: &mut SampleCollector,
 ) {
+    let drain_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     for sample in samples {
         if sample.pid != pid && sample.pid != 0 {
             continue;
@@ -739,7 +765,16 @@ fn record_samples(
         if !key.recordable() {
             continue;
         }
-        *counts.entry(key).or_default() += 1;
+        let offset_ns = match sample.time {
+            Some(perf_ns) => {
+                let origin = *perf_origin.get_or_insert_with(|| perf_ns.saturating_sub(drain_ns));
+                perf_ns.saturating_sub(origin)
+            }
+            None => drain_ns,
+        };
+        collector.record(u64::from(sample.tid), offset_ns, key, |tid| {
+            std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm")).ok()
+        });
     }
 }
 
@@ -872,56 +907,52 @@ fn read_copied_stack(stack: &[u8], sp: u64, addr: u64, buf: &mut [u8]) -> bool {
 fn finish_profile(
     pid: u32,
     comm: Option<String>,
-    counts: HashMap<CountedStack, u64>,
+    collector: SampleCollector,
     images: &[UserImage],
     kernel_symbols: &[Kallsym],
     elapsed: Duration,
     interval: Duration,
 ) -> Profile {
-    let mut stacks = Vec::with_capacity(counts.len());
-    for (key, weight) in counts {
-        let frames = match key {
-            CountedStack::Addresses { frames, kernel_len } => {
-                let kernel_len = kernel_len as usize;
-                frames
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, addr)| {
-                        let leaf = index == 0 || (kernel_len > 0 && index == kernel_len);
-                        if index < kernel_len {
-                            kernel_frame(kernel_symbols, addr, leaf)
-                        } else {
-                            user_frame(images, addr, leaf)
-                        }
-                    })
-                    .collect()
+    let (stacks, samples) = collector.finish(|key| match key {
+        CountedStack::Addresses { frames, kernel_len } => {
+            let kernel_len = kernel_len as usize;
+            frames
+                .into_iter()
+                .enumerate()
+                .map(|(index, addr)| {
+                    let leaf = index == 0 || (kernel_len > 0 && index == kernel_len);
+                    if index < kernel_len {
+                        kernel_frame(kernel_symbols, addr, leaf)
+                    } else {
+                        user_frame(images, addr, leaf)
+                    }
+                })
+                .collect()
+        }
+        CountedStack::Python { kernel, frames } => {
+            let mut out = Vec::with_capacity(kernel.len() + frames.len());
+            for (index, addr) in kernel.into_iter().enumerate() {
+                out.push(kernel_frame(kernel_symbols, addr, index == 0));
             }
-            CountedStack::Python { kernel, frames } => {
-                let mut out = Vec::with_capacity(kernel.len() + frames.len());
-                for (index, addr) in kernel.into_iter().enumerate() {
-                    out.push(kernel_frame(kernel_symbols, addr, index == 0));
-                }
-                out.extend(python::python_profile_frames(&frames));
-                out
+            out.extend(python::python_profile_frames(&frames));
+            out
+        }
+        CountedStack::Java { kernel, frames } => {
+            let mut out = Vec::with_capacity(kernel.len() + frames.len());
+            for (index, addr) in kernel.into_iter().enumerate() {
+                out.push(kernel_frame(kernel_symbols, addr, index == 0));
             }
-            CountedStack::Java { kernel, frames } => {
-                let mut out = Vec::with_capacity(kernel.len() + frames.len());
-                for (index, addr) in kernel.into_iter().enumerate() {
-                    out.push(kernel_frame(kernel_symbols, addr, index == 0));
-                }
-                out.extend(crate::java::java_profile_frames(&frames));
-                out
-            }
-        };
-        stacks.push(Stack { frames, weight });
-    }
-    stacks.sort_by_key(|stack| std::cmp::Reverse(stack.weight));
+            out.extend(crate::java::java_profile_frames(&frames));
+            out
+        }
+    });
     Profile {
         pid,
         comm,
         duration: elapsed,
         period: Some(interval),
         stacks,
+        samples,
         raw_cpuprofile: None,
     }
 }
@@ -1277,6 +1308,7 @@ mod tests {
             ip: fixture.leaf_pc,
             pid: 9,
             tid: 9,
+            time: None,
             callchain: vec![fixture.leaf_pc],
             user_ip: Some(fixture.leaf_pc),
             user_sp: Some(sp),
@@ -1342,6 +1374,7 @@ mod tests {
             ip: 0x5555_0000_1100,
             pid: 1,
             tid: 1,
+            time: None,
             callchain: vec![0x5555_0000_1100],
             user_ip: Some(0x5555_0000_1100),
             user_sp: Some(sp),
@@ -1359,6 +1392,7 @@ mod tests {
             ip: 0xffff_ffff_8100_0100,
             pid: 4,
             tid: 4,
+            time: None,
             callchain: vec![
                 CONTEXT_KERNEL,
                 0xffff_ffff_8100_0100,

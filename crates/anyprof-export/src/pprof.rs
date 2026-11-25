@@ -1,16 +1,16 @@
 //! gzip-compressed pprof profiles (`perftools.profiles.Profile`).
 //!
-//! The written subset is sample type `samples/count`, one location per frame,
-//! function name/file/line, optional address, duration, and period. Period is
-//! stored in nanoseconds. Mappings and the per-frame module are left empty.
-//!
-//! TODO(export): emit pprof mappings so `module` survives a roundtrip.
+//! Writes sample type `samples/count`, mappings from `Frame::module`, one
+//! location per frame, function name/file/line, optional address, duration, and
+//! period (in nanoseconds). When [`Profile::samples`] is populated, each sample
+//! carries `thread` and `offset_ns` labels so thread tracks and the timeline
+//! survive a roundtrip.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use anyprof_core::{Frame, Profile, Runtime, Stack};
+use anyprof_core::{Frame, Profile, Runtime, Stack, TimedSample};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -26,43 +26,107 @@ pub(crate) fn export(profile: &Profile) -> Result<Vec<u8>, Error> {
     let cpu_label = strings.intern("cpu");
     let nanos_label = strings.intern("nanoseconds");
 
+    let mut mappings: HashMap<u64, u64> = HashMap::new();
+    let mut mapping_msgs = Vec::new();
     let mut functions: HashMap<(u64, u64, i64), u64> = HashMap::new();
     let mut function_msgs = Vec::new();
-    let mut locations: HashMap<(u64, i64, i64, u64), u64> = HashMap::new();
+    let mut locations: HashMap<(u64, u64, i64, i64, u64), u64> = HashMap::new();
     let mut location_msgs = Vec::new();
     let mut sample_msgs = Vec::new();
 
-    for stack in &profile.stacks {
-        if stack.weight == 0 {
-            continue;
+    if profile.samples.is_empty() {
+        for stack in &profile.stacks {
+            if stack.weight == 0 {
+                continue;
+            }
+            if stack.weight > i64::MAX as u64 {
+                return Err(Error::invalid(
+                    "pprof",
+                    format!("sample weight {} does not fit in i64", stack.weight),
+                ));
+            }
+            let mut location_ids = Vec::with_capacity(stack.frames.len());
+            for frame in &stack.frames {
+                location_ids.push(intern_location(
+                    frame,
+                    &mut strings,
+                    &mut mappings,
+                    &mut mapping_msgs,
+                    &mut functions,
+                    &mut function_msgs,
+                    &mut locations,
+                    &mut location_msgs,
+                ));
+            }
+            let mut sample = Writer::new();
+            sample.field_packed_varints(1, &location_ids);
+            sample.field_packed_varints(2, &[stack.weight]);
+            sample_msgs.push(sample);
         }
-        if stack.weight > i64::MAX as u64 {
-            return Err(Error::invalid(
-                "pprof",
-                format!("sample weight {} does not fit in i64", stack.weight),
-            ));
+    } else {
+        let thread_key = strings.intern("thread");
+        let offset_key = strings.intern("offset_ns");
+        let mut stack_locations = Vec::with_capacity(profile.stacks.len());
+        for stack in &profile.stacks {
+            let mut ids = Vec::with_capacity(stack.frames.len());
+            for frame in &stack.frames {
+                ids.push(intern_location(
+                    frame,
+                    &mut strings,
+                    &mut mappings,
+                    &mut mapping_msgs,
+                    &mut functions,
+                    &mut function_msgs,
+                    &mut locations,
+                    &mut location_msgs,
+                ));
+            }
+            stack_locations.push(ids);
         }
-        let mut location_ids = Vec::with_capacity(stack.frames.len());
-        for frame in &stack.frames {
-            location_ids.push(intern_location(
-                frame,
-                &mut strings,
-                &mut functions,
-                &mut function_msgs,
-                &mut locations,
-                &mut location_msgs,
-            ));
+        for timed in &profile.samples {
+            if timed.weight == 0 {
+                continue;
+            }
+            if timed.weight > i64::MAX as u64 {
+                return Err(Error::invalid(
+                    "pprof",
+                    format!("sample weight {} does not fit in i64", timed.weight),
+                ));
+            }
+            let Some(location_ids) = stack_locations
+                .get(timed.stack_index)
+                .filter(|ids| !ids.is_empty())
+            else {
+                continue;
+            };
+            let mut sample = Writer::new();
+            sample.field_packed_varints(1, location_ids);
+            sample.field_packed_varints(2, &[timed.weight]);
+            if let Some(label_text) = format_thread_label(timed.tid, timed.thread_name.as_deref()) {
+                let mut tlabel = Writer::new();
+                tlabel.field_varint(1, thread_key);
+                tlabel.field_varint(2, strings.intern(&label_text));
+                if timed.tid > 0 && timed.tid <= i64::MAX as u64 {
+                    tlabel.field_varint(3, timed.tid);
+                }
+                sample.field_message(3, &tlabel);
+            }
+            let mut olabel = Writer::new();
+            olabel.field_varint(1, offset_key);
+            olabel.field_varint(3, timed.offset_ns.min(i64::MAX as u64));
+            olabel.field_varint(4, nanos_label);
+            sample.field_message(3, &olabel);
+            sample_msgs.push(sample);
         }
-        let mut sample = Writer::new();
-        sample.field_packed_varints(1, &location_ids);
-        sample.field_packed_varints(2, &[stack.weight]);
-        sample_msgs.push(sample);
     }
 
     let mut message = Writer::new();
     message.field_message(1, &value_type(samples_label, count_label));
     for sample in &sample_msgs {
         message.field_message(2, sample);
+    }
+    for mapping in &mapping_msgs {
+        message.field_message(3, mapping);
     }
     for location in &location_msgs {
         message.field_message(4, location);
@@ -85,6 +149,16 @@ pub(crate) fn export(profile: &Profile) -> Result<Vec<u8>, Error> {
     gzip(&message.into_vec())
 }
 
+pub(crate) fn format_thread_label(tid: u64, name: Option<&str>) -> Option<String> {
+    let clean = name.map(str::trim).filter(|n| !n.is_empty());
+    match (clean, tid) {
+        (Some(name), 0) => Some(name.to_string()),
+        (Some(name), tid) => Some(format!("{name} ({tid})")),
+        (None, 0) => None,
+        (None, tid) => Some(format!("Thread {tid}")),
+    }
+}
+
 pub(crate) fn import(bytes: &[u8]) -> Result<Profile, Error> {
     let decoded = gunzip_if_needed(bytes)?;
     let mut raw = parse_profile(&decoded)?;
@@ -92,36 +166,71 @@ pub(crate) fn import(bytes: &[u8]) -> Result<Profile, Error> {
         return Err(Error::invalid("pprof", "string_table[0] must be empty"));
     }
 
-    let samples = std::mem::take(&mut raw.samples);
-    let mut stacks = Vec::with_capacity(samples.len());
-    for sample in samples {
-        let weight = match sample.values.first() {
-            Some(value) if *value >= 0 => u64::try_from(*value).unwrap_or(0),
-            Some(value) => {
-                return Err(Error::invalid(
-                    "pprof",
-                    format!("negative sample value {value}"),
-                ));
-            }
-            None => 0,
-        };
-        let mut frames = Vec::new();
-        for location_id in sample.locations {
-            let location = raw.locations.get(&location_id).ok_or_else(|| {
-                Error::invalid("pprof", format!("unknown location id {location_id}"))
-            })?;
-            if location.lines.is_empty() {
-                frames.push(Frame {
-                    address: none_if_zero(location.address),
-                    ..Frame::new(Runtime::Native, "")
-                });
+    let raw_samples = std::mem::take(&mut raw.samples);
+    let mut has_timed = false;
+    for sample in &raw_samples {
+        if offset_from_labels(&raw, &sample.labels)?.is_some() {
+            has_timed = true;
+            break;
+        }
+    }
+
+    let mut stacks = Vec::new();
+    let mut timed_out = Vec::new();
+
+    if has_timed {
+        let mut unique: Vec<(Vec<Frame>, u64)> = Vec::new();
+        let mut index: HashMap<Vec<Frame>, usize> = HashMap::new();
+        let mut raw_timed: Vec<(u64, Option<String>, u64, usize, u64)> = Vec::new();
+        for sample in raw_samples {
+            let weight = sample_first_weight(&sample)?;
+            let frames = decode_sample_frames(&raw, &sample.locations)?;
+            if weight == 0 || frames.is_empty() {
                 continue;
             }
-            for line in &location.lines {
-                frames.push(frame_from_line(&raw, location.address, line)?);
+            let uid = if let Some(&id) = index.get(&frames) {
+                unique[id].1 = unique[id].1.saturating_add(weight);
+                id
+            } else {
+                let id = unique.len();
+                index.insert(frames.clone(), id);
+                unique.push((frames, weight));
+                id
+            };
+            if let Some(offset_ns) = offset_from_labels(&raw, &sample.labels)? {
+                let (tid, thread_name) = thread_id_and_name(&raw, &sample.labels)?;
+                raw_timed.push((tid, thread_name, offset_ns, uid, weight));
             }
         }
-        stacks.push(Stack { frames, weight });
+        let count = unique.len();
+        let mut indexed: Vec<(usize, Stack)> = unique
+            .into_iter()
+            .enumerate()
+            .map(|(uid, (frames, weight))| (uid, Stack { frames, weight }))
+            .collect();
+        indexed.sort_by_key(|(_, stack)| std::cmp::Reverse(stack.weight));
+        let mut remap = vec![0usize; count];
+        for (new_idx, (old_uid, stack)) in indexed.into_iter().enumerate() {
+            remap[old_uid] = new_idx;
+            stacks.push(stack);
+        }
+        raw_timed.sort_by_key(|(_, _, offset_ns, _, _)| *offset_ns);
+        for (tid, thread_name, offset_ns, uid, weight) in raw_timed {
+            timed_out.push(TimedSample {
+                tid,
+                thread_name,
+                offset_ns,
+                stack_index: remap[uid],
+                weight,
+            });
+        }
+    } else {
+        stacks.reserve(raw_samples.len());
+        for sample in raw_samples {
+            let weight = sample_first_weight(&sample)?;
+            let frames = decode_sample_frames(&raw, &sample.locations)?;
+            stacks.push(Stack { frames, weight });
+        }
     }
 
     let period = if raw.period_nanos > 0 && period_is_nanos(&raw)? {
@@ -141,18 +250,73 @@ pub(crate) fn import(bytes: &[u8]) -> Result<Profile, Error> {
         duration,
         period,
         stacks,
+        samples: timed_out,
         ..Profile::default()
     })
 }
 
+fn sample_first_weight(sample: &RawSample) -> Result<u64, Error> {
+    match sample.values.first() {
+        Some(value) if *value >= 0 => Ok(u64::try_from(*value).unwrap_or(0)),
+        Some(value) => Err(Error::invalid(
+            "pprof",
+            format!("negative sample value {value}"),
+        )),
+        None => Ok(0),
+    }
+}
+
+fn decode_sample_frames(raw: &RawProfile, location_ids: &[u64]) -> Result<Vec<Frame>, Error> {
+    let mut frames = Vec::new();
+    for location_id in location_ids {
+        let location = raw
+            .locations
+            .get(location_id)
+            .ok_or_else(|| Error::invalid("pprof", format!("unknown location id {location_id}")))?;
+        let module = mapping_name(raw, location.mapping_id)?;
+        if location.lines.is_empty() {
+            frames.push(Frame {
+                address: none_if_zero(location.address),
+                module,
+                ..Frame::new(Runtime::Native, "")
+            });
+            continue;
+        }
+        for line in &location.lines {
+            let mut frame = frame_from_line(raw, location.address, line)?;
+            frame.module = module.clone();
+            frames.push(frame);
+        }
+    }
+    Ok(frames)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn intern_location(
     frame: &Frame,
     strings: &mut StringTable,
+    mappings: &mut HashMap<u64, u64>,
+    mapping_msgs: &mut Vec<Writer>,
     functions: &mut HashMap<(u64, u64, i64), u64>,
     function_msgs: &mut Vec<Writer>,
-    locations: &mut HashMap<(u64, i64, i64, u64), u64>,
+    locations: &mut HashMap<(u64, u64, i64, i64, u64), u64>,
     location_msgs: &mut Vec<Writer>,
 ) -> u64 {
+    let mapping_id = match frame.module.as_deref().filter(|m| !m.is_empty()) {
+        Some(module_name) => {
+            let file_idx = strings.intern(module_name);
+            *mappings.entry(file_idx).or_insert_with(|| {
+                let id = mapping_msgs.len() as u64 + 1;
+                let mut msg = Writer::new();
+                msg.field_varint(1, id);
+                msg.field_varint(5, file_idx);
+                mapping_msgs.push(msg);
+                id
+            })
+        }
+        None => 0,
+    };
+
     let name = strings.intern(&format_symbol(frame));
     let filename = strings.intern(frame.file.as_deref().unwrap_or(""));
     let start_line = i64::from(frame.line.unwrap_or(0));
@@ -173,7 +337,7 @@ fn intern_location(
         id
     });
 
-    let location_key = (function_id, start_line, column, address);
+    let location_key = (mapping_id, function_id, start_line, column, address);
     *locations.entry(location_key).or_insert_with(|| {
         let id = location_msgs.len() as u64 + 1;
         let mut line = Writer::new();
@@ -186,6 +350,9 @@ fn intern_location(
         }
         let mut message = Writer::new();
         message.field_varint(1, id);
+        if mapping_id > 0 {
+            message.field_varint(2, mapping_id);
+        }
         message.field_varint(3, address);
         message.field_message(4, &line);
         location_msgs.push(message);
@@ -333,6 +500,7 @@ struct RawLabel {
     key: i64,
     str_idx: i64,
     num: i64,
+    num_unit: i64,
     has_num: bool,
 }
 
@@ -477,6 +645,7 @@ fn parse_label(bytes: &[u8]) -> Result<RawLabel, Error> {
         key: 0,
         str_idx: 0,
         num: 0,
+        num_unit: 0,
         has_num: false,
     };
     for (field, value) in message_fields(bytes)? {
@@ -487,6 +656,7 @@ fn parse_label(bytes: &[u8]) -> Result<RawLabel, Error> {
                 label.num = as_i64(value)?;
                 label.has_num = true;
             }
+            (4, Owned::Varint(value)) => label.num_unit = as_i64(value)?,
             _ => {}
         }
     }
@@ -594,6 +764,8 @@ pub(crate) struct InspectedSample {
     pub values: Vec<i64>,
     /// A thread or goroutine label when the sample actually carries one.
     pub track: Option<InspectedTrack>,
+    /// Relative timestamp in nanoseconds when `offset_ns` was recorded on the sample.
+    pub offset_ns: Option<u64>,
 }
 
 pub(crate) struct InspectedFrame {
@@ -720,6 +892,7 @@ pub(crate) fn inspect(bytes: &[u8]) -> Result<InspectedProfile, Error> {
             frames,
             values: sample.values.clone(),
             track: track_from_labels(&raw, &sample.labels)?,
+            offset_ns: offset_from_labels(&raw, &sample.labels)?,
         });
     }
     Ok(InspectedProfile {
@@ -780,6 +953,87 @@ fn mapping_name(raw: &RawProfile, mapping_id: u64) -> Result<Option<String>, Err
     } else {
         Ok(Some(name.to_string()))
     }
+}
+
+fn offset_from_labels(raw: &RawProfile, labels: &[RawLabel]) -> Result<Option<u64>, Error> {
+    for label in labels {
+        let key = lookup(&raw.strings, label.key)?;
+        if !key.eq_ignore_ascii_case("offset_ns") {
+            continue;
+        }
+        if label.str_idx != 0 && !label.has_num {
+            let text = lookup(&raw.strings, label.str_idx)?.trim();
+            if let Ok(parsed) = text.parse::<u64>() {
+                return Ok(Some(parsed));
+            }
+            continue;
+        }
+        if label.num < 0 {
+            return Err(Error::invalid(
+                "pprof",
+                format!("negative offset_ns {}", label.num),
+            ));
+        }
+        // Note: proto3 omits `num = 0` on the wire, so `label.num == 0` with
+        // `key == "offset_ns"` and `str_idx == 0` encodes `0ns`.
+        let scale = if label.num_unit != 0 {
+            let unit = lookup(&raw.strings, label.num_unit)?;
+            time_scale_ns(unit).unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        return Ok(Some(scale_i64(label.num, scale)?));
+    }
+    Ok(None)
+}
+
+fn thread_id_and_name(
+    raw: &RawProfile,
+    labels: &[RawLabel],
+) -> Result<(u64, Option<String>), Error> {
+    for label in labels {
+        let key = lookup(&raw.strings, label.key)?;
+        if track_kind(key) != Some(TrackKind::Thread) {
+            continue;
+        }
+        let text = if label.str_idx != 0 {
+            lookup(&raw.strings, label.str_idx)?.trim().to_string()
+        } else {
+            String::new()
+        };
+        let mut tid = if label.has_num && label.num > 0 {
+            u64::try_from(label.num).unwrap_or(0)
+        } else {
+            0
+        };
+        if tid == 0 {
+            tid = parse_tid_from_thread_label(&text).unwrap_or(0);
+        }
+        let name = if text.is_empty() || (tid > 0 && text == format!("Thread {tid}")) {
+            None
+        } else if tid > 0 {
+            let suffix = format!(" ({tid})");
+            let trimmed = text.strip_suffix(&suffix).unwrap_or(&text).trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        } else {
+            Some(text)
+        };
+        return Ok((tid, name));
+    }
+    Ok((0, None))
+}
+
+pub(crate) fn parse_tid_from_thread_label(text: &str) -> Option<u64> {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("Thread ") {
+        return rest.trim().parse::<u64>().ok();
+    }
+    if let Some((_prefix, tail)) = trimmed.rsplit_once(" (")
+        && let Some(digits) = tail.strip_suffix(')')
+    {
+        return digits.parse::<u64>().ok();
+    }
+    None
 }
 
 fn track_from_labels(
@@ -846,7 +1100,7 @@ pub(crate) fn ticks_from_f64(value: f64, format: &'static str) -> Result<u64, Er
     Ok(value.round() as u64)
 }
 
-/// Operating-system libraries anyprof can recognize from a mapped path.
+/// Operating-system libraries anyprof can recognize from a mapped path or module basename.
 ///
 /// A bare function name is not enough: `std::` and `java.` are not marked.
 pub(crate) fn is_system_library(path: &str) -> bool {
@@ -862,8 +1116,17 @@ pub(crate) fn is_system_library(path: &str) -> bool {
         "win32u.dll",
         "ucrtbase.dll",
         "msvcrt.dll",
+        "advapi32.dll",
+        "user32.dll",
+        "ws2_32.dll",
+        "rpcrt4.dll",
+        "sechost.dll",
+        "bcryptprimitives.dll",
     ];
     if WINDOWS.contains(&base) {
+        return true;
+    }
+    if is_unix_system_basename(base) {
         return true;
     }
     const PREFIXES: &[&str] = &[
@@ -884,11 +1147,48 @@ pub(crate) fn is_system_library(path: &str) -> bool {
         || lower.contains("/windows/syswow64/")
 }
 
+fn is_unix_system_basename(base: &str) -> bool {
+    if matches!(
+        base,
+        "[vdso]"
+            | "linux-vdso.so.1"
+            | "libc.so"
+            | "libm.so"
+            | "libpthread.so"
+            | "libdl.so"
+            | "librt.so"
+            | "libdyld.dylib"
+            | "libobjc.a.dylib"
+            | "libdispatch.dylib"
+            | "libxpc.dylib"
+            | "libmacho.dylib"
+            | "libquarantine.dylib"
+            | "libcommoncrypto.dylib"
+    ) {
+        return true;
+    }
+    if base.starts_with("libc.so.")
+        || base.starts_with("libm.so.")
+        || base.starts_with("libpthread.so.")
+        || base.starts_with("libdl.so.")
+        || base.starts_with("librt.so.")
+        || base.starts_with("ld-linux")
+        || base.starts_with("ld-musl")
+        || (base.starts_with("libc-") && base.ends_with(".so"))
+        || (base.starts_with("libm-") && base.ends_with(".so"))
+        || (base.starts_with("libpthread-") && base.ends_with(".so"))
+        || (base.starts_with("libsystem_") && base.ends_with(".dylib"))
+    {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::export;
+    use super::{export, is_system_library};
     use crate::{Format, import};
-    use anyprof_core::Runtime;
+    use anyprof_core::{Frame, Profile, Runtime, Stack, TimedSample};
     use std::time::Duration;
 
     #[test]
@@ -928,5 +1228,81 @@ mod tests {
         std::io::Read::read_to_end(&mut decoder, &mut raw).unwrap();
         let profile = import(&raw, Format::Pprof).unwrap();
         assert_eq!(profile.total_weight(), 7);
+    }
+
+    #[test]
+    fn roundtrip_preserves_mappings_thread_labels_and_timed_samples() {
+        let mut libc = Frame::new(Runtime::Native, "pthread_mutex_lock");
+        libc.module = Some("libc.so.6".to_string());
+        let mut worker = Frame::new(Runtime::Rust, "demo::worker");
+        worker.module = Some("demo".to_string());
+        worker.file = Some("src/main.rs".to_string());
+        worker.line = Some(42);
+
+        let profile = Profile {
+            pid: 900,
+            comm: Some("demo".to_string()),
+            duration: Duration::from_millis(100),
+            period: Some(Duration::from_millis(10)),
+            stacks: vec![
+                Stack {
+                    frames: vec![worker.clone()],
+                    weight: 2,
+                },
+                Stack {
+                    frames: vec![libc.clone(), worker.clone()],
+                    weight: 1,
+                },
+            ],
+            samples: vec![
+                TimedSample {
+                    tid: 1001,
+                    thread_name: Some("worker-1".to_string()),
+                    offset_ns: 0,
+                    stack_index: 0,
+                    weight: 1,
+                },
+                TimedSample {
+                    tid: 1002,
+                    thread_name: None,
+                    offset_ns: 20_000_000,
+                    stack_index: 1,
+                    weight: 1,
+                },
+                TimedSample {
+                    tid: 1001,
+                    thread_name: Some("worker-1".to_string()),
+                    offset_ns: 50_000_000,
+                    stack_index: 0,
+                    weight: 1,
+                },
+            ],
+            raw_cpuprofile: None,
+        };
+        let bytes = export(&profile).unwrap();
+        let decoded = import(&bytes, Format::Pprof).unwrap();
+        assert_eq!(decoded.total_weight(), 3);
+        assert_eq!(decoded.samples.len(), 3);
+        assert_eq!(decoded.samples[0].offset_ns, 0);
+        assert_eq!(decoded.samples[0].tid, 1001);
+        assert_eq!(decoded.samples[0].thread_name.as_deref(), Some("worker-1"));
+        assert_eq!(decoded.samples[1].offset_ns, 20_000_000);
+        assert_eq!(decoded.samples[1].tid, 1002);
+        assert_eq!(decoded.samples[1].thread_name, None);
+        assert_eq!(decoded.samples[2].offset_ns, 50_000_000);
+
+        let libc_stack = decoded
+            .stacks
+            .iter()
+            .find(|s| s.frames[0].name == "pthread_mutex_lock")
+            .unwrap();
+        assert_eq!(libc_stack.frames[0].module.as_deref(), Some("libc.so.6"));
+        assert_eq!(libc_stack.frames[1].module.as_deref(), Some("demo"));
+
+        assert!(is_system_library("libc.so.6"));
+        assert!(is_system_library("libsystem_kernel.dylib"));
+        assert!(is_system_library("ntdll.dll"));
+        assert!(!is_system_library("demo"));
+        assert!(!is_system_library("libpython3.12.so.1.0"));
     }
 }
