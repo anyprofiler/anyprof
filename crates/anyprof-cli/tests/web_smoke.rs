@@ -72,6 +72,15 @@ fn viewer_renders_profiles_in_headless_chrome() {
     let synthetic = dir.join("synthetic-workers.speedscope.json");
     std::fs::write(&synthetic, synthetic_workers()).unwrap();
     cases.push((synthetic, "studio"));
+    let deep_src = dir.join("deep_app.py");
+    std::fs::write(
+        &deep_src,
+        "def root_entry():\n    return dispatch()\ndef narrow_branch():\n    return hidden_leaf()\ndef hidden_leaf():\n    return 42\n",
+    )
+    .unwrap();
+    let deep = dir.join("deep-zoom.speedscope.json");
+    std::fs::write(&deep, deep_zoom_fixture(&deep_src)).unwrap();
+    cases.push((deep, "deep_zoom"));
     let broken = dir.join("broken.cpuprofile");
     std::fs::write(&broken, b"{").unwrap();
     cases.push((broken, "broken"));
@@ -218,6 +227,12 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
             assert!(
                 !lower.contains("cpu usage"),
                 "{name}: sample activity was labeled as CPU usage:\n{text}"
+            );
+        }
+        "deep_zoom" => {
+            assert!(
+                text.contains("deep_app.py:1") && text.contains("deep_app.py:2"),
+                "{name}: source file and line were not shown in call tree:\n{text}"
             );
         }
         "broken" => assert!(
@@ -451,6 +466,10 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
         "{name}: flame graph canvas was almost empty ({:.1}% colored pixels)",
         colored * 100.0
     );
+
+    if kind == "deep_zoom" {
+        assert_deep_zoom_and_source(cdp, session, &name);
+    }
 
     if (kind == "aggregate" && name.ends_with(".collapsed")) || kind == "studio" {
         cdp.call(
@@ -971,6 +990,190 @@ fn collapsed_fixture() -> String {
         out.push_str(&format!(" {}\n", 1 + (seed >> 8) % 40));
     }
     out
+}
+
+fn deep_zoom_fixture(source_file: &Path) -> String {
+    let file_str = source_file.to_string_lossy().replace('\\', "/");
+    let mut frames = vec![
+        serde_json::json!({ "name": "[python] root_entry", "file": file_str, "line": 1 }),
+        serde_json::json!({ "name": "[python] narrow_branch", "file": file_str, "line": 4 }),
+        serde_json::json!({ "name": "[python] hidden_leaf", "file": file_str, "line": 6 }),
+    ];
+    let mut deep_stack = vec![0_usize];
+    for level in 1..60 {
+        let idx = frames.len();
+        frames.push(serde_json::json!({
+            "name": format!("[python] deep_step_{level}"),
+            "file": file_str,
+            "line": 2,
+        }));
+        deep_stack.push(idx);
+    }
+    let narrow_stack = vec![0_usize, 1_usize, 2_usize];
+    serde_json::json!({
+        "$schema": "https://www.speedscope.app/file-format-schema.json",
+        "shared": { "frames": frames },
+        "profiles": [{
+            "type": "sampled",
+            "name": "main",
+            "unit": "none",
+            "startValue": 0,
+            "endValue": 100,
+            "samples": [deep_stack, narrow_stack],
+            "weights": [98, 2]
+        }]
+    })
+    .to_string()
+}
+
+fn assert_deep_zoom_and_source(cdp: &mut Cdp, session: Option<&str>, name: &str) {
+    // 1. All 60 levels must render on #flame (height >= 60 * 18 = 1080 CSS px) with no 40-level note.
+    let metrics = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": r#"(function () {
+                const canvas = document.querySelector('[data-testid=flame]');
+                const rect = canvas.getBoundingClientRect();
+                const note = document.querySelector('.flame-note');
+                // Level 1 has deep_step_1 (98%) on the left and narrow_branch (2%) at x ~ 99% on the right.
+                return {
+                    cssHeight: rect.height,
+                    hasTruncationNote: !!note,
+                    clickX: rect.left + rect.width * 0.99,
+                    clickY: rect.top + 18 * 1.5
+                };
+            })()"#,
+            "returnByValue": true,
+        }),
+    );
+    let m = &metrics["result"]["value"];
+    let css_height = m["cssHeight"].as_f64().unwrap_or(0.0);
+    assert!(
+        css_height >= 60.0 * 18.0 - 1.0,
+        "{name}: expected 60 levels (>= 1080px), got {css_height}px"
+    );
+    assert_eq!(
+        m["hasTruncationNote"].as_bool(),
+        Some(false),
+        "{name}: 60-level flame graph showed a truncation warning"
+    );
+
+    // 2. Click the 2% narrow_branch bar at level 1 -> zooms subtree to 100% width & syncs call tree.
+    let click_x = m["clickX"].as_f64().unwrap();
+    let click_y = m["clickY"].as_f64().unwrap();
+    for kind in ["mousePressed", "mouseReleased"] {
+        cdp.call(
+            session,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": kind,
+                "x": click_x,
+                "y": click_y,
+                "button": "left",
+                "buttons": if kind == "mouseReleased" { 0 } else { 1 },
+                "clickCount": 1,
+            }),
+        );
+    }
+    assert!(
+        wait_for(
+            cdp,
+            session,
+            "!!document.querySelector('[data-testid=flame-reset]') && document.querySelector('[data-testid=flame-zoom-bar]').textContent.includes('narrow_branch (2.0%)')"
+        ),
+        "{name}: clicking the 2% branch did not zoom into narrow_branch"
+    );
+    // Verify hidden_leaf below narrow_branch now spans the full width (hovering the middle at level 2 hits hidden_leaf).
+    let mid_check = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": r#"(function () {
+                const canvas = document.querySelector('[data-testid=flame]');
+                const rect = canvas.getBoundingClientRect();
+                canvas.dispatchEvent(new MouseEvent('mousemove', {
+                    clientX: rect.left + rect.width * 0.5,
+                    clientY: rect.top + 18 * 2.5,
+                    bubbles: true
+                }));
+                const tip = document.querySelector('.flame-host .tip');
+                const selectedRow = document.querySelector('.flame-tree [data-testid=tree-row][aria-selected="true"]');
+                return {
+                    tip: tip ? tip.textContent : '',
+                    treeSelected: selectedRow ? selectedRow.textContent : ''
+                };
+            })()"#,
+            "returnByValue": true,
+        }),
+    );
+    let tip_text = mid_check["result"]["value"]["tip"].as_str().unwrap_or("");
+    let tree_sel = mid_check["result"]["value"]["treeSelected"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        tip_text.contains("hidden_leaf"),
+        "{name}: zoomed 2% branch did not expand hidden_leaf across canvas center (tip={tip_text:?})"
+    );
+    assert!(
+        tree_sel.contains("narrow_branch"),
+        "{name}: clicking flame bar did not sync .flame-tree selection ({tree_sel:?})"
+    );
+
+    // 3. Press Escape -> unzooms back to full 60-level view.
+    cdp.call(
+        session,
+        "Input.dispatchKeyEvent",
+        json!({
+            "type": "keyDown",
+            "key": "Escape",
+            "code": "Escape",
+            "windowsVirtualKeyCode": 27,
+            "nativeVirtualKeyCode": 27,
+        }),
+    );
+    assert!(
+        wait_for(
+            cdp,
+            session,
+            "!document.querySelector('[data-testid=flame-reset]') && document.querySelector('[data-testid=flame]').getBoundingClientRect().height >= 1079"
+        ),
+        "{name}: Escape did not reset flame zoom"
+    );
+
+    // 4. Click the Source button in Selected function -> loads real local source lines with target highlight.
+    cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.querySelector('[data-testid=open-source-btn]').click()",
+            "returnByValue": true,
+        }),
+    );
+    assert!(
+        wait_for(
+            cdp,
+            session,
+            "!!document.querySelector('.source-row.source-target[data-line=\"4\"]') && document.querySelector('[data-testid=source-rows]').textContent.includes('def narrow_branch():')"
+        ),
+        "{name}: Source view did not highlight line 4 of deep_app.py"
+    );
+    cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.querySelector('[data-testid=tab-flame]').click()",
+            "returnByValue": true,
+        }),
+    );
+    assert!(
+        wait_for(
+            cdp,
+            session,
+            "!!document.querySelector('[data-testid=flame]')"
+        ),
+        "{name}: switching back from Source to Flame Graph failed"
+    );
 }
 
 struct ViewerProcess {

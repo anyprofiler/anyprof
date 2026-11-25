@@ -32,10 +32,11 @@
           <button type="button" role="tab" id="tab-tree" data-pane="tree" aria-selected="true" data-testid="tab-tree">Call Tree</button>
           <button type="button" role="tab" id="tab-flame" data-pane="flame" aria-selected="false" data-testid="tab-flame">Flame Graph</button>
           <button type="button" role="tab" id="tab-functions" data-pane="functions" aria-selected="false" data-testid="tab-functions">Functions</button>
+          <button type="button" role="tab" id="tab-source" data-pane="source" aria-selected="false" data-testid="tab-source">Source</button>
         </div>
         <label class="search">
           <span class="sr">Search</span>
-          <input id="search" type="text" placeholder="Search" data-testid="search" autocomplete="off" spellcheck="false">
+          <input id="search" type="text" placeholder="Search symbol or file" data-testid="search" autocomplete="off" spellcheck="false">
         </label>
         <div class="segment tools">
           <button type="button" id="invert" data-testid="invert" aria-pressed="false">Invert</button>
@@ -43,15 +44,22 @@
         </div>
         <div id="tracks" class="tracks" data-testid="tracks"></div>
       </div>
-      <div id="pane" class="pane" data-testid="pane" tabindex="0" aria-label="Profile table. Arrow keys move, left and right collapse and expand, slash searches, i inverts, escape clears."></div>
+      <div id="pane" class="pane" data-testid="pane" tabindex="0" aria-label="Profile table. Arrow keys move, left and right collapse and expand, Enter opens source, slash searches, i inverts, escape clears or resets zoom."></div>
     </section>
     <div id="split-inspector" class="splitter splitter-x" role="separator" aria-orientation="vertical" aria-label="Resize detail" tabindex="0"></div>
     <aside class="inspector" data-testid="inspector">
-      <h2 id="heaviest-label" data-testid="heaviest-label">Heaviest path</h2>
-      <p id="heaviest-scope" class="scope" data-testid="heaviest-scope"></p>
-      <ol id="heaviest" data-testid="heaviest"></ol>
-      <h2>Selected function</h2>
-      <dl id="detail" data-testid="detail"></dl>
+      <div class="inspector-section inspector-heavy">
+        <h2 id="heaviest-label" data-testid="heaviest-label">Heaviest path</h2>
+        <p id="heaviest-scope" class="scope" data-testid="heaviest-scope"></p>
+        <ol id="heaviest" data-testid="heaviest"></ol>
+      </div>
+      <div class="inspector-section inspector-detail">
+        <div class="detail-head">
+          <h2>Selected function</h2>
+          <button type="button" id="open-source-btn" class="mini" data-testid="open-source-btn" hidden>Source</button>
+        </div>
+        <dl id="detail" data-testid="detail"></dl>
+      </div>
     </aside>
   </div>
 </div>
