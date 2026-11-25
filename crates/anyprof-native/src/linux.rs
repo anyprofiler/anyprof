@@ -980,6 +980,10 @@ fn user_frame(images: &[UserImage], addr: u64, leaf: bool) -> Frame {
     let mut frame = Frame::new(runtime, name);
     frame.address = Some(addr);
     frame.module = module;
+    if let Some((file, line)) = elf::location_for(images, addr, leaf) {
+        frame.file = Some(file.to_string());
+        frame.line = Some(line);
+    }
     frame
 }
 
@@ -1336,7 +1340,10 @@ mod tests {
             got,
             CountedStack::Java {
                 kernel: Vec::new(),
-                frames: vec!["Leaf.work".to_string(), "Caller.entry".to_string()],
+                frames: vec![
+                    crate::java::JavaFrame::named("Leaf.work"),
+                    crate::java::JavaFrame::named("Caller.entry"),
+                ],
             }
         );
 
@@ -1357,7 +1364,7 @@ mod tests {
             truncated,
             CountedStack::Java {
                 kernel: Vec::new(),
-                frames: vec!["Leaf.work".to_string()],
+                frames: vec![crate::java::JavaFrame::named("Leaf.work")],
             }
         );
     }

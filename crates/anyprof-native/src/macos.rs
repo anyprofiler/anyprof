@@ -236,6 +236,14 @@ fn frame_for(addr: u64, symbols: &[ImageSymbols], leaf: bool) -> Frame {
     let mut frame = Frame::new(runtime, name);
     frame.address = Some(addr);
     frame.module = image.map(|image| image.module.clone());
+    if let Some((file, line)) = image.and_then(|image| {
+        image
+            .location_at(lookup)
+            .or_else(|| image.location_at(addr))
+    }) {
+        frame.file = Some(file.to_string());
+        frame.line = Some(line);
+    }
     frame
 }
 

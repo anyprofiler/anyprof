@@ -25,9 +25,13 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyprof_core::Runtime;
 
+use crate::dwarf_line::{
+    DwarfLineSections, LineTable, MAX_LINE_SECTION_BYTES, MAX_STR_SECTION_BYTES,
+};
 use crate::symbol::{self, Presented};
 
 /// How far past a symbol an instruction can sit and still belong to it.
@@ -41,6 +45,7 @@ const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 const CPU_TYPE_ARM64: u32 = 0x0100_000C;
 const LC_SYMTAB: u32 = 0x2;
 const LC_SEGMENT_64: u32 = 0x19;
+const S_ZEROFILL: u32 = 0x1;
 const N_STAB: u8 = 0xe0;
 const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
@@ -96,8 +101,12 @@ pub(crate) struct ImageSymbols {
     pub(crate) rust_image: bool,
     /// Go pclntab relocated by this image’s ASLR slide.
     pub(crate) go: Option<crate::go_sym::GoImage>,
+    /// ASLR slide (`load_addr - __TEXT vmaddr`).
+    slide: u64,
     /// `(runtime address, display name, symbol runtime)`, sorted by address.
     symbols: Vec<(u64, String, Runtime)>,
+    /// Unslid DWARF `.debug_line` table from `__DWARF` or a sibling `.dSYM`.
+    lines: Arc<LineTable>,
 }
 
 impl ImageSymbols {
@@ -112,7 +121,9 @@ impl ImageSymbols {
             module,
             rust_image: false,
             go: None,
+            slide: 0,
             symbols: Vec::new(),
+            lines: Arc::new(LineTable::default()),
         }
     }
 
@@ -143,7 +154,13 @@ impl ImageSymbols {
     ) -> Option<Self> {
         let file = std::fs::File::open(path).ok()?;
         let len = file.metadata().ok()?.len();
-        parse_reader(file, len, load_addr, module, cpu)
+        let mut parsed = parse_reader(file, len, load_addr, module, cpu)?;
+        if parsed.lines.is_empty()
+            && let Some(dsym_lines) = read_dsym_lines(path, cpu)
+        {
+            parsed.lines = Arc::new(dsym_lines);
+        }
+        Some(parsed)
     }
 
     /// Whether `addr` falls inside this image's segments.
@@ -179,6 +196,14 @@ impl ImageSymbols {
             return None;
         }
         Some((name.as_str(), *runtime))
+    }
+
+    /// Source file path and 1-based line number for `addr`, when `__debug_line` covers it.
+    pub(crate) fn location_at(&self, addr: u64) -> Option<(&str, u32)> {
+        if !self.contains(addr) {
+            return None;
+        }
+        self.lines.lookup(addr.wrapping_sub(self.slide))
     }
 }
 
@@ -221,6 +246,8 @@ fn parse_reader<R: Read + Seek>(
     let (text_vmaddr, end_vmaddr) = walk_segments(&commands, header.ncmds)?;
     let symtab = find_symtab(&commands, header.ncmds)?;
     let symbols = read_symbols(&mut reader, offset, size, &symtab)?;
+    let lines =
+        read_dwarf_lines(&mut reader, offset, size, &commands, header.ncmds).unwrap_or_default();
     let slide = load_addr.wrapping_sub(text_vmaddr);
     let mut runtime = Vec::with_capacity(symbols.len());
     for (unslid, name, lang) in symbols {
@@ -240,7 +267,9 @@ fn parse_reader<R: Read + Seek>(
         module: module.to_string(),
         rust_image: false,
         go: None,
+        slide,
         symbols: runtime,
+        lines: Arc::new(lines),
     })
 }
 
@@ -385,6 +414,130 @@ fn read_symbols<R: Read + Seek>(
         symbols.push((n_value, name, runtime));
     }
     Some(symbols)
+}
+
+fn read_dsym_lines(binary_path: &Path, cpu: MachCpu) -> Option<LineTable> {
+    let file_name = binary_path.file_name()?;
+    let mut bundle = binary_path.as_os_str().to_os_string();
+    bundle.push(".dSYM");
+    let dwarf_path = Path::new(&bundle)
+        .join("Contents")
+        .join("Resources")
+        .join("DWARF")
+        .join(file_name);
+    let mut file = std::fs::File::open(dwarf_path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let (offset, size) = select_slice(&mut file, len, cpu)?;
+    if size < 32 || offset.saturating_add(size) > len {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut header_buf = [0u8; 32];
+    file.read_exact(&mut header_buf).ok()?;
+    let header = Header64::read(&header_buf)?;
+    if header.sizeofcmds > 1024 * 1024 {
+        return None;
+    }
+    let mut commands = vec![0u8; header.sizeofcmds];
+    file.read_exact(&mut commands).ok()?;
+    read_dwarf_lines(&mut file, offset, size, &commands, header.ncmds)
+}
+
+#[derive(Clone, Copy)]
+struct MachSection {
+    offset: u64,
+    size: u64,
+}
+
+fn read_dwarf_lines<R: Read + Seek>(
+    reader: &mut R,
+    slice_offset: u64,
+    slice_size: u64,
+    commands: &[u8],
+    ncmds: usize,
+) -> Option<LineTable> {
+    let mut line_sec = None;
+    let mut line_str_sec = None;
+    let mut str_sec = None;
+    for command in LoadCommands::new(commands, ncmds) {
+        if command.cmd != LC_SEGMENT_64 || command.data.len() < 64 {
+            continue;
+        }
+        let nsects = u32::from_le_bytes(command.data[56..60].try_into().ok()?) as usize;
+        let needed = 64usize.checked_add(nsects.checked_mul(80)?)?;
+        if command.data.len() < needed {
+            continue;
+        }
+        for idx in 0..nsects {
+            let sec = &command.data[64 + idx * 80..64 + (idx + 1) * 80];
+            let sect = segname(&sec[0..16]);
+            let seg = segname(&sec[16..32]);
+            if seg != "__DWARF" {
+                continue;
+            }
+            let size = u64::from_le_bytes(sec[40..48].try_into().ok()?);
+            let offset = u64::from(u32::from_le_bytes(sec[48..52].try_into().ok()?));
+            let flags = u32::from_le_bytes(sec[64..68].try_into().ok()?);
+            if size == 0 || (flags & 0xff) == S_ZEROFILL {
+                continue;
+            }
+            let entry = MachSection { offset, size };
+            match sect {
+                "__debug_line" if line_sec.is_none() => line_sec = Some(entry),
+                "__debug_line_str" if line_str_sec.is_none() => line_str_sec = Some(entry),
+                "__debug_str" if str_sec.is_none() => str_sec = Some(entry),
+                _ => {}
+            }
+        }
+    }
+    let line_sec = line_sec?;
+    let debug_line = read_mach_section(
+        reader,
+        slice_offset,
+        slice_size,
+        line_sec,
+        MAX_LINE_SECTION_BYTES,
+    )?;
+    let debug_line_str = line_str_sec
+        .and_then(|sec| {
+            read_mach_section(reader, slice_offset, slice_size, sec, MAX_STR_SECTION_BYTES)
+        })
+        .unwrap_or_default();
+    let debug_str = str_sec
+        .and_then(|sec| {
+            read_mach_section(reader, slice_offset, slice_size, sec, MAX_STR_SECTION_BYTES)
+        })
+        .unwrap_or_default();
+    let table = LineTable::parse(
+        DwarfLineSections {
+            debug_line: &debug_line,
+            debug_line_str: &debug_line_str,
+            debug_str: &debug_str,
+        },
+        8,
+    );
+    (!table.is_empty()).then_some(table)
+}
+
+fn read_mach_section<R: Read + Seek>(
+    reader: &mut R,
+    slice_offset: u64,
+    slice_size: u64,
+    sec: MachSection,
+    cap: u64,
+) -> Option<Vec<u8>> {
+    if sec.size == 0 || sec.size > cap {
+        return None;
+    }
+    let start = slice_offset.checked_add(sec.offset)?;
+    let end = start.checked_add(sec.size)?;
+    if end > slice_offset.saturating_add(slice_size) {
+        return None;
+    }
+    let mut buf = vec![0u8; sec.size as usize];
+    reader.seek(SeekFrom::Start(start)).ok()?;
+    reader.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
 fn cstr_at(strings: &[u8], offset: usize) -> Option<&str> {
@@ -613,6 +766,78 @@ mod tests {
             Some("anyprof_native_spin")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sibling_dsym_bundle_resolves_source_file_and_line() {
+        let exe_bytes = synthetic_macho(&[("_anyprof_native_spin", 0x1000_0100)]);
+        let dsym_bytes = synthetic_dsym_macho(0x1000_0100, 0x40, "/src/busy.cpp", 18);
+        let dir = std::env::temp_dir().join(format!("anyprof-macho-dsym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dwarf_dir = dir
+            .join("busy.dSYM")
+            .join("Contents")
+            .join("Resources")
+            .join("DWARF");
+        std::fs::create_dir_all(&dwarf_dir).unwrap();
+        let exe_path = dir.join("busy");
+        std::fs::write(&exe_path, &exe_bytes).unwrap();
+        std::fs::write(dwarf_dir.join("busy"), &dsym_bytes).unwrap();
+
+        let image = ImageSymbols::parse_file(&exe_path, 0x1040_0000, "busy", MachCpu::Arm64)
+            .expect("mach-o with dSYM");
+        assert_eq!(image.location_at(0x1040_0110), Some(("/src/busy.cpp", 18)));
+        assert_eq!(image.location_at(0x1040_0180), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn synthetic_dsym_macho(addr: u64, len: u8, path: &str, line: u8) -> Vec<u8> {
+        let mut hdr = vec![1, 1, 1, (-5i8) as u8, 14, 13];
+        hdr.extend_from_slice(&[0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]);
+        hdr.push(0); // empty include_directories
+        hdr.extend_from_slice(path.as_bytes());
+        hdr.extend_from_slice(&[0, 0, 0, 0, 0]);
+
+        let mut prog = vec![0, 9, 2]; // DW_LNE_SET_ADDRESS
+        prog.extend_from_slice(&addr.to_le_bytes());
+        prog.extend_from_slice(&[3, line.saturating_sub(1), 1]); // DW_LNS_ADVANCE_LINE, DW_LNS_COPY
+        prog.extend_from_slice(&[2, len, 0, 1, 1]); // DW_LNS_ADVANCE_PC, DW_LNE_END_SEQUENCE
+
+        let mut unit = Vec::new();
+        unit.extend_from_slice(&4u16.to_le_bytes());
+        unit.extend_from_slice(&(hdr.len() as u32).to_le_bytes());
+        unit.extend_from_slice(&hdr);
+        unit.extend_from_slice(&prog);
+
+        let mut debug_line = Vec::new();
+        debug_line.extend_from_slice(&(unit.len() as u32).to_le_bytes());
+        debug_line.extend_from_slice(&unit);
+
+        let seg_cmd_len = 72 + 80;
+        let sec_offset = 32 + seg_cmd_len;
+        let mut seg = vec![0u8; seg_cmd_len];
+        seg[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        seg[4..8].copy_from_slice(&(seg_cmd_len as u32).to_le_bytes());
+        seg[8..15].copy_from_slice(b"__DWARF");
+        seg[64..68].copy_from_slice(&1u32.to_le_bytes()); // nsects = 1
+        let sec = &mut seg[72..152];
+        sec[0..12].copy_from_slice(b"__debug_line");
+        sec[16..23].copy_from_slice(b"__DWARF");
+        sec[40..48].copy_from_slice(&(debug_line.len() as u64).to_le_bytes());
+        sec[48..52].copy_from_slice(&(sec_offset as u32).to_le_bytes());
+
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&0xFEED_FACFu32.to_le_bytes());
+        header[4..8].copy_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
+        header[12..16].copy_from_slice(&0x0au32.to_le_bytes()); // MH_DSYM
+        header[16..20].copy_from_slice(&1u32.to_le_bytes()); // ncmds = 1
+        header[20..24].copy_from_slice(&(seg_cmd_len as u32).to_le_bytes());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&seg);
+        out.extend_from_slice(&debug_line);
+        out
     }
 
     fn synthetic_macho(symbols: &[(&str, u64)]) -> Vec<u8> {

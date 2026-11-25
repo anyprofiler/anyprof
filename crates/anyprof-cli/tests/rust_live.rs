@@ -83,20 +83,23 @@ fn record_auto_detects_a_busy_rust_program() {
     });
     std::fs::write(&source, BUSY_RS).unwrap();
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let compile = Command::new(&rustc)
-        .args([
-            "--edition",
-            "2024",
-            "--crate-name",
-            "anyprof_rust_fixture",
-            "-C",
-            "opt-level=0",
-            "-C",
-            "force-frame-pointers=yes",
-            "-C",
-            "debuginfo=2",
-            "-o",
-        ])
+    let mut rustc_cmd = Command::new(&rustc);
+    rustc_cmd.args([
+        "--edition",
+        "2024",
+        "--crate-name",
+        "anyprof_rust_fixture",
+        "-C",
+        "opt-level=0",
+        "-C",
+        "force-frame-pointers=yes",
+        "-C",
+        "debuginfo=2",
+    ]);
+    #[cfg(target_os = "macos")]
+    rustc_cmd.args(["-C", "split-debuginfo=packed"]);
+    let compile = rustc_cmd
+        .arg("-o")
         .arg(&binary)
         .arg(&source)
         .output()
@@ -199,6 +202,25 @@ fn record_auto_detects_a_busy_rust_program() {
             && folded.contains("anyprof_rust_fixture::anyprof_rust_spin")
             && folded.contains("anyprof_rust_caller"),
         "collapsed stacks:\n{folded}"
+    );
+    let speedscope = dir.join("cpu.speedscope.json");
+    let convert_ss = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+        .args(["conv", "-i"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&speedscope)
+        .args(["-t", "speedscope"])
+        .output()
+        .expect("anyprof conv speedscope");
+    assert!(
+        convert_ss.status.success(),
+        "conv to speedscope failed\n{}",
+        String::from_utf8_lossy(&convert_ss.stderr)
+    );
+    let json = std::fs::read_to_string(&speedscope).unwrap();
+    assert!(
+        json.contains("busy.rs") && json.contains("\"line\":"),
+        "speedscope missing Rust file:line metadata:\n{json}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -108,6 +108,7 @@ fn record_native_writes_a_profile_of_a_busy_cpp_program() {
         .args([
             "-std=c++17",
             "-O0",
+            "-g",
             "-fno-omit-frame-pointer",
             "-mno-omit-leaf-frame-pointer",
             "-o",
@@ -205,6 +206,10 @@ fn record_native_writes_a_profile_of_a_busy_cpp_program() {
         "collapsed stacks:\n{folded}"
     );
     assert!(json.contains("spin"), "speedscope lost the spin frame");
+    assert!(
+        json.contains("busy.cpp") && json.contains("\"line\":"),
+        "speedscope missing native file:line metadata:\n{json}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -458,6 +463,10 @@ fn assert_native_profile(recorded: &std::process::Output, pid: u32, output_dir: 
         "collapsed stacks:\n{folded}"
     );
     assert!(json.contains("spin"), "speedscope lost the spin frame");
+    assert!(
+        json.contains("busy.cpp") && json.contains("\"line\":"),
+        "speedscope missing native file:line metadata:\n{json}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

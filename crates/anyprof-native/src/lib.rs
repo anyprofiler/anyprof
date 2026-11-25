@@ -31,6 +31,7 @@
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
+mod dwarf_line;
 mod elf;
 mod go_sym;
 mod java;
