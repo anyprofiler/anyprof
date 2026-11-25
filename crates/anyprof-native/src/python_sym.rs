@@ -16,7 +16,7 @@ use crate::elf::LoadSegment;
 
 const MAX_SYMBOLS: u32 = 2_000_000;
 const MAX_STRINGS: u32 = 64 * 1024 * 1024;
-const MAX_SECTIONS: u16 = 10_000;
+const MAX_SECTIONS: u64 = 100_000;
 const MAX_COMMANDS: u32 = 10_000;
 const MAX_COMMAND_BYTES: u32 = 16 * 1024 * 1024;
 
@@ -169,8 +169,8 @@ fn elf_exports(file: &mut File) -> Option<PythonImage> {
     let phentsize = u16::from_le_bytes(header[54..56].try_into().ok()?);
     let phnum = u16::from_le_bytes(header[56..58].try_into().ok()?);
     let shentsize = u16::from_le_bytes(header[58..60].try_into().ok()?);
-    let mut shnum = u16::from_le_bytes(header[60..62].try_into().ok()?);
-    let mut shstrndx = u16::from_le_bytes(header[62..64].try_into().ok()?);
+    let mut shnum = u64::from(u16::from_le_bytes(header[60..62].try_into().ok()?));
+    let mut shstrndx = u64::from(u16::from_le_bytes(header[62..64].try_into().ok()?));
     if phentsize < 56 || phnum == 0 || phnum > 512 || shentsize < 64 || shoff == 0 {
         return None;
     }
@@ -178,25 +178,24 @@ fn elf_exports(file: &mut File) -> Option<PythonImage> {
     if shnum == 0 {
         let mut zero = [0u8; 64];
         read_at(file, shoff, &mut zero)?;
-        shnum = u32::from_le_bytes(zero[44..48].try_into().ok()?)
-            .try_into()
-            .ok()?;
+        shnum = u64::from_le_bytes(zero[32..40].try_into().ok()?);
         if shstrndx == 0xffff {
-            shstrndx = u32::from_le_bytes(zero[40..44].try_into().ok()?)
-                .try_into()
-                .ok()?;
+            shstrndx = u64::from(u32::from_le_bytes(zero[40..44].try_into().ok()?));
         }
     }
     if shnum == 0 || shnum > MAX_SECTIONS || shstrndx >= shnum {
         return None;
     }
-    let sections = read_vec(file, shoff, usize::from(shnum) * usize::from(shentsize))?;
+    let section_bytes = usize::try_from(shnum)
+        .ok()?
+        .checked_mul(usize::from(shentsize))?;
+    let sections = read_vec(file, shoff, section_bytes)?;
     let mut runtime = None;
     let mut version = None;
     let mut eval = None;
     let mut eval_size = 0u64;
     for index in 0..shnum {
-        let start = usize::from(index) * usize::from(shentsize);
+        let start = usize::try_from(index).ok()? * usize::from(shentsize);
         let row = sections.get(start..start + 64)?;
         let kind = u32::from_le_bytes(row[4..8].try_into().ok()?);
         // SHT_DYNSYM and SHT_SYMTAB. Ubuntu's interpreter keeps only the first.
@@ -207,7 +206,7 @@ fn elf_exports(file: &mut File) -> Option<PythonImage> {
         let size = u64::from_le_bytes(row[32..40].try_into().ok()?);
         let link = u32::from_le_bytes(row[40..44].try_into().ok()?);
         let entsize = u64::from_le_bytes(row[56..64].try_into().ok()?);
-        if entsize < 24 || link >= u32::from(shnum) {
+        if entsize < 24 || u64::from(link) >= shnum {
             continue;
         }
         let count = size / entsize;
@@ -766,6 +765,102 @@ mod tests {
         }
         bytes[0x300..0x304].copy_from_slice(&0x030D_12F0u32.to_le_bytes());
         bytes[0x310..0x318].copy_from_slice(b"xdebugpy");
+        bytes
+    }
+
+    #[test]
+    fn elf64_extended_shnum_reads_section_zero_sh_size_not_sh_info() {
+        let bytes = synthetic_extended_elf64();
+        let path =
+            std::env::temp_dir().join(format!("anyprof-ext-shnum-{}.elf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let image = exports(&path).expect("extended ELF64 exports _PyRuntime");
+        assert_eq!(image.runtime, 0x400310);
+        assert_eq!(image.version, 0x400300);
+        assert_eq!(image.version_file, Some(0x300));
+        assert_eq!(image.eval, 0x400320);
+        assert_eq!(image.eval_size, 0x80);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn synthetic_extended_elf64() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x600];
+        // ELF64 little-endian header.
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        let phoff = 0x40u64;
+        let shoff = 0x100u64;
+        bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
+        bytes[40..48].copy_from_slice(&shoff.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        bytes[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        bytes[60..62].copy_from_slice(&0u16.to_le_bytes()); // e_shnum == 0 (extended)
+        bytes[62..64].copy_from_slice(&0xffffu16.to_le_bytes()); // e_shstrndx == SHN_XINDEX
+
+        // Program header 0: PT_LOAD mapping file [0..0x600) at vaddr 0x400000.
+        let ph = phoff as usize;
+        bytes[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        bytes[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes());
+        bytes[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes());
+        bytes[ph + 16..ph + 24].copy_from_slice(&0x400000u64.to_le_bytes());
+        bytes[ph + 32..ph + 40].copy_from_slice(&0x600u64.to_le_bytes());
+        bytes[ph + 40..ph + 48].copy_from_slice(&0x600u64.to_le_bytes());
+
+        // String table at 0x240.
+        let str_off = 0x240usize;
+        let mut strtab = vec![0u8];
+        let name_runtime = strtab.len() as u32;
+        strtab.extend_from_slice(b"_PyRuntime\0");
+        let name_version = strtab.len() as u32;
+        strtab.extend_from_slice(b"Py_Version\0");
+        let name_eval = strtab.len() as u32;
+        strtab.extend_from_slice(b"_PyEval_EvalFrameDefault\0");
+        bytes[str_off..str_off + strtab.len()].copy_from_slice(&strtab);
+
+        // Dynamic symbol table at 0x380 (4 entries * 24 bytes = 96 bytes).
+        let sym_off = 0x380usize;
+        let write_sym = |buf: &mut [u8], idx: usize, name: u32, info: u8, value: u64, size: u64| {
+            let at = sym_off + idx * 24;
+            buf[at..at + 4].copy_from_slice(&name.to_le_bytes());
+            buf[at + 4] = info;
+            buf[at + 6..at + 8].copy_from_slice(&1u16.to_le_bytes()); // st_shndx != 0
+            buf[at + 8..at + 16].copy_from_slice(&value.to_le_bytes());
+            buf[at + 16..at + 24].copy_from_slice(&size.to_le_bytes());
+        };
+        write_sym(&mut bytes, 1, name_runtime, 0x11, 0x400310, 64); // STT_OBJECT
+        write_sym(&mut bytes, 2, name_version, 0x11, 0x400300, 4); // STT_OBJECT
+        write_sym(&mut bytes, 3, name_eval, 0x12, 0x400320, 0x80); // STT_FUNC
+        bytes[0x300..0x304].copy_from_slice(&0x030c_10f0u32.to_le_bytes());
+        bytes[0x310..0x318].copy_from_slice(b"xdebugpy");
+
+        // Section 0 at 0x100: sh_size [32..40] = 3 sections, sh_link [40..44] = 2 (shstrndx),
+        // and sh_info [44..48] = 0xdead_beef (PN_XNUM slot; must NOT be read as shnum).
+        let s0 = shoff as usize;
+        bytes[s0 + 32..s0 + 40].copy_from_slice(&3u64.to_le_bytes());
+        bytes[s0 + 40..s0 + 44].copy_from_slice(&2u32.to_le_bytes());
+        bytes[s0 + 44..s0 + 48].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+
+        // Section 1 at 0x140: SHT_DYNSYM (11), link = 2.
+        let s1 = s0 + 64;
+        bytes[s1 + 4..s1 + 8].copy_from_slice(&11u32.to_le_bytes());
+        bytes[s1 + 24..s1 + 32].copy_from_slice(&(sym_off as u64).to_le_bytes());
+        bytes[s1 + 32..s1 + 40].copy_from_slice(&(4u64 * 24).to_le_bytes());
+        bytes[s1 + 40..s1 + 44].copy_from_slice(&2u32.to_le_bytes());
+        bytes[s1 + 56..s1 + 64].copy_from_slice(&24u64.to_le_bytes());
+
+        // Section 2 at 0x180: SHT_STRTAB (3).
+        let s2 = s0 + 128;
+        bytes[s2 + 4..s2 + 8].copy_from_slice(&3u32.to_le_bytes());
+        bytes[s2 + 24..s2 + 32].copy_from_slice(&(str_off as u64).to_le_bytes());
+        bytes[s2 + 32..s2 + 40].copy_from_slice(&(strtab.len() as u64).to_le_bytes());
+
         bytes
     }
 }
