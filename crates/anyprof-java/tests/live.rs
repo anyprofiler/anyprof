@@ -59,6 +59,47 @@ public class AnyprofSpin {
       sink = y;
     }
   }
+  public static void alternating() {
+    long n = 0;
+    while (true) {
+      if ((n & 1L) == 0L) {
+        callerA(n);
+      } else {
+        callerB(n);
+      }
+      sink ^= clobber(12, n ^ 0x5a5a5a5a5a5a5a5aL);
+      n++;
+    }
+  }
+  public static void callerA(long x) {
+    sink = stepA(x, x + 1L, x + 2L, x + 3L);
+  }
+  public static long stepA(long a, long b, long c, long d) {
+    return work(a ^ b) + c + d;
+  }
+  public static void callerB(long x) {
+    sink = stepB(x, x + 4L, x + 5L, x + 6L);
+  }
+  public static long stepB(long a, long b, long c, long d) {
+    return work(a ^ b) + c + d;
+  }
+  public static long work(long seed) {
+    long y = seed;
+    for (int i = 0; i < 2048; i++) {
+      y = y * 31L + i;
+    }
+    return y;
+  }
+  public static long clobber(int depth, long fill) {
+    long p0 = fill ^ 0x1111111111111111L;
+    long p1 = fill ^ 0x2222222222222222L;
+    long p2 = fill ^ 0x3333333333333333L;
+    long p3 = fill ^ 0x4444444444444444L;
+    if (depth <= 0) {
+      return p0 ^ p1 ^ p2 ^ p3;
+    }
+    return clobber(depth - 1, fill + 1L) ^ p0 ^ p1 ^ p2 ^ p3;
+  }
   public static void main(String[] args) throws Exception {
     String mode = args.length > 0 ? args[0] : "busy";
     if (mode.equals("sleep")) {
@@ -73,6 +114,10 @@ public class AnyprofSpin {
       a.start();
       b.start();
       Thread.sleep(Long.MAX_VALUE);
+      return;
+    }
+    if (mode.equals("alternating")) {
+      alternating();
       return;
     }
     caller();
@@ -114,6 +159,15 @@ public class AnyprofSpin {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn returning_call_chains_are_not_torn_across_callers() {
+        with_root(
+            "supported::returning_call_chains_are_not_torn_across_callers",
+            sample_alternating,
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn samples_a_busy_java_program() {
@@ -140,6 +194,13 @@ public class AnyprofSpin {
     fn both_spinning_threads_are_sampled() {
         let _lock = LiveLock::acquire();
         sample_threads();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn returning_call_chains_are_not_torn_across_callers() {
+        let _lock = LiveLock::acquire();
+        sample_alternating();
     }
 
     /// A double-forked JVM is not a descendant of this test.
@@ -419,6 +480,129 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             explain(&profile)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_alternating() {
+        for jdk in jdks() {
+            sample_alternating_one(&jdk);
+        }
+    }
+
+    fn sample_alternating_one(jdk: &Jdk) {
+        let java = &jdk.java;
+        let Some(dir) = compile_fixture(&format!("alternating-{}", jdk.label), java) else {
+            return;
+        };
+        let mut command = Command::new(java);
+        for method in [
+            "alternating",
+            "callerA",
+            "stepA",
+            "callerB",
+            "stepB",
+            "work",
+            "clobber",
+        ] {
+            command.arg(format!(
+                "-XX:CompileCommand=dontinline,AnyprofSpin.{method}"
+            ));
+        }
+        command
+            .arg("-cp")
+            .arg(&dir)
+            .arg("AnyprofSpin")
+            .arg("alternating")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawn {}: {err}", java.display()));
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(800));
+        if child.try_wait().ok().flatten().is_some() {
+            let _ = std::fs::remove_dir_all(&dir);
+            if required() {
+                panic!("the alternating Java fixture exited before sampling");
+            }
+            eprintln!("skipping alternating java sample: the fixture exited");
+            return;
+        }
+        let started = JavaBackend.start(
+            &anyprof_core::Target { pid },
+            &record(Duration::from_millis(1500)),
+        );
+        let Some(session) = accept_or_skip(started) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let alive = child.try_wait().ok().flatten().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        let profile = session.stop().expect("stop");
+        assert!(
+            alive,
+            "the alternating Java process exited during the profile"
+        );
+        assert_alternating_stacks(&profile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn assert_alternating_stacks(profile: &anyprof_core::Profile) {
+        let mut chain_a = 0u64;
+        let mut chain_b = 0u64;
+        let mut total_work = 0u64;
+        let mut work_with_caller = 0u64;
+        for stack in &profile.stacks {
+            let names: Vec<&str> = stack
+                .frames
+                .iter()
+                .filter(|frame| frame.runtime == Runtime::Java)
+                .map(|frame| frame.name.as_str())
+                .collect();
+            let has_a =
+                names.contains(&"AnyprofSpin.callerA") || names.contains(&"AnyprofSpin.stepA");
+            let has_b =
+                names.contains(&"AnyprofSpin.callerB") || names.contains(&"AnyprofSpin.stepB");
+            assert!(
+                !(has_a && has_b),
+                "torn cross-caller Java stack mixed A and B:\n{}",
+                explain(profile)
+            );
+            let work_pos = names.iter().position(|&name| name == "AnyprofSpin.work");
+            if let Some(work_idx) = work_pos {
+                total_work += stack.weight;
+                let step_a = names.iter().position(|&name| name == "AnyprofSpin.stepA");
+                let caller_a = names.iter().position(|&name| name == "AnyprofSpin.callerA");
+                let step_b = names.iter().position(|&name| name == "AnyprofSpin.stepB");
+                let caller_b = names.iter().position(|&name| name == "AnyprofSpin.callerB");
+                if let (Some(sa), Some(ca)) = (step_a, caller_a)
+                    && work_idx < sa
+                    && sa < ca
+                {
+                    chain_a += stack.weight;
+                    work_with_caller += stack.weight;
+                } else if let (Some(sb), Some(cb)) = (step_b, caller_b)
+                    && work_idx < sb
+                    && sb < cb
+                {
+                    chain_b += stack.weight;
+                    work_with_caller += stack.weight;
+                }
+            }
+        }
+        assert!(
+            total_work > 0 && chain_a > 0 && chain_b > 0,
+            "expected both callerA->stepA->work and callerB->stepB->work (work {total_work}, chain_a {chain_a}, chain_b {chain_b})\n{}",
+            explain(profile)
+        );
+        assert!(
+            work_with_caller * 5 >= total_work * 4,
+            "most AnyprofSpin.work samples should unwind to callerA or callerB instead of truncating on overwritten live stack ({work_with_caller}/{total_work})\n{}",
+            explain(profile)
+        );
     }
 
     fn record(duration: Duration) -> anyprof_core::RecordOptions {
