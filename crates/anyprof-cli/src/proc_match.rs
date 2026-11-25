@@ -41,18 +41,33 @@ fn pick_unique_match(query: &str, entries: &[ProcessEntry]) -> Result<u32> {
     let needle = query.to_ascii_lowercase();
     let needle_no_exe = strip_exe(&needle);
 
-    let exact: Vec<&ProcessEntry> = entries
+    let candidates: Vec<&ProcessEntry> = entries
         .iter()
-        .filter(|entry| is_exact_match(entry, &needle, needle_no_exe))
+        .filter(|entry| needle_no_exe == "anyprof" || !is_anyprof_wrapper(entry))
         .collect();
 
-    let chosen = if !exact.is_empty() {
-        exact
+    let exe_exact: Vec<&ProcessEntry> = candidates
+        .iter()
+        .copied()
+        .filter(|entry| is_exe_exact_match(entry, &needle, needle_no_exe))
+        .collect();
+
+    let chosen = if !exe_exact.is_empty() {
+        exe_exact
     } else {
-        entries
+        let arg_exact: Vec<&ProcessEntry> = candidates
             .iter()
-            .filter(|entry| is_substring_match(entry, &needle))
-            .collect()
+            .copied()
+            .filter(|entry| is_arg_exact_match(entry, &needle, needle_no_exe))
+            .collect();
+        if !arg_exact.is_empty() {
+            arg_exact
+        } else {
+            candidates
+                .into_iter()
+                .filter(|entry| is_substring_match(entry, &needle))
+                .collect()
+        }
     };
 
     match chosen.as_slice() {
@@ -80,18 +95,46 @@ fn pick_unique_match(query: &str, entries: &[ProcessEntry]) -> Result<u32> {
     }
 }
 
-fn is_exact_match(entry: &ProcessEntry, needle: &str, needle_no_exe: &str) -> bool {
+fn is_anyprof_wrapper(entry: &ProcessEntry) -> bool {
+    let is_anyprof_bin = |raw: &str| strip_exe(&basename(raw).to_ascii_lowercase()) == "anyprof";
+    if entry.comm.as_deref().is_some_and(is_anyprof_bin)
+        || entry.exe_name.as_deref().is_some_and(is_anyprof_bin)
+        || entry
+            .cmdline
+            .first()
+            .map(String::as_str)
+            .is_some_and(is_anyprof_bin)
+    {
+        return true;
+    }
+    let Some(first) = entry.cmdline.first() else {
+        return false;
+    };
+    let launcher = strip_exe(&basename(first).to_ascii_lowercase()).to_string();
+    matches!(launcher.as_str(), "sudo" | "doas" | "pkexec" | "run0")
+        && entry.cmdline.iter().skip(1).any(|arg| is_anyprof_bin(arg))
+}
+
+fn is_exe_exact_match(entry: &ProcessEntry, needle: &str, needle_no_exe: &str) -> bool {
     let matches_token = |raw: &str| {
         let base = basename(raw).to_ascii_lowercase();
         base == needle || strip_exe(&base) == needle_no_exe
     };
-    if entry.comm.as_deref().is_some_and(matches_token) {
-        return true;
-    }
-    if entry.exe_name.as_deref().is_some_and(matches_token) {
-        return true;
-    }
-    entry.cmdline.iter().any(|arg| matches_token(arg))
+    entry.comm.as_deref().is_some_and(matches_token)
+        || entry.exe_name.as_deref().is_some_and(matches_token)
+        || entry
+            .cmdline
+            .first()
+            .map(String::as_str)
+            .is_some_and(matches_token)
+}
+
+fn is_arg_exact_match(entry: &ProcessEntry, needle: &str, needle_no_exe: &str) -> bool {
+    let matches_token = |raw: &str| {
+        let base = basename(raw).to_ascii_lowercase();
+        base == needle || strip_exe(&base) == needle_no_exe
+    };
+    entry.cmdline.iter().skip(1).any(|arg| matches_token(arg))
 }
 
 fn is_substring_match(entry: &ProcessEntry, needle: &str) -> bool {
@@ -359,6 +402,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(miss.contains("no running process matched"), "{miss}");
+    }
+
+    #[test]
+    fn sudo_wrapper_invoking_anyprof_does_not_collide_with_target_name() {
+        let entries = vec![
+            entry(7641, "aptarget7508", &["/tmp/aptarget7508"]),
+            entry(
+                7674,
+                "sudo",
+                &[
+                    "sudo",
+                    "-n",
+                    "/usr/local/bin/anyprof",
+                    "rec",
+                    "-n",
+                    "aptarget7508",
+                ],
+            ),
+            entry(
+                8100,
+                "sudo",
+                &[
+                    "sudo",
+                    "-n",
+                    "/usr/local/bin/anyprof",
+                    "rec",
+                    "-n",
+                    "billing_worker",
+                ],
+            ),
+            entry(8090, "python3", &["python3", "/srv/billing_worker.py"]),
+        ];
+        assert_eq!(pick_unique_match("aptarget7508", &entries).unwrap(), 7641);
+        assert_eq!(pick_unique_match("billing_worker", &entries).unwrap(), 8090);
     }
 
     #[test]
