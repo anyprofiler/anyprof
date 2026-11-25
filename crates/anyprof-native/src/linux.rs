@@ -93,6 +93,9 @@ struct Mapped {
     start: u64,
     ptr: *mut u8,
     len: usize,
+    /// Set once `poll` reports `POLLHUP` / `POLLERR` so an exited thread's fd
+    /// does not spin `poll` before the next thread-list refresh reaps it.
+    hup: bool,
 }
 
 impl Drop for Mapped {
@@ -164,8 +167,21 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         "native symbol tables loaded"
     );
 
+    if !opts.stop.stop_requested()
+        && let Err(errno) = sampler.enable()
+    {
+        return Err(Error::backend(
+            "native",
+            format!(
+                "perf events for pid {} could not be enabled (errno {errno})",
+                target.pid
+            ),
+        ));
+    }
+
+    let live_vm = python.is_some() || java.is_some();
     let started = Instant::now();
-    let mut next = started;
+    let mut next_refresh = started;
     let mut counts: HashMap<CountedStack, u64> = HashMap::new();
     let mut lost = 0u64;
     loop {
@@ -178,15 +194,22 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         {
             break;
         }
-        lost = lost.saturating_add(refresh(
-            &mut sampler,
-            target.pid,
-            opts.include_kernel,
-            &go_images,
-            &python,
-            &java,
-            &mut counts,
-        ));
+        if Instant::now() >= next_refresh {
+            lost = lost.saturating_add(refresh(
+                &mut sampler,
+                target.pid,
+                opts.include_kernel,
+                &go_images,
+                &python,
+                &java,
+                &mut counts,
+            ));
+            next_refresh += interval;
+            let now = Instant::now();
+            if next_refresh < now {
+                next_refresh = now;
+            }
+        }
         lost = lost.saturating_add(take_samples(
             &sampler,
             target.pid,
@@ -196,18 +219,18 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             &java,
             &mut counts,
         ));
-        next += interval;
-        let now = Instant::now();
-        if next < now {
-            next = now;
-        }
+        let mut wake = next_refresh;
         if let Some(limit) = opts.duration {
             let end = started + limit;
-            if next > end {
-                next = end;
+            if wake > end {
+                wake = end;
             }
         }
-        wait_until(next, opts);
+        if live_vm {
+            poll_events(&mut sampler.events, wake, opts);
+        } else {
+            wait_until(wake, opts);
+        }
     }
     sampler.disable();
     lost = lost.saturating_add(take_samples(
@@ -311,6 +334,7 @@ fn attach(pid: u32, attr: &PerfEventAttr) -> Result<Sampler, AttachFail> {
                     start: thread.start,
                     ptr,
                     len,
+                    hup: false,
                 }),
                 Err(err) => {
                     unsafe { libc::close(fd) };
@@ -352,12 +376,6 @@ fn attach(pid: u32, attr: &PerfEventAttr) -> Result<Sampler, AttachFail> {
             format!("pid {pid} is not running")
         };
         return Err(AttachFail::Fatal(Error::backend("native", why)));
-    }
-    if let Err(errno) = sampler.enable() {
-        return Err(AttachFail::Fatal(Error::backend(
-            "native",
-            format!("perf events for pid {pid} could not be enabled (errno {errno})"),
-        )));
     }
     Ok(sampler)
 }
@@ -514,6 +532,7 @@ fn refresh(
                     start: thread.start,
                     ptr,
                     len,
+                    hup: false,
                 };
                 if ioctl_req(mapped.fd, IOC_ENABLE) {
                     sampler.events.push(mapped);
@@ -586,6 +605,9 @@ fn drain_mapped(mapped: &Mapped) -> (Vec<ParsedSample>, u64) {
     let tail_ptr = unsafe { mapped.ptr.add(DATA_TAIL).cast::<u64>() };
     let head = unsafe { AtomicU64::from_ptr(head_ptr).load(Ordering::Acquire) };
     let mut tail = unsafe { AtomicU64::from_ptr(tail_ptr).load(Ordering::Relaxed) };
+    if head == tail {
+        return (Vec::new(), 0);
+    }
     let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
     let mut samples = Vec::new();
     let mut lost = 0u64;
@@ -733,6 +755,27 @@ fn assemble_addresses(
     python: &Option<PythonVm>,
     java: &Option<JavaVm>,
 ) -> Option<CountedStack> {
+    assemble_addresses_with(
+        sample,
+        include_kernel,
+        go_images,
+        python,
+        java,
+        &mut |addr, buf| crate::python::read_process(pid, addr, buf),
+    )
+}
+
+fn assemble_addresses_with<R>(
+    sample: &ParsedSample,
+    include_kernel: bool,
+    go_images: &[GoImage],
+    python: &Option<PythonVm>,
+    java: &Option<JavaVm>,
+    live_read: &mut R,
+) -> Option<CountedStack>
+where
+    R: FnMut(u64, &mut [u8]) -> bool,
+{
     let (kernel_chain, user_chain) = perf_parse::split_callchain(&sample.callchain);
     let mut kernel = if include_kernel {
         kernel_chain
@@ -751,30 +794,32 @@ fn assemble_addresses(
         .unwrap_or(0);
     let fp = sample.user_fp.unwrap_or(0);
     let sp = sample.user_sp.unwrap_or(0);
-    if let Some(vm) = java
-        && let Some(frames) = vm.frames(pc, sp, fp, &mut |addr, buf| {
-            crate::python::read_process(pid, addr, buf)
-        })
-    {
-        // The perf sample is historical. The method chain is the thread's
-        // current Java stack, read when the sample is consumed. A tight loop
-        // is still on that method. `None` is a leaf outside the code cache
-        // or a blob whose method cannot be read. Both keep the native walk.
-        return Some(CountedStack::Java { kernel, frames });
+    let stack = sample.stack.as_slice();
+    if let Some(vm) = java {
+        let mut read_java = |addr: u64, buf: &mut [u8]| {
+            if read_copied_stack(stack, sp, addr, buf) {
+                true
+            } else {
+                live_read(addr, buf)
+            }
+        };
+        if let Some(frames) = vm.frames(pc, sp, fp, &mut read_java) {
+            // Stack return addresses and interpreter slots within the copied
+            // `PERF_SAMPLE_STACK_USER` window come from the kernel's interrupt
+            // snapshot, while CodeCache and Metaspace reads fall back to
+            // `process_vm_readv`. `None` keeps the native walk below.
+            return Some(CountedStack::Java { kernel, frames });
+        }
     }
     if let Some(vm) = python
-        && let Some(frames) = vm.frames(u64::from(sample.tid), pc, &mut |addr, buf| {
-            python::read_process(pid, addr, buf)
-        })
+        && let Some(frames) = vm.frames(u64::from(sample.tid), pc, live_read)
     {
-        // The perf sample is historical. The frame chain is the thread's
-        // current Python stack, read when the sample is consumed. A tight
-        // loop is still on that function. `None` covers a leaf outside the
-        // interpreter image and a leaf inside it whose chain cannot be
-        // read. Both keep the native walk below, unlabeled as Python.
+        // `poll_events` wakes as soon as a sample is published to minimize lag
+        // before reading the thread's `_PyInterpreterFrame` chain. `None`
+        // covers a leaf outside the interpreter image and a leaf inside it
+        // whose chain cannot be read; both keep the native walk below.
         return Some(CountedStack::Python { kernel, frames });
     }
-    let stack = sample.stack.as_slice();
     // Go's pcsp walk uses the copied user stack. A leaf that is not a Go
     // function keeps the frame-pointer walk below.
     let go_walk = go_sym::unwind(
@@ -1151,9 +1196,67 @@ fn wait_until(deadline: Instant, opts: &RecordOptions) {
     }
 }
 
+fn poll_events(events: &mut [Mapped], deadline: Instant, opts: &RecordOptions) {
+    let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(events.len());
+    let mut indices: Vec<usize> = Vec::with_capacity(events.len());
+    while Instant::now() < deadline {
+        if opts.stop.stop_requested() {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        pollfds.clear();
+        indices.clear();
+        for (idx, event) in events.iter().enumerate() {
+            if event.fd >= 0 && !event.hup {
+                pollfds.push(libc::pollfd {
+                    fd: event.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                indices.push(idx);
+            }
+        }
+        if pollfds.is_empty() {
+            std::thread::sleep(remaining.min(Duration::from_millis(20)));
+            continue;
+        }
+        let slice = remaining.min(Duration::from_millis(20));
+        let timeout_ms = i32::try_from(slice.as_millis().max(1)).unwrap_or(20);
+        // SAFETY: `pollfds` points to `pollfds.len()` valid entries for the call.
+        let ready = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if ready > 0 {
+            let mut wake_for_drain = false;
+            for (pfd, &idx) in pollfds.iter().zip(indices.iter()) {
+                if pfd.revents & libc::POLLIN != 0 {
+                    wake_for_drain = true;
+                }
+                if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    events[idx].hup = true;
+                    wake_for_drain = true;
+                }
+            }
+            if wake_for_drain {
+                return;
+            }
+        } else if ready < 0 && errno_now() != libc::EINTR {
+            std::thread::sleep(slice);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::assemble_addresses;
+    use super::{assemble_addresses, assemble_addresses_with};
+    use crate::java::tests::SyntheticJavaFixture;
     use crate::perf_parse::{CONTEXT_KERNEL, CONTEXT_USER, ParsedSample};
     use crate::python::CountedStack;
 
@@ -1165,6 +1268,67 @@ mod tests {
             CountedStack::Python { .. } => panic!("a synthetic sample is not Python"),
             CountedStack::Java { .. } => panic!("a synthetic sample is not Java"),
         }
+    }
+
+    #[test]
+    fn java_frames_unwind_from_copied_stack_when_live_stack_is_overwritten() {
+        let fixture = SyntheticJavaFixture::two_compiled_frames();
+        let sp = 0x7fff_0000_1000u64;
+        let sample = ParsedSample {
+            ip: fixture.leaf_pc,
+            pid: 9,
+            tid: 9,
+            callchain: vec![fixture.leaf_pc],
+            user_ip: Some(fixture.leaf_pc),
+            user_sp: Some(sp),
+            user_fp: Some(sp + 16),
+            stack: fixture.build_copied_stack(sp),
+        };
+        let mut dirty_live_read = |addr: u64, buf: &mut [u8]| {
+            if fixture.read_metadata(addr, buf) {
+                true
+            } else {
+                buf.fill(0xaa);
+                true
+            }
+        };
+        let got = assemble_addresses_with(
+            &sample,
+            false,
+            &[],
+            &None,
+            &fixture.vm,
+            &mut dirty_live_read,
+        )
+        .expect("java stack");
+        assert_eq!(
+            got,
+            CountedStack::Java {
+                kernel: Vec::new(),
+                frames: vec!["Leaf.work".to_string(), "Caller.entry".to_string()],
+            }
+        );
+
+        let without_snapshot = ParsedSample {
+            stack: Vec::new(),
+            ..sample
+        };
+        let truncated = assemble_addresses_with(
+            &without_snapshot,
+            false,
+            &[],
+            &None,
+            &fixture.vm,
+            &mut dirty_live_read,
+        )
+        .expect("leaf-only java stack when snapshot is absent");
+        assert_eq!(
+            truncated,
+            CountedStack::Java {
+                kernel: Vec::new(),
+                frames: vec!["Leaf.work".to_string()],
+            }
+        );
     }
 
     #[test]

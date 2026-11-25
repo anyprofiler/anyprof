@@ -1796,7 +1796,7 @@ fn pe_reject(path: &Path) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         InterpreterLayout, JvmArch, array_offsets, compiled_method_type, heap_used_offset,
         interpreter_method_words, interpreter_slot,
@@ -1899,6 +1899,202 @@ mod tests {
         }
         if text.contains("arm64") || text.contains("aarch64") {
             assert_eq!(file.arch, super::JvmArch::Aarch64);
+        }
+    }
+
+    #[test]
+    fn synthetic_fixture_unwinds_compiled_frames() {
+        let fixture = SyntheticJavaFixture::two_compiled_frames();
+        let sp = 0x7fff_0000_1000u64;
+        let stack = fixture.build_copied_stack(sp);
+        let frames = fixture
+            .vm
+            .as_ref()
+            .expect("vm")
+            .frames(fixture.leaf_pc, sp, sp + 16, &mut |addr, buf| {
+                if let Some(off) = addr.checked_sub(sp)
+                    && let Ok(off) = usize::try_from(off)
+                    && let Some(end) = off.checked_add(buf.len())
+                    && end <= stack.len()
+                {
+                    buf.copy_from_slice(&stack[off..end]);
+                    return true;
+                }
+                fixture.read_metadata(addr, buf)
+            })
+            .expect("compiled java frames");
+        assert_eq!(
+            frames,
+            vec!["Leaf.work".to_string(), "Caller.entry".to_string()]
+        );
+    }
+
+    pub(crate) struct SyntheticJavaFixture {
+        pub vm: Option<super::JavaVm>,
+        pub leaf_pc: u64,
+        pub caller_pc: u64,
+        mem: std::collections::HashMap<u64, u8>,
+    }
+
+    impl SyntheticJavaFixture {
+        pub fn two_compiled_frames() -> Self {
+            use super::{CodeRange, JavaVm, Layout};
+            let mut mem = std::collections::HashMap::new();
+            let put = |mem: &mut std::collections::HashMap<u64, u8>, addr: u64, bytes: &[u8]| {
+                for (idx, &byte) in bytes.iter().enumerate() {
+                    mem.insert(addr + idx as u64, byte);
+                }
+            };
+            let put_u64 = |mem: &mut std::collections::HashMap<u64, u8>, addr: u64, val: u64| {
+                put(mem, addr, &val.to_le_bytes());
+            };
+            let put_u16 = |mem: &mut std::collections::HashMap<u64, u8>, addr: u64, val: u16| {
+                put(mem, addr, &val.to_le_bytes());
+            };
+            let put_i32 = |mem: &mut std::collections::HashMap<u64, u8>, addr: u64, val: i32| {
+                put(mem, addr, &val.to_le_bytes());
+            };
+            let put_sym = |mem: &mut std::collections::HashMap<u64, u8>, addr: u64, text: &[u8]| {
+                put_u16(mem, addr, text.len() as u16);
+                put(mem, addr + 2, text);
+            };
+
+            let code_low = 0x3000_0000u64;
+            let code_high = 0x3001_0000u64;
+            let low_bound_addr = 0x2000_0000u64;
+            let high_bound_addr = 0x2000_0008u64;
+            let heaps_ptr_addr = 0x2000_0010u64;
+            let array_addr = 0x2000_0100u64;
+            let array_data_addr = 0x2000_0120u64;
+            let heap_addr = 0x2000_0200u64;
+            let segmap_addr = 0x2000_1000u64;
+            let blob_name_addr = 0x2000_2000u64;
+
+            put_u64(&mut mem, low_bound_addr, code_low);
+            put_u64(&mut mem, high_bound_addr, code_high);
+            put_u64(&mut mem, heaps_ptr_addr, array_addr);
+            put_i32(&mut mem, array_addr, 1);
+            put_i32(&mut mem, array_addr + 4, 1);
+            put_u64(&mut mem, array_addr + 8, array_data_addr);
+            put_u64(&mut mem, array_data_addr, heap_addr);
+
+            // CodeHeap: memory VirtualSpace [0..16], segmap VirtualSpace [16..32], log2_segment_size = 8 (256B)
+            put_u64(&mut mem, heap_addr, code_low);
+            put_u64(&mut mem, heap_addr + 8, code_high);
+            put_u64(&mut mem, heap_addr + 16, segmap_addr);
+            put_u64(&mut mem, heap_addr + 24, segmap_addr + 0x400);
+            put_i32(&mut mem, heap_addr + 32, 8);
+            put(&mut mem, blob_name_addr, b"nmethod\0");
+
+            let add_method = |mem: &mut std::collections::HashMap<u64, u8>,
+                              meta_base: u64,
+                              cls: &[u8],
+                              mth: &[u8]|
+             -> u64 {
+                let sym_cls = meta_base;
+                let sym_mth = meta_base + 0x40;
+                let klass = meta_base + 0x80;
+                let pool = meta_base + 0xc0;
+                let const_method = meta_base + 0x100;
+                let method = meta_base + 0x140;
+                put_sym(mem, sym_cls, cls);
+                put_sym(mem, sym_mth, mth);
+                put_u64(mem, klass, sym_cls);
+                put_u64(mem, pool, klass);
+                put_u64(mem, pool + 16, sym_mth);
+                put_u64(mem, const_method, pool);
+                put_u16(mem, const_method + 8, 1);
+                put_u64(mem, method, const_method);
+                method
+            };
+
+            let leaf_method = add_method(&mut mem, 0x2001_0000, b"Leaf", b"work");
+            let caller_method = add_method(&mut mem, 0x2001_1000, b"Caller", b"entry");
+
+            let add_blob = |mem: &mut std::collections::HashMap<u64, u8>,
+                            seg_index: u64,
+                            method: u64,
+                            frame_words: i32|
+             -> u64 {
+                let block = code_low + (seg_index << 8);
+                put(mem, segmap_addr + seg_index, &[0]);
+                put(mem, block + 8, &[1]); // HeapBlock._used = 1
+                let blob = block + 16;
+                let code_begin = blob + 64;
+                let code_end = blob + 192;
+                put_u64(mem, blob, code_begin);
+                put_u64(mem, blob + 8, code_end);
+                put_i32(mem, blob + 16, frame_words);
+                put_i32(mem, blob + 20, 192);
+                put_u64(mem, blob + 24, blob_name_addr);
+                put_u64(mem, blob + 32, method);
+                code_begin + 16
+            };
+
+            let leaf_pc = add_blob(&mut mem, 1, leaf_method, 4);
+            let caller_pc = add_blob(&mut mem, 4, caller_method, 4);
+
+            let vm = JavaVm {
+                layout: Layout {
+                    code_range: CodeRange::Pointers { begin: 0, end: 8 },
+                    frame_size: 16,
+                    blob_size: 20,
+                    blob_name: 24,
+                    compiled_method: 32,
+                    const_method: 0,
+                    constants: 0,
+                    name_index: 8,
+                    pool_holder: 0,
+                    klass_name: 0,
+                    sym_length: 0,
+                    sym_body: 2,
+                    heap_memory: 0,
+                    heap_segmap: 16,
+                    heap_log2: 32,
+                    vs_low: 0,
+                    vs_high: 8,
+                    heap_block: 16,
+                    heap_used: 8,
+                    array_len: 0,
+                    array_cap: 4,
+                    array_data: 8,
+                    cp_size: 8,
+                    method_words: -3,
+                },
+                heaps: heaps_ptr_addr,
+                low_bound: low_bound_addr,
+                high_bound: high_bound_addr,
+            };
+            Self {
+                vm: Some(vm),
+                leaf_pc,
+                caller_pc,
+                mem,
+            }
+        }
+
+        pub fn build_copied_stack(&self, sp: u64) -> Vec<u8> {
+            // Leaf frame_words = 4 -> sender_sp = sp + 32; return PC at sp + 24, saved FP at sp + 16.
+            // Caller frame_words = 4 -> sender_sp = sp + 64; return PC at sp + 56 (outside code cache).
+            let mut stack = vec![0u8; 64];
+            stack[16..24].copy_from_slice(&(sp + 32).to_le_bytes());
+            stack[24..32].copy_from_slice(&self.caller_pc.to_le_bytes());
+            stack[48..56].copy_from_slice(&(sp + 64).to_le_bytes());
+            stack[56..64].copy_from_slice(&0x5555_0000_9000u64.to_le_bytes());
+            stack
+        }
+
+        pub fn read_metadata(&self, addr: u64, buf: &mut [u8]) -> bool {
+            for (idx, slot) in buf.iter_mut().enumerate() {
+                let Some(byte_addr) = addr.checked_add(idx as u64) else {
+                    return false;
+                };
+                let Some(&val) = self.mem.get(&byte_addr) else {
+                    return false;
+                };
+                *slot = val;
+            }
+            true
         }
     }
 }
