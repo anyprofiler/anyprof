@@ -15,7 +15,6 @@
 //! a warning is logged. Linux records kernel frames with perf events. Windows
 //! x64 samples user frames only, the same as macOS.
 
-use std::ffi::c_char;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -57,11 +56,6 @@ use mach2::thread_status::ARM_THREAD_STATE64 as THREAD_STATE;
 #[cfg(target_arch = "x86_64")]
 use mach2::thread_status::x86_THREAD_STATE64 as THREAD_STATE;
 
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidpath(pid: i32, buffer: *mut c_char, buffersize: u32) -> i32;
-}
-
 unsafe extern "C" {
     fn thread_info(
         target_act: thread_act_t,
@@ -72,7 +66,12 @@ unsafe extern "C" {
     fn mach_port_deallocate(task: mach_port_t, name: mach_port_t) -> kern_return_t;
 }
 
-pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
+pub fn record(
+    target: &Target,
+    opts: &RecordOptions,
+    session_stop: &anyprof_core::StopGate,
+    ready_tx: &std::sync::mpsc::SyncSender<Result<(), Error>>,
+) -> Result<Profile, Error> {
     if opts.include_kernel {
         tracing::warn!("ignoring -k/--kernel: the macOS native sampler collects user frames only");
     }
@@ -93,7 +92,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
     let mut go_images = Vec::new();
     let mut python = None;
     let mut java = None;
-    let mut symbols = SymbolTable::new(target.pid);
+    let mut symbols = SymbolTable::new(target.pid, opts.language_unwind);
     symbols.sync_from_task(
         task.port,
         &mut unwinder,
@@ -106,13 +105,14 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         images = symbols.images.len(),
         "native unwind tables prepared"
     );
+    let _ = ready_tx.send(Ok(()));
 
     let started = Instant::now();
     let mut next = started;
     let mut collector = SampleCollector::new();
     let mut cache_activated = false;
     loop {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             break;
         }
         if opts
@@ -158,7 +158,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
                 break;
             }
         }
-        if !cache_activated && !opts.stop.stop_requested() {
+        if !cache_activated && !stop_requested(opts, session_stop) {
             cache_activated = true;
             symbols.activate_shared_cache(&mut unwinder);
         }
@@ -173,7 +173,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
                 next = end;
             }
         }
-        wait_until(next, opts);
+        wait_until(next, opts, session_stop);
         if opts
             .duration
             .is_some_and(|limit| started.elapsed() >= limit)
@@ -181,6 +181,7 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
             break;
         }
     }
+    let elapsed = started.elapsed();
 
     symbols.sync_from_task(
         task.port,
@@ -197,14 +198,18 @@ pub fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
         comm,
         collector,
         &mut symbols,
-        started.elapsed(),
+        elapsed,
         interval,
     ))
 }
 
-fn wait_until(deadline: Instant, opts: &RecordOptions) {
+fn stop_requested(opts: &RecordOptions, session_stop: &anyprof_core::StopGate) -> bool {
+    opts.stop.stop_requested() || session_stop.stop_requested()
+}
+
+fn wait_until(deadline: Instant, opts: &RecordOptions, session_stop: &anyprof_core::StopGate) {
     while Instant::now() < deadline {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -996,6 +1001,7 @@ struct TrackedImage {
 struct SymbolTable {
     pid: u32,
     cpu: MachCpu,
+    language_unwind: anyprof_core::LanguageUnwind,
     shared_cache: Option<Option<&'static crate::dyld_cache::DyldSharedCache>>,
     info_addr: Option<u64>,
     seen_dyld_count: Option<u32>,
@@ -1005,10 +1011,11 @@ struct SymbolTable {
 }
 
 impl SymbolTable {
-    fn new(pid: u32) -> Self {
+    fn new(pid: u32, language_unwind: anyprof_core::LanguageUnwind) -> Self {
         Self {
             pid,
             cpu: MachCpu::host(),
+            language_unwind,
             shared_cache: None,
             info_addr: None,
             seen_dyld_count: None,
@@ -1069,10 +1076,10 @@ impl SymbolTable {
         }
 
         if added_any {
-            if python.is_none() {
+            if self.language_unwind.allows_python() && python.is_none() {
                 *python = python::attach_mach(&self.raw_images);
             }
-            if java.is_none() {
+            if self.language_unwind.allows_java() && java.is_none() {
                 *java = java::attach_mach(&self.raw_images, &mut |addr, buf| {
                     read_task(task, addr, buf)
                 });
@@ -1113,7 +1120,11 @@ impl SymbolTable {
         if path.is_file() {
             let file_unwind = ImageSymbols::parse_unwind_file(path, remote.load, &module, self.cpu);
             let rust_image = crate::rust_image::file_is_rust(path);
-            let go = attach_go(&remote.path, remote.load);
+            let go = self
+                .language_unwind
+                .allows_go()
+                .then(|| attach_go(&remote.path, remote.load))
+                .flatten();
             if let Some(mut parsed) = file_unwind {
                 parsed.rust_image = rust_image;
                 parsed.go = go;
@@ -1371,24 +1382,7 @@ fn read_remote_cstr(task: task_t, addr: u64) -> Option<String> {
 }
 
 fn pid_path(pid: u32) -> Option<String> {
-    let mut buf = [0u8; 4096];
-    let n = unsafe {
-        proc_pidpath(
-            pid as i32,
-            buf.as_mut_ptr() as *mut c_char,
-            buf.len() as u32,
-        )
-    };
-    if n <= 0 {
-        return None;
-    }
-    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
-    let text = std::str::from_utf8(&buf[..end]).ok()?;
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
+    anyprof_core::executable_file(pid).and_then(|path| path.into_os_string().into_string().ok())
 }
 
 fn module_name(path: &str) -> String {

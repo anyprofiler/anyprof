@@ -17,11 +17,13 @@
 //! there, with the same platform split as the native sampler.
 
 mod binary;
-mod exe;
 
 use std::time::Duration;
 
-use anyprof_core::{Backend, Capabilities, Error, Format, RecordOptions, Session, Target};
+use anyprof_core::{
+    Backend, Capabilities, Error, Format, LanguageUnwind, RecordOptions, Session, Target,
+    executable_file,
+};
 use anyprof_native::NativeBackend;
 
 /// Detail for [`Error::NotImplemented`] on Windows builds that are not x64.
@@ -62,7 +64,7 @@ impl Backend for GoBackend {
     }
 
     fn detect(&self, pid: u32) -> bool {
-        let Some(path) = exe::executable_path(pid) else {
+        let Some(path) = executable_file(pid) else {
             tracing::debug!(pid, "go detect: executable path is not readable");
             return false;
         };
@@ -97,7 +99,20 @@ impl Backend for GoBackend {
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
-        NativeBackend.start(target, opts).map_err(retarget)
+        let mut go_opts = opts.clone();
+        go_opts.language_unwind = LanguageUnwind::Go;
+        let inner = NativeBackend.start(target, &go_opts).map_err(retarget)?;
+        Ok(Box::new(RetargetSession { inner }))
+    }
+}
+
+struct RetargetSession {
+    inner: Box<dyn Session>,
+}
+
+impl Session for RetargetSession {
+    fn stop(self: Box<Self>) -> Result<anyprof_core::Profile, Error> {
+        self.inner.stop().map_err(retarget)
     }
 }
 

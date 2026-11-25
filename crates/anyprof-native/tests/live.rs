@@ -194,17 +194,25 @@ fn sample_busy_program() {
             ..anyprof_core::RecordOptions::default()
         },
     );
+    let session = match started {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "native profile failed: {err}\nsymbols:\n{}",
+                nm_symbols(&binary)
+            );
+        }
+    };
+    std::thread::sleep(Duration::from_secs(1));
+    let profile = session.stop().unwrap_or_else(|err| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("stop failed: {err}")
+    });
     let _ = child.kill();
     let _ = child.wait();
-    let session = started.unwrap_or_else(|err| {
-        panic!(
-            "native profile failed: {err}\nsymbols:\n{}",
-            nm_symbols(&binary)
-        )
-    });
-    let profile = session
-        .stop()
-        .unwrap_or_else(|err| panic!("stop failed: {err}"));
 
     let spin_weight = profile
         .stacks
@@ -321,12 +329,22 @@ fn sample_idle_program() {
             ..anyprof_core::RecordOptions::default()
         },
     );
+    let session = match started {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("idle profile failed: {err}");
+        }
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let profile = session.stop().unwrap_or_else(|err| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("stop failed: {err}")
+    });
     let _ = child.kill();
     let _ = child.wait();
-    let session = started.unwrap_or_else(|err| panic!("idle profile failed: {err}"));
-    let profile = session
-        .stop()
-        .unwrap_or_else(|err| panic!("stop failed: {err}"));
     let total = profile.total_weight();
     assert!(
         total <= 2,
@@ -386,12 +404,22 @@ fn sample_nofp_and_dyld_cache() {
             ..anyprof_core::RecordOptions::default()
         },
     );
+    let session = match started {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("nofp profile failed: {err}");
+        }
+    };
+    std::thread::sleep(Duration::from_millis(800));
+    let profile = session.stop().unwrap_or_else(|err| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("stop failed: {err}")
+    });
     let _ = child.kill();
     let _ = child.wait();
-    let session = started.unwrap_or_else(|err| panic!("nofp profile failed: {err}"));
-    let profile = session
-        .stop()
-        .unwrap_or_else(|err| panic!("stop failed: {err}"));
 
     assert!(
         profile.stacks.iter().any(|stack| {

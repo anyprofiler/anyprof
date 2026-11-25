@@ -30,7 +30,9 @@
 
 use std::time::Duration;
 
-use anyprof_core::{Backend, Capabilities, Error, Format, RecordOptions, Session, Target};
+use anyprof_core::{
+    Backend, Capabilities, Error, Format, LanguageUnwind, RecordOptions, Session, Target,
+};
 use anyprof_native::NativeBackend;
 
 /// Detail for [`Error::NotImplemented`] on Windows builds that are not x64.
@@ -95,11 +97,39 @@ impl Backend for PythonBackend {
     }
 
     fn start(&self, target: &Target, opts: &RecordOptions) -> Result<Box<dyn Session>, Error> {
+        if opts.duration.is_some_and(|duration| duration.is_zero()) {
+            return Err(Error::backend(
+                self.name(),
+                "profile duration must be greater than zero",
+            ));
+        }
+        if !sampler_implemented() {
+            return Err(Error::not_implemented(self.name(), NOT_IMPLEMENTED));
+        }
+        if !anyprof_core::process_exists(target.pid) {
+            return Err(Error::backend(
+                self.name(),
+                format!("pid {} is not running", target.pid),
+            ));
+        }
         // An unsupported build, or a Linux read the kernel refuses, stops
         // here. The native sampler is not asked to record interpreter frames
         // under this backend's name.
         anyprof_native::prepare_python(target.pid)?;
-        NativeBackend.start(target, opts).map_err(retarget)
+        let mut py_opts = opts.clone();
+        py_opts.language_unwind = LanguageUnwind::Python;
+        let inner = NativeBackend.start(target, &py_opts).map_err(retarget)?;
+        Ok(Box::new(RetargetSession { inner }))
+    }
+}
+
+struct RetargetSession {
+    inner: Box<dyn Session>,
+}
+
+impl Session for RetargetSession {
+    fn stop(self: Box<Self>) -> Result<anyprof_core::Profile, Error> {
+        self.inner.stop().map_err(retarget)
     }
 }
 

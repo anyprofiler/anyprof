@@ -38,7 +38,9 @@
 
 use std::time::Duration;
 
-use anyprof_core::{Backend, Capabilities, Error, Format, RecordOptions, Session, Target};
+use anyprof_core::{
+    Backend, Capabilities, Error, Format, LanguageUnwind, RecordOptions, Session, Target,
+};
 use anyprof_native::NativeBackend;
 
 /// Detail for [`Error::NotImplemented`] on Windows builds that are not x64.
@@ -122,7 +124,20 @@ impl Backend for JavaBackend {
         // here. The native sampler is not asked to record libjvm frames
         // under this backend's name.
         anyprof_native::prepare_java(target.pid)?;
-        NativeBackend.start(target, opts).map_err(retarget)
+        let mut java_opts = opts.clone();
+        java_opts.language_unwind = LanguageUnwind::Java;
+        let inner = NativeBackend.start(target, &java_opts).map_err(retarget)?;
+        Ok(Box::new(RetargetSession { inner }))
+    }
+}
+
+struct RetargetSession {
+    inner: Box<dyn Session>,
+}
+
+impl Session for RetargetSession {
+    fn stop(self: Box<Self>) -> Result<anyprof_core::Profile, Error> {
+        self.inner.stop().map_err(retarget)
     }
 }
 

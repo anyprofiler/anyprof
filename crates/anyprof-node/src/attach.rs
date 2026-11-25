@@ -171,18 +171,7 @@ fn activate_inspector(pid: u32) -> Result<(), String> {
 
 #[cfg(unix)]
 fn signal_sigusr1(pid: u32) -> Result<(), String> {
-    let status = std::process::Command::new("kill")
-        .args(["-USR1", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|err| format!("running kill -USR1: {err}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("kill -USR1 {pid} failed ({status})"))
-    }
+    anyprof_core::send_sigusr1(pid)
 }
 
 #[cfg(windows)]

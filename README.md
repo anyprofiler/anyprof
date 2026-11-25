@@ -45,7 +45,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/anyprofiler/anypro
 anyprof update
 ```
 
-**Build from source** (requires Rust 1.88+):
+**Build from source** (requires Rust 1.88+; omits the `self-update` HTTP/TLS stack by default):
 
 ```bash
 cargo install --git https://github.com/anyprofiler/anyprof anyprof-cli
@@ -92,7 +92,7 @@ anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 | `-F, --frequency <HZ>` | Sampling rate (`1`–`1000000` Hz). Mutually exclusive with `--interval`. |
 | `--interval <DURATION>` | Sampling period (e.g. `100us`, `1ms`, `10ms`). Mutually exclusive with `-F`. |
 | `-k, --kernel` | Include kernel stack frames (supported on Linux `x86_64` & `aarch64`). |
-| `-b, --backend <NAME>` | Force backend: `node`, `browser`, `rust`, `go`, `python`, `java`, or `native`. |
+| `-b, --backend <NAME>` | Force backend: `node`, `browser`, `rust`, `go`, `python`, `java`, or `native` (`-b native` keeps raw C/C++ frames without VM stack replacement). |
 | `-w, --web` | Open the recorded profile in the built-in viewer after saving. |
 | `-v`, `-vv`, `-vvv` | Increase log verbosity (`info`, `debug`, `trace`; also respects `RUST_LOG`). |
 

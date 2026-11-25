@@ -40,27 +40,50 @@ const CLOSE_INSPECTOR_EXPR: &str = r#"(() => {
   }
 })()"#;
 
-/// Run the V8 CPU profiler and return the `.cpuprofile` JSON object.
+/// Active background V8 CPU profiling session over the Chrome DevTools Protocol.
 ///
-/// `expected_pid`, when set, is checked with `Runtime.evaluate` of `process.pid`
-/// before sampling starts. A mismatch is an error: the websocket often belongs
-/// to a different Node process that is already listening on port 9229.
-///
-/// `interval_us` is V8's sampling interval in microseconds (`Profiler.setSamplingInterval`
-/// is called before `Profiler.start`). Sampling ends when `duration` elapses, or
-/// sooner when `stop` is signaled. `None` waits until `stop`. `Profiler.stop`
-/// and `Profiler.disable` run on every path after `Profiler.start`, including
-/// errors, so the target is not left with the profiler attached. When
-/// `close_inspector` is true, `inspector.close()` is evaluated afterwards so a
-/// Node.js inspector that anyprof activated does not remain open.
-pub fn capture_cpu_profile(
+/// Created by [`start_cpu_profile`] after `Profiler.start` succeeds. Dropping
+/// the session without calling [`Self::stop`] signals the background worker and
+/// waits for `Profiler.stop` / `Profiler.disable` (and optional inspector close)
+/// so the target process is never left with an active profiler attached.
+pub struct CdpSession {
+    session_stop: std::sync::Arc<StopGate>,
+    worker: Option<thread::JoinHandle<Result<Vec<u8>, Error>>>,
+}
+
+impl CdpSession {
+    /// End sampling, detach the V8 profiler, and return the raw `.cpuprofile` JSON.
+    pub fn stop(mut self) -> Result<Vec<u8>, Error> {
+        self.session_stop.request_stop();
+        let handle = self
+            .worker
+            .take()
+            .expect("worker handle present until stop or drop");
+        handle
+            .join()
+            .map_err(|_| Error::message("CDP profiler background thread panicked"))?
+    }
+}
+
+impl Drop for CdpSession {
+    fn drop(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            self.session_stop.request_stop();
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Connect to `websocket_url`, verify `expected_pid` when set, start V8's CPU
+/// profiler synchronously, and spawn the background reader/timer session.
+pub fn start_cpu_profile(
     websocket_url: &str,
     duration: Option<Duration>,
     interval_us: u32,
     expected_pid: Option<u32>,
     close_inspector: bool,
-    stop: &StopGate,
-) -> Result<Vec<u8>, Error> {
+    stop: std::sync::Arc<StopGate>,
+) -> Result<CdpSession, Error> {
     if duration.is_some_and(|duration| duration.is_zero()) {
         return Err(Error::message("profile duration must be greater than zero"));
     }
@@ -99,23 +122,68 @@ pub fn capture_cpu_profile(
         return Err(err);
     }
     tracing::info!(%websocket_url, ?duration, interval_us, "CPU profiler started");
-    let waited = wait_for_samples(&mut socket, duration, stop);
-    // Stop even when the wait failed, and before returning, so Ctrl+C and
-    // websocket errors both detach the profiler.
-    stop.begin_stopping();
-    let stopped = rpc.call(&mut socket, "Profiler.stop", json!({}));
-    let _ = rpc.call(&mut socket, "Profiler.disable", json!({}));
-    if close_inspector {
-        close_node_inspector(&mut rpc, &mut socket, websocket_url);
+
+    let session_stop = StopGate::new();
+    let worker_session_stop = std::sync::Arc::clone(&session_stop);
+    let url_owned = websocket_url.to_string();
+    let worker = thread::Builder::new()
+        .name("anyprof-cdp".to_string())
+        .spawn(move || -> Result<Vec<u8>, Error> {
+            let waited = wait_for_samples(&mut socket, duration, &stop, &worker_session_stop);
+            // Stop even when the wait failed, and before returning, so Ctrl+C and
+            // websocket errors both detach the profiler.
+            stop.begin_stopping();
+            let stopped = rpc.call(&mut socket, "Profiler.stop", json!({}));
+            let _ = rpc.call(&mut socket, "Profiler.disable", json!({}));
+            if close_inspector {
+                close_node_inspector(&mut rpc, &mut socket, &url_owned);
+            }
+            waited?;
+            let stopped = stopped?;
+            let profile = stopped
+                .get("profile")
+                .cloned()
+                .ok_or_else(|| Error::message("Profiler.stop did not return a profile"))?;
+            serde_json::to_vec(&profile)
+                .map_err(|err| Error::message(format!("encoding cpuprofile JSON: {err}")))
+        })
+        .map_err(|err| Error::message(format!("spawning CDP profiler thread: {err}")))?;
+
+    Ok(CdpSession {
+        session_stop,
+        worker: Some(worker),
+    })
+}
+
+/// Run the V8 CPU profiler synchronously for `duration` (or until `stop`) and
+/// return the `.cpuprofile` JSON object.
+pub fn capture_cpu_profile(
+    websocket_url: &str,
+    duration: Option<Duration>,
+    interval_us: u32,
+    expected_pid: Option<u32>,
+    close_inspector: bool,
+    stop: &StopGate,
+) -> Result<Vec<u8>, Error> {
+    let proxy_stop = StopGate::new();
+    let session = start_cpu_profile(
+        websocket_url,
+        duration,
+        interval_us,
+        expected_pid,
+        close_inspector,
+        std::sync::Arc::clone(&proxy_stop),
+    )?;
+    let started = Instant::now();
+    while keep_sampling(started.elapsed(), duration, stop.stop_requested()) {
+        thread::sleep(Duration::from_millis(20));
     }
-    waited?;
-    let stopped = stopped?;
-    let profile = stopped
-        .get("profile")
-        .cloned()
-        .ok_or_else(|| Error::message("Profiler.stop did not return a profile"))?;
-    serde_json::to_vec(&profile)
-        .map_err(|err| Error::message(format!("encoding cpuprofile JSON: {err}")))
+    if stop.stop_requested() {
+        proxy_stop.request_stop();
+    }
+    let res = session.stop();
+    stop.begin_stopping();
+    res
 }
 
 fn close_node_inspector(
@@ -229,6 +297,7 @@ fn wait_for_samples(
     socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
     duration: Option<Duration>,
     stop: &StopGate,
+    session_stop: &StopGate,
 ) -> Result<(), Error> {
     if let Some(tcp) = plain_tcp(socket.get_mut()) {
         tcp.set_nonblocking(true)?;
@@ -236,7 +305,8 @@ fn wait_for_samples(
     let started = Instant::now();
     let result = (|| {
         loop {
-            if !keep_sampling(started.elapsed(), duration, stop.stop_requested()) {
+            let stop_requested = stop.stop_requested() || session_stop.stop_requested();
+            if !keep_sampling(started.elapsed(), duration, stop_requested) {
                 return Ok(());
             }
             // Bind the read so the message's drop order does not depend on the edition.
@@ -259,7 +329,7 @@ fn wait_for_samples(
                         ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
                     ) =>
                 {
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(20));
                 }
                 Err(err) => return Err(Error::message(format!("websocket read: {err}"))),
             }

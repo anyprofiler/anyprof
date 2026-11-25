@@ -126,8 +126,10 @@ dependencies = [
 name = "anyprof-core"
 version = "0.1.10"
 dependencies = [
+ "libc",
  "thiserror",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -149,7 +151,6 @@ dependencies = [
  "anyprof-export",
  "anyprof-native",
  "tracing",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -173,6 +174,7 @@ dependencies = [
  "framehop",
  "libc",
  "mach2",
+ "object",
  "pdb",
  "rustc-demangle",
  "tracing",
@@ -208,7 +210,6 @@ dependencies = [
  "anyprof-export",
  "anyprof-native",
  "tracing",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1412,6 +1413,15 @@ dependencies = [
  "bitflags 2.13.2",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "object"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11dbdb66876026054e4ffc8d757d862bdf5df5aebd5c0b95a41f17832a94f7d2"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

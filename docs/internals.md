@@ -6,6 +6,7 @@ This document captures the low-level sampling, stack-unwinding, symbol-resolutio
 
 - **Leaf-first internal stacks**: `Profile::stacks` stores frames from `frames[0]` (on-CPU leaf) to the root frame, matching `pprof`. Exporters for root-first formats (`collapsed` and `speedscope`) reverse frame order on write.
 - **Runtime prefixes**: Non-native frames carry a `[runtime] name` prefix (`[node]`, `[browser]`, `[rust]`, `[go]`, `[python]`, `[java]`, `[kernel]`) across `collapsed`, `speedscope`, `pprof`, and rebuilt `.cpuprofile` exports so mixed-language stacks preserve frame provenance. Raw V8 `.cpuprofile` captures from `Profiler.stop` are written verbatim.
+- **Non-blocking `Session` lifecycle & `LanguageUnwind`**: `Backend::start` validates target permissions/attach synchronously and runs sampling on a background worker thread until `Session::stop()` collects the finished `Profile` (or `Drop` signals cooperative cancellation and detaches cleanly). `RecordOptions::language_unwind` (`None`, `Go`, `Python`, `Java`, `Auto`) controls whether `NativeBackend` preserves raw C/C++ VM frames (`-b native`) or delegates frame replacement to a language runtime walker.
 
 ## Platform Native Samplers (`anyprof-native`)
 

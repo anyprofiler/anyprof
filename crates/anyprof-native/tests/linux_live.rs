@@ -53,16 +53,17 @@ fn samples_a_busy_cpp_program() {
         let _ = child.wait();
         return;
     };
+    std::thread::sleep(Duration::from_millis(500));
     let during = read_counter(&counter);
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(500));
     let after = read_counter(&counter);
     let state = proc_state(pid);
-    let _ = child.kill();
-    let _ = child.wait();
 
     let profile = session
         .stop()
         .unwrap_or_else(|err| panic!("stop failed: {err}\nsymbols:\n{}", nm_symbols(&binary)));
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(
         during > before && after > during,
         "the target must keep running during and after the profile (before {before}, during {during}, after {after}, state {state:?})"
@@ -155,9 +156,10 @@ fn samples_an_optimized_fp_less_cpp_program() {
         let _ = child.wait();
         return;
     };
+    std::thread::sleep(Duration::from_millis(800));
+    let profile = session.stop().expect("stop nofp");
     let _ = child.kill();
     let _ = child.wait();
-    let profile = session.stop().expect("stop nofp");
     assert!(
         profile.stacks.iter().any(|stack| {
             let has_leaf = stack.frames.iter().any(|f| f.name.contains("nofp_leaf"));
@@ -197,16 +199,17 @@ fn an_idle_process_does_not_invent_on_cpu_samples() {
             ..anyprof_core::RecordOptions::default()
         },
     );
-    let state = proc_state(pid);
-    let alive = anyprof_core::process_exists(pid);
     let Some(session) = accept_or_skip(started) else {
         let _ = child.kill();
         let _ = child.wait();
         return;
     };
+    std::thread::sleep(Duration::from_millis(500));
+    let state = proc_state(pid);
+    let alive = anyprof_core::process_exists(pid);
+    let profile = session.stop().expect("stop");
     let _ = child.kill();
     let _ = child.wait();
-    let profile = session.stop().expect("stop");
     let total = profile.total_weight();
     assert!(
         total <= 2,
@@ -256,15 +259,16 @@ fn both_running_threads_are_sampled() {
             ..anyprof_core::RecordOptions::default()
         },
     );
-    let state = proc_state(pid);
     let Some(session) = accept_or_skip(started) else {
         let _ = child.kill();
         let _ = child.wait();
         return;
     };
+    std::thread::sleep(Duration::from_secs(1));
+    let state = proc_state(pid);
+    let profile = session.stop().expect("stop");
     let _ = child.kill();
     let _ = child.wait();
-    let profile = session.stop().expect("stop");
     let a = weight_named(&profile, "spin_a");
     let b = weight_named(&profile, "spin_b");
     assert!(
@@ -306,11 +310,11 @@ fn kernel_frames_are_recorded_when_the_thread_is_in_the_kernel() {
             ..anyprof_core::RecordOptions::default()
         },
     );
-    let _ = child.kill();
-    let _ = child.wait();
     let session = match started {
         Ok(session) => session,
         Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
             let message = err.to_string();
             let blocked = message.contains("perf_event_open")
                 && (message.contains("paranoid") || message.contains("-k"));
@@ -322,7 +326,10 @@ fn kernel_frames_are_recorded_when_the_thread_is_in_the_kernel() {
             panic!("-k profile failed: {message}");
         }
     };
+    std::thread::sleep(Duration::from_millis(500));
     let profile = session.stop().expect("stop");
+    let _ = child.kill();
+    let _ = child.wait();
     let kernel: Vec<_> = profile
         .stacks
         .iter()
@@ -365,6 +372,7 @@ fn sampling_this_process_completes() {
     );
     match result {
         Ok(session) => {
+            std::thread::sleep(Duration::from_millis(100));
             let profile = session.stop().expect("stop");
             assert_eq!(profile.pid, std::process::id());
             assert!(profile.duration >= Duration::from_millis(50));
@@ -385,6 +393,41 @@ fn sampling_this_process_completes() {
             eprintln!("skipping self-sample: {message}");
         }
     }
+}
+
+#[test]
+fn async_session_samples_work_between_start_and_stop() {
+    let attach_start = Instant::now();
+    let result = anyprof_native::NativeBackend.start(
+        &anyprof_core::Target {
+            pid: std::process::id(),
+        },
+        &anyprof_core::RecordOptions {
+            duration: None,
+            sampling_interval: Some(Duration::from_millis(5)),
+            ..anyprof_core::RecordOptions::default()
+        },
+    );
+    let Some(session) = accept_or_skip(result) else {
+        return;
+    };
+    let attach_elapsed = attach_start.elapsed();
+    assert!(
+        attach_elapsed < Duration::from_secs(2),
+        "start(duration: None) must return immediately without blocking ({attach_elapsed:?})"
+    );
+    let deadline = Instant::now() + Duration::from_millis(180);
+    let mut acc = 1u64;
+    while Instant::now() < deadline {
+        acc = std::hint::black_box(acc.wrapping_mul(6364136223846793005).wrapping_add(1));
+    }
+    std::hint::black_box(acc);
+    let profile = session.stop().expect("stop embedded session");
+    assert_eq!(profile.pid, std::process::id());
+    assert!(
+        profile.total_weight() > 0,
+        "embedded start() -> work() -> stop() must capture samples"
+    );
 }
 
 #[test]
@@ -454,12 +497,13 @@ fn an_unrelated_same_user_process_follows_perf_not_ptrace_scope() {
             ..anyprof_core::RecordOptions::default()
         },
     );
-    let state = proc_state(pid);
     let scope = read_i32("/proc/sys/kernel/yama/ptrace_scope");
-    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
     match started {
         Ok(session) => {
+            std::thread::sleep(Duration::from_millis(100));
+            let state = proc_state(pid);
             let profile = session.stop().expect("stop");
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             assert_eq!(profile.pid, pid);
             assert!(
                 profile.duration >= Duration::from_millis(50),
@@ -472,6 +516,7 @@ fn an_unrelated_same_user_process_follows_perf_not_ptrace_scope() {
             );
         }
         Err(err) => {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             let message = err.to_string();
             if message.contains("perf_event_open") && !native_required() {
                 eprintln!(

@@ -49,21 +49,23 @@ pub(crate) struct PythonImage {
 /// Reads the three CPython symbols from `path`.
 pub(crate) fn exports(path: &Path) -> Option<PythonImage> {
     let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).ok()?;
     file.seek(SeekFrom::Start(0)).ok()?;
     let le = u32::from_le_bytes(magic);
     let be = u32::from_be_bytes(magic);
+    let cache = object::ReadCache::new(file);
     if le == 0x464c_457f {
-        return elf_exports(&mut file);
+        return elf_exports(&cache);
     }
     if le == 0xFEED_FACF || be == 0xCAFE_BABE {
-        return macho_exports(&mut file);
+        return macho_exports(&cache, len);
     }
     // A DOS header is `MZ` (`4D 5A`), usually followed by `0x90`. The
     // little-endian word is `0x00905A4D`, not `0x00005A4D`.
     if magic[0] == b'M' && magic[1] == b'Z' {
-        return pe_exports(&mut file);
+        return pe_exports(&cache);
     }
     None
 }
@@ -71,49 +73,42 @@ pub(crate) fn exports(path: &Path) -> Option<PythonImage> {
 /// Mach-O load commands that name a Python runtime library.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn linked_python_libraries(path: &Path) -> Vec<std::path::PathBuf> {
-    let Ok(mut file) = File::open(path) else {
+    use object::LittleEndian;
+    use object::macho;
+    use object::read::macho::LoadCommandVariant;
+
+    let Ok(file) = File::open(path) else {
         return Vec::new();
     };
-    let Some((offset, _)) = macho_slice(&mut file) else {
+    let Ok(meta) = file.metadata() else {
         return Vec::new();
     };
-    let Some((commands, ncmds)) = macho_commands(&mut file, offset) else {
+    let cache = object::ReadCache::new(file);
+    let Some((slice_off, slice_size)) =
+        crate::binfmt::macho_slice(&cache, meta.len(), crate::binfmt::macho_host_cputype())
+    else {
+        return Vec::new();
+    };
+    let slice_ref = cache.range(slice_off, slice_size);
+    let Some((_, mut commands)) = crate::binfmt::macho_commands(slice_ref, MAX_COMMAND_BYTES)
+    else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut cursor = 0usize;
-    for _ in 0..ncmds {
-        if commands.len() < cursor + 8 {
-            break;
-        }
-        let cmd = u32::from_le_bytes(commands[cursor..cursor + 4].try_into().unwrap_or([0; 4]));
-        let size = u32::from_le_bytes(
-            commands[cursor + 4..cursor + 8]
-                .try_into()
-                .unwrap_or([0; 4]),
-        ) as usize;
-        if size < 8 || cursor + size > commands.len() {
-            break;
-        }
-        // LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB.
-        if matches!(cmd, 0xC | 0x18 | 0x1F) && size >= 24 {
-            let name_off = u32::from_le_bytes(
-                commands[cursor + 8..cursor + 12]
-                    .try_into()
-                    .unwrap_or([0; 4]),
-            ) as usize;
-            if name_off >= 8 && name_off < size {
-                let bytes = &commands[cursor + name_off..cursor + size];
-                let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-                let name = String::from_utf8_lossy(&bytes[..end]);
-                if name_mentions_python(&name)
-                    && let Some(resolved) = resolve_install_name(path, &name)
-                {
-                    out.push(resolved);
-                }
+    while let Ok(Some(cmd)) = commands.next() {
+        if matches!(
+            cmd.cmd(),
+            macho::LC_LOAD_DYLIB | macho::LC_LOAD_WEAK_DYLIB | macho::LC_REEXPORT_DYLIB
+        ) && let Ok(LoadCommandVariant::Dylib(dylib)) = cmd.variant()
+            && let Ok(raw) = cmd.string(LittleEndian, dylib.dylib.name)
+        {
+            let name = String::from_utf8_lossy(raw);
+            if name_mentions_python(&name)
+                && let Some(resolved) = resolve_install_name(path, &name)
+            {
+                out.push(resolved);
             }
         }
-        cursor += size;
     }
     out
 }
@@ -142,117 +137,52 @@ fn resolve_install_name(binary: &Path, name: &str) -> Option<std::path::PathBuf>
     candidate.is_file().then_some(candidate)
 }
 
-fn read_at(file: &mut File, offset: u64, buf: &mut [u8]) -> Option<()> {
-    file.seek(SeekFrom::Start(offset)).ok()?;
-    file.read_exact(buf).ok()
-}
+fn elf_exports(cache: &object::ReadCache<File>) -> Option<PythonImage> {
+    use object::LittleEndian;
+    use object::elf;
+    use object::read::elf::Sym as _;
 
-fn read_vec(file: &mut File, offset: u64, len: usize) -> Option<Vec<u8>> {
-    if len > MAX_STRINGS as usize {
+    let parsed = crate::binfmt::parse_elf64(cache, MAX_SECTIONS as usize)?;
+    if parsed.loads.is_empty() || parsed.sections.is_empty() {
         return None;
     }
-    let mut buf = vec![0u8; len];
-    read_at(file, offset, &mut buf)?;
-    Some(buf)
-}
-
-fn elf_exports(file: &mut File) -> Option<PythonImage> {
-    let mut ident = [0u8; 16];
-    read_at(file, 0, &mut ident)?;
-    if ident[4] != 2 || ident[5] != 1 {
-        return None;
-    }
-    let mut header = [0u8; 64];
-    read_at(file, 0, &mut header)?;
-    let phoff = u64::from_le_bytes(header[32..40].try_into().ok()?);
-    let shoff = u64::from_le_bytes(header[40..48].try_into().ok()?);
-    let phentsize = u16::from_le_bytes(header[54..56].try_into().ok()?);
-    let phnum = u16::from_le_bytes(header[56..58].try_into().ok()?);
-    let shentsize = u16::from_le_bytes(header[58..60].try_into().ok()?);
-    let mut shnum = u64::from(u16::from_le_bytes(header[60..62].try_into().ok()?));
-    let mut shstrndx = u64::from(u16::from_le_bytes(header[62..64].try_into().ok()?));
-    if phentsize < 56 || phnum == 0 || phnum > 512 || shentsize < 64 || shoff == 0 {
-        return None;
-    }
-    let loads = elf_loads(file, phoff, phentsize, phnum)?;
-    if shnum == 0 {
-        let mut zero = [0u8; 64];
-        read_at(file, shoff, &mut zero)?;
-        shnum = u64::from_le_bytes(zero[32..40].try_into().ok()?);
-        if shstrndx == 0xffff {
-            shstrndx = u64::from(u32::from_le_bytes(zero[40..44].try_into().ok()?));
-        }
-    }
-    if shnum == 0 || shnum > MAX_SECTIONS || shstrndx >= shnum {
-        return None;
-    }
-    let section_bytes = usize::try_from(shnum)
-        .ok()?
-        .checked_mul(usize::from(shentsize))?;
-    let sections = read_vec(file, shoff, section_bytes)?;
+    let loads = parsed.loads;
     let mut runtime = None;
     let mut version = None;
     let mut eval = None;
     let mut eval_size = 0u64;
-    for index in 0..shnum {
-        let start = usize::try_from(index).ok()? * usize::from(shentsize);
-        let row = sections.get(start..start + 64)?;
-        let kind = u32::from_le_bytes(row[4..8].try_into().ok()?);
-        // SHT_DYNSYM and SHT_SYMTAB. Ubuntu's interpreter keeps only the first.
-        if kind != 11 && kind != 2 {
-            continue;
-        }
-        let offset = u64::from_le_bytes(row[24..32].try_into().ok()?);
-        let size = u64::from_le_bytes(row[32..40].try_into().ok()?);
-        let link = u32::from_le_bytes(row[40..44].try_into().ok()?);
-        let entsize = u64::from_le_bytes(row[56..64].try_into().ok()?);
-        if entsize < 24 || u64::from(link) >= shnum {
-            continue;
-        }
-        let count = size / entsize;
-        if count == 0 || count > u64::from(MAX_SYMBOLS) {
-            continue;
-        }
-        let str_row = sections
-            .get(usize::try_from(link).ok()? * usize::from(shentsize)..)?
-            .get(..64)?;
-        let str_off = u64::from_le_bytes(str_row[24..32].try_into().ok()?);
-        let str_size = u64::from_le_bytes(str_row[32..40].try_into().ok()?);
-        if str_size == 0 || str_size > u64::from(MAX_STRINGS) {
-            continue;
-        }
-        let strings = read_vec(file, str_off, usize::try_from(str_size).ok()?)?;
-        let symbols = read_vec(file, offset, usize::try_from(count * entsize).ok()?)?;
-        for sym in 0..count {
-            let at = usize::try_from(sym * entsize).ok()?;
-            let entry = symbols.get(at..at + 24)?;
-            let name_off = u32::from_le_bytes(entry[0..4].try_into().ok()?) as usize;
-            let info = entry[4];
-            let shndx = u16::from_le_bytes(entry[6..8].try_into().ok()?);
-            let value = u64::from_le_bytes(entry[8..16].try_into().ok()?);
-            let sym_size = u64::from_le_bytes(entry[16..24].try_into().ok()?);
-            let kind = info & 0xf;
-            if shndx == 0 || value == 0 || !matches!(kind, 1 | 2 | 10) {
-                continue;
-            }
-            let Some(name) = c_string(&strings, name_off) else {
-                continue;
-            };
-            if name == RUNTIME {
-                let Some(file_off) = file_offset(&loads, value) else {
-                    continue;
-                };
-                runtime = Some((value, file_off));
-            } else if name == VERSION {
-                let Some(file_off) = file_offset(&loads, value) else {
-                    continue;
-                };
-                version = Some((value, file_off));
-            } else if name == EVAL {
-                eval = Some(value);
-                eval_size = sym_size;
-            }
-        }
+    for section_type in [elf::SHT_DYNSYM, elf::SHT_SYMTAB] {
+        crate::binfmt::visit_elf64_symbols(
+            cache,
+            &parsed.sections,
+            section_type,
+            MAX_SYMBOLS as usize,
+            u64::from(MAX_STRINGS),
+            |name, sym| {
+                let shndx = sym.st_shndx(LittleEndian);
+                let value = sym.st_value(LittleEndian);
+                let sym_size = sym.st_size(LittleEndian);
+                let kind = sym.st_type();
+                if shndx == elf::SHN_UNDEF
+                    || value == 0
+                    || !matches!(kind, elf::STT_OBJECT | elf::STT_FUNC | elf::STT_GNU_IFUNC)
+                {
+                    return;
+                }
+                if name == RUNTIME {
+                    if let Some(file_off) = file_offset(&loads, value) {
+                        runtime = Some((value, file_off));
+                    }
+                } else if name == VERSION {
+                    if let Some(file_off) = file_offset(&loads, value) {
+                        version = Some((value, file_off));
+                    }
+                } else if name == EVAL {
+                    eval = Some(value);
+                    eval_size = sym_size;
+                }
+            },
+        );
     }
     let (runtime, runtime_file) = runtime?;
     let (version, version_file) = match version {
@@ -273,25 +203,6 @@ fn elf_exports(file: &mut File) -> Option<PythonImage> {
     })
 }
 
-fn elf_loads(file: &mut File, phoff: u64, entsize: u16, phnum: u16) -> Option<Vec<LoadSegment>> {
-    let bytes = read_vec(file, phoff, usize::from(phnum) * usize::from(entsize))?;
-    let mut loads = Vec::new();
-    for index in 0..phnum {
-        let start = usize::from(index) * usize::from(entsize);
-        let row = bytes.get(start..start + 56)?;
-        let kind = u32::from_le_bytes(row[0..4].try_into().ok()?);
-        if kind != 1 {
-            continue;
-        }
-        loads.push(LoadSegment {
-            offset: u64::from_le_bytes(row[8..16].try_into().ok()?),
-            vaddr: u64::from_le_bytes(row[16..24].try_into().ok()?),
-            filesz: u64::from_le_bytes(row[32..40].try_into().ok()?),
-        });
-    }
-    (!loads.is_empty()).then_some(loads)
-}
-
 fn file_offset(loads: &[LoadSegment], vaddr: u64) -> Option<u64> {
     loads.iter().find_map(|load| {
         if vaddr >= load.vaddr && vaddr < load.vaddr.saturating_add(load.filesz) {
@@ -302,140 +213,78 @@ fn file_offset(loads: &[LoadSegment], vaddr: u64) -> Option<u64> {
     })
 }
 
-fn c_string(bytes: &[u8], offset: usize) -> Option<&str> {
-    let rest = bytes.get(offset..)?;
-    let end = rest.iter().position(|b| *b == 0)?;
-    std::str::from_utf8(&rest[..end]).ok()
-}
+fn macho_exports(cache: &object::ReadCache<File>, len: u64) -> Option<PythonImage> {
+    use object::LittleEndian;
+    use object::macho;
+    use object::read::macho::{LoadCommandVariant, Nlist as _};
 
-fn macho_slice(file: &mut File) -> Option<(u64, u64)> {
-    let len = file.seek(SeekFrom::End(0)).ok()?;
-    let mut magic = [0u8; 4];
-    read_at(file, 0, &mut magic)?;
-    if u32::from_le_bytes(magic) == 0xFEED_FACF {
-        return Some((0, len));
-    }
-    if u32::from_be_bytes(magic) != 0xCAFE_BABE {
-        return None;
-    }
-    let mut count = [0u8; 4];
-    read_at(file, 4, &mut count)?;
-    let nfat = u32::from_be_bytes(count);
-    if nfat == 0 || nfat > 64 {
-        return None;
-    }
-    let want = host_cputype();
-    for index in 0..nfat {
-        let mut arch = [0u8; 20];
-        read_at(file, 8 + u64::from(index) * 20, &mut arch)?;
-        let cputype = u32::from_be_bytes(arch[0..4].try_into().ok()?);
-        let offset = u64::from(u32::from_be_bytes(arch[8..12].try_into().ok()?));
-        let size = u64::from(u32::from_be_bytes(arch[12..16].try_into().ok()?));
-        if cputype == want {
-            return Some((offset, size));
-        }
-    }
-    None
-}
-
-fn host_cputype() -> u32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        0x0100_000C
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        0x0100_0007
-    }
-}
-
-fn macho_commands(file: &mut File, slice: u64) -> Option<(Vec<u8>, usize)> {
-    let mut header = [0u8; 32];
-    read_at(file, slice, &mut header)?;
-    if u32::from_le_bytes(header[0..4].try_into().ok()?) != 0xFEED_FACF {
-        return None;
-    }
-    let ncmds = u32::from_le_bytes(header[16..20].try_into().ok()?);
-    let sizeofcmds = u32::from_le_bytes(header[20..24].try_into().ok()?);
-    if ncmds == 0 || ncmds > MAX_COMMANDS || sizeofcmds == 0 || sizeofcmds > MAX_COMMAND_BYTES {
-        return None;
-    }
-    let commands = read_vec(file, slice + 32, sizeofcmds as usize)?;
-    Some((commands, ncmds as usize))
-}
-
-fn macho_exports(file: &mut File) -> Option<PythonImage> {
-    let (slice, _) = macho_slice(file)?;
-    let (commands, ncmds) = macho_commands(file, slice)?;
+    let (slice_off, slice_size) =
+        crate::binfmt::macho_slice(cache, len, crate::binfmt::macho_host_cputype())?;
+    let slice_ref = cache.range(slice_off, slice_size);
+    let (_, mut commands) = crate::binfmt::macho_commands(slice_ref, MAX_COMMAND_BYTES)?;
     let mut text_vmaddr = None;
-    let mut symoff = 0u64;
-    let mut nsyms = 0u32;
-    let mut stroff = 0u64;
-    let mut strsize = 0u32;
-    let mut cursor = 0usize;
+    let mut symtab_cmd = None;
     let mut segments = Vec::new();
-    for _ in 0..ncmds {
-        if commands.len() < cursor + 8 {
+    let mut seen_cmds = 0u32;
+    while let Some(cmd) = commands.next().ok()? {
+        seen_cmds += 1;
+        if seen_cmds > MAX_COMMANDS {
             return None;
         }
-        let cmd = u32::from_le_bytes(commands[cursor..cursor + 4].try_into().ok()?);
-        let size = u32::from_le_bytes(commands[cursor + 4..cursor + 8].try_into().ok()?) as usize;
-        if size < 8 || cursor + size > commands.len() {
-            return None;
-        }
-        let data = &commands[cursor + 8..cursor + size];
-        if cmd == 0x19 && data.len() >= 64 {
-            let name = std::str::from_utf8(&data[0..16])
-                .ok()?
-                .trim_end_matches('\0');
-            let vmaddr = u64::from_le_bytes(data[16..24].try_into().ok()?);
-            let fileoff = u64::from_le_bytes(data[32..40].try_into().ok()?);
-            let filesize = u64::from_le_bytes(data[40..48].try_into().ok()?);
-            if name == "__TEXT" {
-                text_vmaddr = Some(vmaddr);
+        match cmd.variant().ok()? {
+            LoadCommandVariant::Segment64(seg, _) => {
+                let name = crate::binfmt::macho_name(&seg.segname);
+                let vmaddr = seg.vmaddr.get(LittleEndian);
+                let fileoff = seg.fileoff.get(LittleEndian);
+                let filesize = seg.filesize.get(LittleEndian);
+                if name == "__TEXT" {
+                    text_vmaddr = Some(vmaddr);
+                }
+                segments.push((vmaddr, fileoff, filesize));
             }
-            segments.push((vmaddr, fileoff, filesize));
-        } else if cmd == 0x2 && data.len() >= 16 {
-            symoff = u64::from(u32::from_le_bytes(data[0..4].try_into().ok()?));
-            nsyms = u32::from_le_bytes(data[4..8].try_into().ok()?);
-            stroff = u64::from(u32::from_le_bytes(data[8..12].try_into().ok()?));
-            strsize = u32::from_le_bytes(data[12..16].try_into().ok()?);
+            LoadCommandVariant::Symtab(symtab) => {
+                symtab_cmd = Some(symtab);
+            }
+            _ => {}
         }
-        cursor += size;
     }
+    let symtab_cmd = symtab_cmd?;
+    let nsyms = symtab_cmd.nsyms.get(LittleEndian);
+    let strsize = symtab_cmd.strsize.get(LittleEndian);
     if nsyms == 0 || nsyms > MAX_SYMBOLS || strsize == 0 || strsize > MAX_STRINGS {
         return None;
     }
-    let strings = read_vec(file, slice + stroff, strsize as usize)?;
-    let symbols = read_vec(file, slice + symoff, nsyms as usize * 16)?;
+    let symtab = symtab_cmd
+        .symbols::<macho::MachHeader64<LittleEndian>, _>(LittleEndian, slice_ref)
+        .ok()?;
+    let strings = symtab.strings();
     let mut values = Vec::new();
     let mut runtime = None;
     let mut version = None;
     let mut eval = None;
-    for index in 0..nsyms as usize {
-        let entry = symbols.get(index * 16..index * 16 + 16)?;
-        let strx = u32::from_le_bytes(entry[0..4].try_into().ok()?) as usize;
-        let n_type = entry[4];
-        let n_sect = entry[5];
-        let value = u64::from_le_bytes(entry[8..16].try_into().ok()?);
+    for entry in symtab.symbols() {
+        let n_type = entry.n_type().0;
+        let n_sect = entry.n_sect();
+        let value = entry.n_value(LittleEndian);
         if n_type & 0xe0 != 0 || n_type & 0x0e != 0x0e || n_sect == 0 || value == 0 {
             continue;
         }
         values.push(value);
-        let Some(name) = c_string(&strings, strx) else {
+        let Ok(raw_name) = entry.name(LittleEndian, strings) else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(raw_name) else {
             continue;
         };
         let name = name.strip_prefix('_').unwrap_or(name);
         if name == RUNTIME {
-            let Some(file_off) = macho_file_offset(slice, &segments, value) else {
-                continue;
-            };
-            runtime = Some((value, file_off));
+            if let Some(file_off) = macho_file_offset(slice_off, &segments, value) {
+                runtime = Some((value, file_off));
+            }
         } else if name == VERSION {
-            let Some(file_off) = macho_file_offset(slice, &segments, value) else {
-                continue;
-            };
-            version = Some((value, file_off));
+            if let Some(file_off) = macho_file_offset(slice_off, &segments, value) {
+                version = Some((value, file_off));
+            }
         } else if name == EVAL {
             eval = Some(value);
         }
@@ -487,107 +336,23 @@ fn next_gap(sorted: &[u64], value: u64) -> u64 {
     }
 }
 
-fn pe_exports(file: &mut File) -> Option<PythonImage> {
-    let mut dos = [0u8; 0x40];
-    read_at(file, 0, &mut dos)?;
-    let e_lfanew = u32::from_le_bytes(dos[0x3c..0x40].try_into().ok()?) as u64;
-    let mut sig = [0u8; 4];
-    read_at(file, e_lfanew, &mut sig)?;
-    if sig != [b'P', b'E', 0, 0] {
-        return None;
-    }
-    let mut coff = [0u8; 20];
-    read_at(file, e_lfanew + 4, &mut coff)?;
-    let nsections = u16::from_le_bytes(coff[2..4].try_into().ok()?);
-    let optsize = u16::from_le_bytes(coff[16..18].try_into().ok()?);
-    if nsections == 0 || nsections > 128 || optsize < 112 {
-        return None;
-    }
-    let optional = read_vec(file, e_lfanew + 24, usize::from(optsize))?;
-    if u16::from_le_bytes(optional[0..2].try_into().ok()?) != 0x20b {
-        return None;
-    }
-    let image_base = u64::from_le_bytes(optional.get(24..32)?.try_into().ok()?);
-    let export_rva = u32::from_le_bytes(optional.get(112..116)?.try_into().ok()?) as u64;
-    let export_size = u32::from_le_bytes(optional.get(116..120)?.try_into().ok()?) as u64;
-    if export_rva == 0 || export_size < 40 {
-        return None;
-    }
-    let sections = read_vec(
-        file,
-        e_lfanew + 24 + u64::from(optsize),
-        usize::from(nsections) * 40,
-    )?;
-    let mut mapped = Vec::new();
-    for index in 0..usize::from(nsections) {
-        let row = sections.get(index * 40..index * 40 + 40)?;
-        mapped.push(PeSection {
-            va: u32::from_le_bytes(row[12..16].try_into().ok()?) as u64,
-            virtual_size: u32::from_le_bytes(row[8..12].try_into().ok()?) as u64,
-            raw: u32::from_le_bytes(row[20..24].try_into().ok()?) as u64,
-            raw_size: u32::from_le_bytes(row[16..20].try_into().ok()?) as u64,
-        });
-    }
-    let export_off = pe_file_offset(&mapped, export_rva)?;
-    let mut dir = [0u8; 40];
-    read_at(file, export_off, &mut dir)?;
-    let nnames = u32::from_le_bytes(dir[24..28].try_into().ok()?);
-    let functions = u32::from_le_bytes(dir[28..32].try_into().ok()?) as u64;
-    let names = u32::from_le_bytes(dir[32..36].try_into().ok()?) as u64;
-    let ordinals = u32::from_le_bytes(dir[36..40].try_into().ok()?) as u64;
-    if nnames == 0 || nnames > MAX_SYMBOLS {
-        return None;
-    }
-    let names_off = pe_file_offset(&mapped, names)?;
-    let name_table = read_vec(file, names_off, nnames as usize * 4)?;
-    let ordinal_table = read_vec(
-        file,
-        pe_file_offset(&mapped, ordinals)?,
-        nnames as usize * 2,
-    )?;
+fn pe_exports(cache: &object::ReadCache<File>) -> Option<PythonImage> {
+    let pe = crate::binfmt::parse_pe64(cache, 128).ok()?;
+    let image_base = pe.image_base;
     let mut runtime = None;
     let mut version = None;
     let mut eval = None;
     let mut rvas = Vec::new();
-    for index in 0..nnames as usize {
-        let Some(name_bytes) = name_table.get(index * 4..index * 4 + 4) else {
-            continue;
+    crate::binfmt::walk_pe64_exports(cache, &pe, MAX_SYMBOLS, |name, rva, target_file_off| {
+        let rva_u64 = u64::from(rva);
+        rvas.push(rva_u64);
+        let Some(name) = name else {
+            return;
         };
-        let Some(ordinal_bytes) = ordinal_table.get(index * 2..index * 2 + 2) else {
-            continue;
+        let Some(file_off) = target_file_off else {
+            return;
         };
-        let name_rva = u32::from_le_bytes(name_bytes.try_into().unwrap()) as u64;
-        let ordinal = u16::from_le_bytes(ordinal_bytes.try_into().unwrap());
-        let Some(func_off) = pe_file_offset(&mapped, functions + u64::from(ordinal) * 4) else {
-            continue;
-        };
-        let mut rva_buf = [0u8; 4];
-        if read_at(file, func_off, &mut rva_buf).is_none() {
-            continue;
-        }
-        let rva = u32::from_le_bytes(rva_buf) as u64;
-        if rva == 0 || (rva >= export_rva && rva < export_rva + export_size) {
-            continue;
-        }
-        rvas.push(rva);
-        let Some(name_off) = pe_file_offset(&mapped, name_rva) else {
-            continue;
-        };
-        let mut name_buf = [0u8; 64];
-        if read_at(file, name_off, &mut name_buf).is_none() {
-            continue;
-        }
-        let end = name_buf
-            .iter()
-            .position(|b| *b == 0)
-            .unwrap_or(name_buf.len());
-        let Ok(name) = std::str::from_utf8(&name_buf[..end]) else {
-            continue;
-        };
-        let link = image_base.saturating_add(rva);
-        let Some(file_off) = pe_file_offset(&mapped, rva) else {
-            continue;
-        };
+        let link = image_base.saturating_add(rva_u64);
         if name == RUNTIME {
             runtime = Some((link, file_off));
         } else if name == VERSION {
@@ -595,7 +360,8 @@ fn pe_exports(file: &mut File) -> Option<PythonImage> {
         } else if name == EVAL {
             eval = Some(link);
         }
-    }
+    })
+    .ok()?;
     rvas.sort_unstable();
     rvas.dedup();
     let (runtime, runtime_file) = runtime?;
@@ -620,27 +386,14 @@ fn pe_exports(file: &mut File) -> Option<PythonImage> {
     })
 }
 
-struct PeSection {
-    va: u64,
-    virtual_size: u64,
-    raw: u64,
-    raw_size: u64,
-}
-
-fn pe_file_offset(sections: &[PeSection], rva: u64) -> Option<u64> {
-    sections.iter().find_map(|section| {
-        let span = section.virtual_size.max(section.raw_size);
-        if rva >= section.va && rva < section.va.saturating_add(span) {
-            Some(section.raw + (rva - section.va))
-        } else {
-            None
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_at(file: &mut File, offset: u64, buf: &mut [u8]) -> Option<()> {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        file.read_exact(buf).ok()
+    }
 
     #[test]
     fn windows_embed_dll_exports_the_runtime() {
@@ -731,6 +484,7 @@ mod tests {
         let optional = 0x98;
         bytes[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
         bytes[optional + 24..optional + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
+        bytes[optional + 108..optional + 112].copy_from_slice(&16u32.to_le_bytes());
         bytes[optional + 112..optional + 116].copy_from_slice(&0x200u32.to_le_bytes());
         bytes[optional + 116..optional + 120].copy_from_slice(&40u32.to_le_bytes());
         let section = 0x188;

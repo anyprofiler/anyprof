@@ -33,6 +33,7 @@
 //! Register this backend last. [`NativeBackend::detect`] is true for any live
 //! pid so it acts as the fallback when no language runtime matched.
 
+mod binfmt;
 mod dwarf_line;
 mod dyld_cache;
 mod elf;
@@ -107,7 +108,9 @@ impl Backend for NativeBackend {
         Capabilities {
             on_cpu: true,
             off_cpu: false,
-            mixed_stacks: false,
+            // Native stacks can mix C/C++ (`Runtime::Native`), demangled Rust
+            // shared libraries (`Runtime::Rust`), and Linux `-k` kernel frames.
+            mixed_stacks: true,
             // Kernel stacks exist only in the Linux x86_64/aarch64 perf sampler.
             // Other Linux architectures return not implemented from `start`
             // and do not advertise `-k`.
@@ -145,41 +148,16 @@ impl Backend for NativeBackend {
                 format!("pid {} is not running", target.pid),
             ));
         }
-        #[cfg(target_os = "macos")]
-        {
-            let profile = macos::record(target, opts)?;
-            tracing::info!(
-                pid = target.pid,
-                samples = profile.total_weight(),
-                stacks = profile.stacks.len(),
-                "native profile complete"
-            );
-            Ok(Box::new(ReadySession { profile }))
-        }
-        #[cfg(all(
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
+        #[cfg(any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(windows, target_arch = "x86_64"),
         ))]
         {
-            let profile = linux::record(target, opts)?;
-            tracing::info!(
-                pid = target.pid,
-                samples = profile.total_weight(),
-                stacks = profile.stacks.len(),
-                "native profile complete"
-            );
-            Ok(Box::new(ReadySession { profile }))
-        }
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        {
-            let profile = windows::record(target, opts)?;
-            tracing::info!(
-                pid = target.pid,
-                samples = profile.total_weight(),
-                stacks = profile.stacks.len(),
-                "native profile complete"
-            );
-            Ok(Box::new(ReadySession { profile }))
+            spawn_native_session(*target, opts.clone())
         }
         #[cfg(not(any(
             target_os = "macos",
@@ -195,13 +173,114 @@ impl Backend for NativeBackend {
     }
 }
 
-struct ReadySession {
-    profile: anyprof_core::Profile,
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(windows, target_arch = "x86_64"),
+))]
+fn spawn_native_session(target: Target, opts: RecordOptions) -> Result<Box<dyn Session>, Error> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), Error>>(1);
+    let session_stop = anyprof_core::StopGate::new();
+    let worker_stop = std::sync::Arc::clone(&session_stop);
+    let pid = target.pid;
+    let worker = std::thread::Builder::new()
+        .name("anyprof-native".to_string())
+        .spawn(move || -> Result<anyprof_core::Profile, Error> {
+            #[cfg(target_os = "macos")]
+            let res = macos::record(&target, &opts, &worker_stop, &ready_tx);
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            let res = linux::record(&target, &opts, &worker_stop, &ready_tx);
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            let res = windows::record(&target, &opts, &worker_stop, &ready_tx);
+
+            if let Ok(ref profile) = res {
+                tracing::info!(
+                    pid,
+                    samples = profile.total_weight(),
+                    stacks = profile.stacks.len(),
+                    "native profile complete"
+                );
+            }
+            res
+        })
+        .map_err(|err| {
+            Error::backend("native", format!("spawning native sampler thread: {err}"))
+        })?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(Box::new(ActiveSession {
+            session_stop,
+            worker: Some(worker),
+        })),
+        Ok(Err(err)) => {
+            let _ = worker.join();
+            Err(err)
+        }
+        Err(_) => match worker.join() {
+            Ok(Err(err)) => Err(err),
+            Ok(Ok(_)) => Err(Error::backend(
+                "native",
+                "native sampler exited before signaling startup",
+            )),
+            Err(_) => Err(Error::backend("native", "native sampler thread panicked")),
+        },
+    }
 }
 
-impl Session for ReadySession {
-    fn stop(self: Box<Self>) -> Result<anyprof_core::Profile, Error> {
-        Ok(self.profile)
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(windows, target_arch = "x86_64"),
+))]
+struct ActiveSession {
+    session_stop: std::sync::Arc<anyprof_core::StopGate>,
+    worker: Option<std::thread::JoinHandle<Result<anyprof_core::Profile, Error>>>,
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(windows, target_arch = "x86_64"),
+))]
+impl Session for ActiveSession {
+    fn stop(mut self: Box<Self>) -> Result<anyprof_core::Profile, Error> {
+        self.session_stop.request_stop();
+        let handle = self
+            .worker
+            .take()
+            .expect("worker handle present until stop or drop");
+        handle
+            .join()
+            .map_err(|_| Error::backend("native", "native sampler thread panicked"))?
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(windows, target_arch = "x86_64"),
+))]
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            self.session_stop.request_stop();
+            let _ = handle.join();
+        }
     }
 }
 
@@ -257,7 +336,7 @@ mod tests {
         let caps = NativeBackend.capabilities();
         assert!(caps.on_cpu);
         assert!(!caps.off_cpu);
-        assert!(!caps.mixed_stacks);
+        assert!(caps.mixed_stacks);
         assert_eq!(caps.needs_root, cfg!(target_os = "macos"));
         assert_eq!(
             caps.kernel_frames,

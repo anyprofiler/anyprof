@@ -43,10 +43,9 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::ProcessStatus::GetModuleFileNameExW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessInformation, IsWow64Process2, OpenProcess, OpenProcessToken,
-    OpenThread, PROCESS_NAME_WIN32, PROCESS_PROTECTION_LEVEL_INFORMATION,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-    ProcessProtectionLevelInfo, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
-    THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    OpenThread, PROCESS_PROTECTION_LEVEL_INFORMATION, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, ProcessProtectionLevelInfo, ResumeThread,
+    SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
 use crate::policy::{self, DebugPrivilege, SampleCollector};
@@ -70,7 +69,12 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
+pub(crate) fn record(
+    target: &Target,
+    opts: &RecordOptions,
+    session_stop: &anyprof_core::StopGate,
+    ready_tx: &std::sync::mpsc::SyncSender<Result<(), Error>>,
+) -> Result<Profile, Error> {
     if opts.include_kernel {
         tracing::warn!(
             "ignoring -k/--kernel: the Windows native sampler collects user frames only"
@@ -89,18 +93,33 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
 
     let process = Process::open(target.pid)?;
     ensure_x64(process.handle, target.pid)?;
-    let symbols = Symbols::load(process.handle)?;
-    let mut go = load_go(process.handle);
-    let python = python::attach_process(process.handle);
-    let java = java::attach_process(process.handle, &mut |addr, buf| {
-        read_process(process.handle, addr, buf)
-    });
+    let symbols = Symbols::load(process.handle, target.pid)?;
+    let mut go = opts
+        .language_unwind
+        .allows_go()
+        .then(|| load_go(target.pid))
+        .flatten();
+    let python = opts
+        .language_unwind
+        .allows_python()
+        .then(|| python::attach_process(process.handle))
+        .flatten();
+    let java = opts
+        .language_unwind
+        .allows_java()
+        .then(|| {
+            java::attach_process(process.handle, &mut |addr, buf| {
+                read_process(process.handle, addr, buf)
+            })
+        })
+        .flatten();
+    let _ = ready_tx.send(Ok(()));
 
     let started = Instant::now();
     let mut next = started;
     let mut collector = SampleCollector::new();
     loop {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             break;
         }
         if opts
@@ -147,8 +166,9 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
                 next = end;
             }
         }
-        wait_until(next, opts);
+        wait_until(next, opts, session_stop);
     }
+    let elapsed = started.elapsed();
 
     let comm = inspect(target.pid).and_then(|snapshot| snapshot.comm);
     let profile = finish_profile(
@@ -157,11 +177,15 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         collector,
         process.handle,
         go.as_ref(),
-        started.elapsed(),
+        elapsed,
         interval,
     );
     drop(symbols);
     Ok(profile)
+}
+
+fn stop_requested(opts: &RecordOptions, session_stop: &anyprof_core::StopGate) -> bool {
+    opts.stop.stop_requested() || session_stop.stop_requested()
 }
 
 enum SampleFault {
@@ -223,7 +247,7 @@ struct Symbols {
 }
 
 impl Symbols {
-    fn load(process: HANDLE) -> Result<Self, Error> {
+    fn load(process: HANDLE, pid: u32) -> Result<Self, Error> {
         // Local debug info next to the image is loaded. These options stop
         // dbghelp from prompting, walking `_NT_SYMBOL_PATH`, or contacting a
         // symbol server. `SYMOPT_SECURE` is not set: it also disables
@@ -241,7 +265,7 @@ impl Symbols {
         // finds that name in this directory. The embedded absolute path, when
         // it still exists, is tried first, which is how a C/C++ PDB next to
         // its exe is loaded. The path is not a symbol server.
-        let search = exe_symbol_dir(process);
+        let search = exe_symbol_dir(pid);
         let search_ptr = search
             .as_ref()
             .map_or(std::ptr::null(), |path| path.as_ptr());
@@ -282,8 +306,8 @@ impl GoProc {
     }
 }
 
-fn load_go(process: HANDLE) -> Option<GoProc> {
-    let path = process_exe(process)?;
+fn load_go(pid: u32) -> Option<GoProc> {
+    let path = anyprof_core::executable_file(pid)?;
     let image = crate::go_sym::open_image(&path)?;
     let preferred = crate::go_sym::pe_image_base(&path).unwrap_or(0);
     let module = path
@@ -296,23 +320,6 @@ fn load_go(process: HANDLE) -> Option<GoProc> {
         preferred,
         module,
     })
-}
-
-fn process_exe(process: HANDLE) -> Option<std::path::PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-
-    let mut buf = vec![0u16; 32 * 1024];
-    let mut len = buf.len() as u32;
-    let ok = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
-    if ok == 0 || len == 0 {
-        return None;
-    }
-    let os = std::ffi::OsString::from_wide(&buf[..len as usize]);
-    if os.is_empty() {
-        None
-    } else {
-        Some(std::path::PathBuf::from(os))
-    }
 }
 
 fn go_frames(process: HANDLE, pc: u64, sp: u64, go: Option<&mut GoProc>) -> Option<Vec<u64>> {
@@ -902,23 +909,18 @@ fn module_file(process: HANDLE, addr: u64) -> Option<std::path::PathBuf> {
     }
 }
 
-fn exe_symbol_dir(process: HANDLE) -> Option<Vec<u16>> {
-    let mut buf = vec![0u16; 32768];
-    let mut len = buf.len() as u32;
-    let ok = unsafe {
-        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
-    };
-    if ok == FALSE || len == 0 {
+fn exe_symbol_dir(pid: u32) -> Option<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let exe = anyprof_core::executable_file(pid)?;
+    let parent = exe.parent()?;
+    if parent.as_os_str().is_empty() {
         return None;
     }
-    let path = &buf[..len as usize];
-    let slash = path
-        .iter()
-        .rposition(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))?;
-    if slash == 0 {
+    let mut dir: Vec<u16> = parent.as_os_str().encode_wide().collect();
+    if dir.is_empty() {
         return None;
     }
-    let mut dir = path[..slash].to_vec();
     dir.push(0);
     Some(dir)
 }
@@ -1056,9 +1058,9 @@ fn try_enable_debug_privilege() -> DebugPrivilege {
     }
 }
 
-fn wait_until(deadline: Instant, opts: &RecordOptions) {
+fn wait_until(deadline: Instant, opts: &RecordOptions, session_stop: &anyprof_core::StopGate) {
     while Instant::now() < deadline {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());

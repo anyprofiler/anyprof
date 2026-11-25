@@ -664,82 +664,80 @@ fn module_text_hit(
     None
 }
 
-fn elf_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
-    reader.seek(SeekFrom::Start(0)).ok()?;
-    let mut ehdr = [0u8; 64];
-    reader.read_exact(&mut ehdr).ok()?;
-    if ehdr[4] != 2 || ehdr[5] != 1 {
+fn elf_pclntab<R: Read + Seek>(reader: &mut R, _len: u64) -> Option<GoTables> {
+    use object::LittleEndian;
+    use object::read::elf::SectionHeader as _;
+
+    let cache = object::ReadCache::new(reader);
+    let parsed = crate::binfmt::parse_elf64(&cache, 10_000)?;
+    if parsed.sections.is_empty() {
         return None;
     }
-    let shoff = u64::from_le_bytes(ehdr[40..48].try_into().ok()?);
-    let shentsize = u16::from_le_bytes(ehdr[58..60].try_into().ok()?) as u64;
-    let mut shnum = u16::from_le_bytes(ehdr[60..62].try_into().ok()?) as u64;
-    let shstrndx = u16::from_le_bytes(ehdr[62..64].try_into().ok()?) as u64;
-    if shentsize < 64 || shoff == 0 || shnum > 10_000 {
-        return None;
-    }
-    if shnum == 0 {
-        shnum = read_u64_at(reader, shoff + 4 * 8, len).unwrap_or(0);
-    }
-    if shstrndx >= shnum {
-        return None;
-    }
-    let str_hdr = shoff.checked_add(shstrndx.checked_mul(shentsize)?)?;
-    let str_off = read_u64_at(reader, str_hdr + 24, len)?;
-    let str_size = read_u64_at(reader, str_hdr + 32, len)?;
-    if str_size > MAX_TABLE {
-        return None;
-    }
-    let mut strings = vec![0u8; str_size as usize];
-    reader.seek(SeekFrom::Start(str_off)).ok()?;
-    reader.read_exact(&mut strings).ok()?;
     let mut text_span = None;
-    let mut pcln = None;
-    let mut module = None;
-    for index in 0..shnum {
-        let hdr = shoff.checked_add(index.checked_mul(shentsize)?)?;
-        reader.seek(SeekFrom::Start(hdr)).ok()?;
-        let mut buf = [0u8; 64];
-        reader.read_exact(&mut buf).ok()?;
-        let name_off = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
-        let name = cstr_at(&strings, name_off)?;
-        let addr = u64::from_le_bytes(buf[16..24].try_into().ok()?);
-        let off = u64::from_le_bytes(buf[24..32].try_into().ok()?);
-        let size = u64::from_le_bytes(buf[32..40].try_into().ok()?);
+    let mut pcln_sec = None;
+    let mut module_sec = None;
+    for sec in parsed.sections.iter() {
+        let Ok(raw_name) = parsed.sections.section_name(LittleEndian, sec) else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(raw_name) else {
+            continue;
+        };
+        let addr = sec.sh_addr(LittleEndian);
+        let size = sec.sh_size(LittleEndian);
         if name == ".text" && text_span.is_none() {
             text_span = Some(TextSpan {
                 start: addr,
                 end: addr.saturating_add(size),
             });
         }
-        if pcln.is_none() && (name == ".gopclntab" || name == ".data.rel.ro.gopclntab") {
-            pcln = Some((addr, off, size));
+        if pcln_sec.is_none() && (name == ".gopclntab" || name == ".data.rel.ro.gopclntab") {
+            pcln_sec = Some(sec);
         }
-        if name == ".go.module" && module.is_none() {
-            module = Some((off, size));
+        if name == ".go.module" && module_sec.is_none() {
+            module_sec = Some(sec);
         }
     }
-    let (paddr, poff, psize) = pcln?;
-    let bytes = read_span(reader, poff, psize, len)?;
-    let magic_at = pcln_magic_at(&bytes)?;
+    let pcln_sec = pcln_sec?;
+    let paddr = pcln_sec.sh_addr(LittleEndian);
+    let bytes = crate::binfmt::read_elf64_section(&cache, pcln_sec, MAX_TABLE)?;
+    if bytes.len() < 16 {
+        return None;
+    }
+    let magic_at = pcln_magic_at(bytes)?;
     let pcln_addr = paddr.checked_add(magic_at as u64)?;
-    let module_text = module.and_then(|(off, size)| {
-        let blob = read_span(reader, off, size.min(MAX_TABLE), len)?;
-        module_runtime_text(&blob, pcln_addr, text_span?, 0)
+    let module_text = module_sec.and_then(|sec| {
+        let blob = crate::binfmt::read_elf64_section(&cache, sec, MAX_TABLE)?;
+        if blob.len() < 16 {
+            return None;
+        }
+        module_runtime_text(blob, pcln_addr, text_span?, 0)
     });
     adopt(&bytes[magic_at..], module_text, text_span, 0)
 }
 
 fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
-    let (offset, size) = macho_slice(reader, len)?;
-    let layout = macho_sections(reader, offset, size)?;
+    use object::ReadRef as _;
+
+    let want = macho_host_cpu()?;
+    let cache = object::ReadCache::new(reader);
+    let (slice_off, slice_size) = crate::binfmt::macho_slice(&cache, len, want)?;
+    let slice_ref = cache.range(slice_off, slice_size);
+    let layout = macho_sections(slice_ref)?;
     let pcln = layout.pclntab?;
-    let bytes = read_span(reader, pcln.file_off, pcln.size, len)?;
-    let magic_at = pcln_magic_at(&bytes)?;
+    if !(16..=MAX_TABLE).contains(&pcln.size) {
+        return None;
+    }
+    let bytes = slice_ref.read_bytes_at(pcln.slice_off, pcln.size).ok()?;
+    let magic_at = pcln_magic_at(bytes)?;
     let pcln_addr = pcln.addr.checked_add(magic_at as u64)?;
     let module_text = layout.module.and_then(|module| {
-        let blob = read_span(reader, module.file_off, module.size.min(MAX_TABLE), len)?;
-        module_runtime_text(&blob, pcln_addr, layout.text?, layout.text_segment)
+        let take = module.size.min(MAX_TABLE);
+        if take < 16 {
+            return None;
+        }
+        let blob = slice_ref.read_bytes_at(module.slice_off, take).ok()?;
+        module_runtime_text(blob, pcln_addr, layout.text?, layout.text_segment)
     });
     adopt(
         &bytes[magic_at..],
@@ -752,51 +750,23 @@ fn macho_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
 /// ASLR slide: runtime header address minus the link `__TEXT` vmaddr.
 #[cfg(target_os = "macos")]
 pub(crate) fn macho_bias(path: &Path, load_addr: u64) -> Option<u64> {
-    let mut file = File::open(path).ok()?;
+    let file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    let (offset, size) = macho_slice(&mut file, len)?;
-    let layout = macho_sections(&mut file, offset, size)?;
-    Some(load_addr.wrapping_sub(layout.text_segment))
-}
-
-fn macho_slice<R: Read + Seek>(reader: &mut R, len: u64) -> Option<(u64, u64)> {
-    reader.seek(SeekFrom::Start(0)).ok()?;
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic).ok()?;
-    if u32::from_le_bytes(magic) == 0xFEED_FACF {
-        return Some((0, len));
-    }
-    if u32::from_be_bytes(magic) != 0xCAFE_BABE {
-        return None;
-    }
-    let mut count = [0u8; 4];
-    reader.read_exact(&mut count).ok()?;
-    let nfat = u32::from_be_bytes(count);
-    if nfat == 0 || nfat > 64 {
-        return None;
-    }
     let want = macho_host_cpu()?;
-    for _ in 0..nfat {
-        let mut arch = [0u8; 20];
-        reader.read_exact(&mut arch).ok()?;
-        let cpu = u32::from_be_bytes(arch[0..4].try_into().ok()?);
-        let offset = u64::from(u32::from_be_bytes(arch[8..12].try_into().ok()?));
-        let size = u64::from(u32::from_be_bytes(arch[12..16].try_into().ok()?));
-        if cpu == want {
-            return Some((offset, size));
-        }
-    }
-    None
+    let cache = object::ReadCache::new(file);
+    let (slice_off, slice_size) = crate::binfmt::macho_slice(&cache, len, want)?;
+    let layout = macho_sections(cache.range(slice_off, slice_size))?;
+    Some(load_addr.wrapping_sub(layout.text_segment))
 }
 
 fn macho_host_cpu() -> Option<u32> {
     #[cfg(target_arch = "aarch64")]
     {
-        Some(0x0100_000C)
+        Some(object::macho::CPU_TYPE_ARM64.0)
     }
     #[cfg(target_arch = "x86_64")]
     {
-        Some(0x0100_0007)
+        Some(object::macho::CPU_TYPE_X86_64.0)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -806,7 +776,7 @@ fn macho_host_cpu() -> Option<u32> {
 
 struct MachoBlob {
     addr: u64,
-    file_off: u64,
+    slice_off: u64,
     size: u64,
 }
 
@@ -816,68 +786,37 @@ struct MachoLayout {
     text_segment: u64,
     /// `__text` link range. Go 1.26 entry offsets are relative to `runtime.text`.
     text: Option<TextSpan>,
-    /// `__gopclntab` link address and file span.
+    /// `__gopclntab` link address and slice-relative span.
     pclntab: Option<MachoBlob>,
-    /// `__go_module` file span. That is `.go.module` with Mach-O’s name rules.
+    /// `__go_module` slice-relative span. That is `.go.module` with Mach-O’s name rules.
     module: Option<MachoBlob>,
 }
 
-/// `__TEXT` vmaddr, the `__text` link address, and `__gopclntab`’s file span.
-fn macho_sections<R: Read + Seek>(
-    reader: &mut R,
-    slice_off: u64,
-    slice_size: u64,
-) -> Option<MachoLayout> {
-    reader.seek(SeekFrom::Start(slice_off)).ok()?;
-    let mut header = [0u8; 32];
-    reader.read_exact(&mut header).ok()?;
-    if u32::from_le_bytes(header[0..4].try_into().ok()?) != 0xFEED_FACF {
-        return None;
-    }
-    let ncmds = u32::from_le_bytes(header[16..20].try_into().ok()?) as usize;
-    let sizeofcmds = u32::from_le_bytes(header[20..24].try_into().ok()?) as usize;
-    if ncmds > 10_000 || sizeofcmds > 1024 * 1024 {
-        return None;
-    }
-    let mut commands = vec![0u8; sizeofcmds];
-    reader.read_exact(&mut commands).ok()?;
-    let end = slice_off.saturating_add(slice_size);
+/// `__TEXT` vmaddr, the `__text` link address, and `__gopclntab`’s slice span.
+fn macho_sections<'data, R: object::ReadRef<'data>>(slice_ref: R) -> Option<MachoLayout> {
+    use object::LittleEndian;
+    use object::read::macho::{LoadCommandVariant, Section as _, Segment as _};
+
+    let slice_len = slice_ref.len().ok()?;
+    let (_, mut commands) = crate::binfmt::macho_commands(slice_ref, 1024 * 1024)?;
     let mut text = None;
     let mut text_section = None;
     let mut section = None;
     let mut module = None;
-    let mut at = 0usize;
-    for _ in 0..ncmds {
-        if at + 8 > commands.len() {
-            break;
-        }
-        let cmd = u32::from_le_bytes(commands[at..at + 4].try_into().ok()?);
-        let cmdsize = u32::from_le_bytes(commands[at + 4..at + 8].try_into().ok()?) as usize;
-        if cmdsize < 8 || at + cmdsize > commands.len() {
-            return None;
-        }
-        if cmd == 0x19 && cmdsize >= 72 {
-            let data = &commands[at + 8..at + cmdsize];
-            let name = sect_name(&data[0..16]);
-            let vmaddr = u64::from_le_bytes(data[16..24].try_into().ok()?);
-            if name == "__TEXT" {
-                text = Some(vmaddr);
+    while let Some(cmd) = commands.next().ok()? {
+        if let LoadCommandVariant::Segment64(seg, sec_data) = cmd.variant().ok()? {
+            if crate::binfmt::macho_name(&seg.segname) == "__TEXT" {
+                text = Some(seg.vmaddr.get(LittleEndian));
             }
-            let nsects = u32::from_le_bytes(data[56..60].try_into().ok()?) as usize;
-            let mut sect = 64usize;
-            for _ in 0..nsects {
-                if sect + 80 > data.len() {
-                    break;
-                }
-                let raw = &data[sect..sect + 80];
-                let sect_name = sect_name(&raw[0..16]);
-                let addr = u64::from_le_bytes(raw[32..40].try_into().ok()?);
-                let size = u64::from_le_bytes(raw[40..48].try_into().ok()?);
-                let file_off = u64::from(u32::from_le_bytes(raw[48..52].try_into().ok()?));
-                let abs = slice_off.checked_add(file_off);
-                let in_slice = abs
-                    .and_then(|off| off.checked_add(size))
-                    .is_some_and(|last| last <= end);
+            let Ok(sects) = seg.sections(LittleEndian, sec_data) else {
+                continue;
+            };
+            for sec in sects {
+                let sect_name = crate::binfmt::macho_name(sec.sectname());
+                let addr = sec.addr(LittleEndian);
+                let size = sec.size(LittleEndian);
+                let off = u64::from(sec.offset.get(LittleEndian));
+                let in_slice = off.checked_add(size).is_some_and(|last| last <= slice_len);
                 if sect_name == "__text" && text_section.is_none() {
                     text_section = Some(TextSpan {
                         start: addr,
@@ -887,21 +826,19 @@ fn macho_sections<R: Read + Seek>(
                 if sect_name == "__gopclntab" && in_slice {
                     section = Some(MachoBlob {
                         addr,
-                        file_off: abs?,
+                        slice_off: off,
                         size,
                     });
                 }
                 if sect_name == "__go_module" && module.is_none() && in_slice {
                     module = Some(MachoBlob {
                         addr,
-                        file_off: abs?,
+                        slice_off: off,
                         size,
                     });
                 }
-                sect += 80;
             }
         }
-        at += cmdsize;
     }
     Some(MachoLayout {
         text_segment: text?,
@@ -911,9 +848,25 @@ fn macho_sections<R: Read + Seek>(
     })
 }
 
-fn pe_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
-    let sections = pe_sections(reader, len)?;
-    let base = image_base(reader, len).unwrap_or(0);
+fn pe_pclntab<R: Read + Seek>(reader: &mut R, _len: u64) -> Option<GoTables> {
+    use object::LittleEndian;
+    use object::ReadRef as _;
+
+    let cache = object::ReadCache::new(reader);
+    let pe = crate::binfmt::parse_pe64(&cache, 96).ok()?;
+    let base = pe.image_base;
+    let mut sections = Vec::new();
+    for sec in pe.sections.iter() {
+        let raw_name = sec.raw_name();
+        let name = std::str::from_utf8(raw_name).unwrap_or("");
+        sections.push(PeSection {
+            name: name.to_string(),
+            virtual_size: u64::from(sec.virtual_size.get(LittleEndian)),
+            virtual_addr: u64::from(sec.virtual_address.get(LittleEndian)),
+            raw_size: u64::from(sec.size_of_raw_data.get(LittleEndian)),
+            raw_ptr: u64::from(sec.pointer_to_raw_data.get(LittleEndian)),
+        });
+    }
     let text = sections
         .iter()
         .find(|section| section.name == ".text")
@@ -929,35 +882,36 @@ fn pe_pclntab<R: Read + Seek>(reader: &mut R, len: u64) -> Option<GoTables> {
                 end: start.saturating_add(size),
             }
         });
-    for name in [".gopclntab", ".rdata", ".data"] {
+    for name in [".gopclntab", ".gopclnt", ".rdata", ".data"] {
         let Some(section) = sections.iter().find(|section| section.name == name) else {
             continue;
         };
-        let Some(bytes) = read_span(
-            reader,
-            section.raw_ptr,
-            section.raw_size.min(MAX_TABLE),
-            len,
-        ) else {
+        let take = section.raw_size.min(MAX_TABLE);
+        if take < 16 {
+            continue;
+        }
+        let Ok(bytes) = cache.read_bytes_at(section.raw_ptr, take) else {
             continue;
         };
-        let Some(magic_at) = pcln_magic_at(&bytes) else {
+        let Some(magic_at) = pcln_magic_at(bytes) else {
             continue;
         };
         let pcln_addr = base
             .wrapping_add(section.virtual_addr)
             .wrapping_add(magic_at as u64);
         let module_text = sections.iter().find_map(|candidate| {
-            if candidate.name != ".go.module" && candidate.name != ".data" {
+            if candidate.name != ".go.module"
+                && candidate.name != ".go.modu"
+                && candidate.name != ".data"
+            {
                 return None;
             }
-            let blob = read_span(
-                reader,
-                candidate.raw_ptr,
-                candidate.raw_size.min(MAX_TABLE),
-                len,
-            )?;
-            module_runtime_text(&blob, pcln_addr, text?, 0)
+            let msize = candidate.raw_size.min(MAX_TABLE);
+            if msize < 16 {
+                return None;
+            }
+            let blob = cache.read_bytes_at(candidate.raw_ptr, msize).ok()?;
+            module_runtime_text(blob, pcln_addr, text?, 0)
         });
         if let Some(tables) = adopt(&bytes[magic_at..], module_text, text, 0) {
             return Some(tables);
@@ -1016,112 +970,10 @@ struct PeSection {
     raw_ptr: u64,
 }
 
-fn pe_sections<R: Read + Seek>(reader: &mut R, len: u64) -> Option<Vec<PeSection>> {
-    reader.seek(SeekFrom::Start(0x3c)).ok()?;
-    let mut lfanew_buf = [0u8; 4];
-    reader.read_exact(&mut lfanew_buf).ok()?;
-    let lfanew = u32::from_le_bytes(lfanew_buf) as u64;
-    if lfanew > 1024 * 1024 || lfanew + 24 > len {
-        return None;
-    }
-    reader.seek(SeekFrom::Start(lfanew)).ok()?;
-    let mut pe = [0u8; 24];
-    reader.read_exact(&mut pe).ok()?;
-    if pe[0..4] != *b"PE\0\0" {
-        return None;
-    }
-    let nsections = u16::from_le_bytes(pe[6..8].try_into().ok()?) as u64;
-    let opt_size = u16::from_le_bytes(pe[20..22].try_into().ok()?) as u64;
-    if nsections > 96 || opt_size > 1024 * 1024 {
-        return None;
-    }
-    let start = lfanew.checked_add(24)?.checked_add(opt_size)?;
-    let mut sections = Vec::new();
-    for index in 0..nsections {
-        let at = start.checked_add(index.checked_mul(40)?)?;
-        reader.seek(SeekFrom::Start(at)).ok()?;
-        let mut raw = [0u8; 40];
-        reader.read_exact(&mut raw).ok()?;
-        let name_end = raw[..8].iter().position(|byte| *byte == 0).unwrap_or(8);
-        let name = String::from_utf8_lossy(&raw[..name_end]).into_owned();
-        let virtual_size = u32::from_le_bytes(raw[8..12].try_into().ok()?) as u64;
-        let virtual_addr = u32::from_le_bytes(raw[12..16].try_into().ok()?) as u64;
-        let raw_size = u32::from_le_bytes(raw[16..20].try_into().ok()?) as u64;
-        let raw_ptr = u32::from_le_bytes(raw[20..24].try_into().ok()?) as u64;
-        sections.push(PeSection {
-            name,
-            virtual_size,
-            virtual_addr,
-            raw_size,
-            raw_ptr,
-        });
-    }
-    Some(sections)
-}
-
-fn image_base<R: Read + Seek>(reader: &mut R, len: u64) -> Option<u64> {
-    reader.seek(SeekFrom::Start(0x3c)).ok()?;
-    let mut lfanew_buf = [0u8; 4];
-    reader.read_exact(&mut lfanew_buf).ok()?;
-    let lfanew = u32::from_le_bytes(lfanew_buf) as u64;
-    reader.seek(SeekFrom::Start(lfanew)).ok()?;
-    let mut pe = [0u8; 24];
-    reader.read_exact(&mut pe).ok()?;
-    if pe[0..4] != *b"PE\0\0" {
-        return None;
-    }
-    let opt_size = u16::from_le_bytes(pe[20..22].try_into().ok()?) as u64;
-    if opt_size < 32 || lfanew + 24 + 32 > len {
-        return None;
-    }
-    reader.seek(SeekFrom::Start(lfanew + 24)).ok()?;
-    let mut magic = [0u8; 2];
-    reader.read_exact(&mut magic).ok()?;
-    if u16::from_le_bytes(magic) != 0x20B {
-        return None;
-    }
-    // PE32+ ImageBase is 24 bytes into the optional header.
-    reader.seek(SeekFrom::Start(lfanew + 24 + 24)).ok()?;
-    let mut base = [0u8; 8];
-    reader.read_exact(&mut base).ok()?;
-    Some(u64::from_le_bytes(base))
-}
-
-fn read_span<R: Read + Seek>(reader: &mut R, off: u64, size: u64, len: u64) -> Option<Vec<u8>> {
-    if !(16..=MAX_TABLE).contains(&size) || off.checked_add(size)? > len {
-        return None;
-    }
-    reader.seek(SeekFrom::Start(off)).ok()?;
-    let mut buf = vec![0u8; size as usize];
-    reader.read_exact(&mut buf).ok()?;
-    Some(buf)
-}
-
-fn read_u64_at<R: Read + Seek>(reader: &mut R, at: u64, len: u64) -> Option<u64> {
-    if at.checked_add(8)? > len {
-        return None;
-    }
-    reader.seek(SeekFrom::Start(at)).ok()?;
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf).ok()?;
-    Some(u64::from_le_bytes(buf))
-}
-
-fn cstr_at(bytes: &[u8], off: usize) -> Option<&str> {
-    let rest = bytes.get(off..)?;
-    let end = rest
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(rest.len());
-    std::str::from_utf8(&rest[..end]).ok()
-}
-
-fn sect_name(bytes: &[u8]) -> &str {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+#[cfg(any(target_os = "windows", test))]
+fn image_base<R: Read + Seek>(reader: &mut R, _len: u64) -> Option<u64> {
+    let cache = object::ReadCache::new(reader);
+    Some(crate::binfmt::parse_pe64(&cache, 96).ok()?.image_base)
 }
 
 fn read_uvarint(data: &[u8], mut index: usize) -> Option<(usize, u32)> {

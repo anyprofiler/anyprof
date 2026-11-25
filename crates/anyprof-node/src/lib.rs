@@ -17,9 +17,10 @@
 mod attach;
 mod ports;
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use anyprof_cdp::{capture_cpu_profile, sampling_interval_us};
+use anyprof_cdp::{CdpSession, sampling_interval_us, start_cpu_profile};
 use anyprof_core::{
     Backend, Capabilities, DEVTOOLS_SAMPLING_INTERVAL, Error, Format, ProcessSnapshot, Profile,
     RecordOptions, Runtime, Session, Target, inspect,
@@ -102,15 +103,15 @@ impl Backend for NodeBackend {
         let mut attached =
             attach::inspector_websocket(target.pid, &snapshot.cmdline, opts.inspect.as_deref())?;
         let close_inspector = attached.activated_by_us && !opts.keep_inspector;
-        let bytes = match capture_cpu_profile(
+        let cdp = match start_cpu_profile(
             &attached.websocket_url,
             opts.duration,
             interval_us,
             Some(target.pid),
             close_inspector,
-            &opts.stop,
+            Arc::clone(&opts.stop),
         ) {
-            Ok(bytes) => bytes,
+            Ok(session) => session,
             Err(first_err)
                 if !attached.activated_by_us
                     && opts.inspect.is_none()
@@ -120,30 +121,26 @@ impl Backend for NodeBackend {
                 std::thread::sleep(Duration::from_millis(60));
                 attached = attach::inspector_websocket(target.pid, &snapshot.cmdline, None)?;
                 let close_retry = attached.activated_by_us && !opts.keep_inspector;
-                capture_cpu_profile(
+                start_cpu_profile(
                     &attached.websocket_url,
                     opts.duration,
                     interval_us,
                     Some(target.pid),
                     close_retry,
-                    &opts.stop,
+                    Arc::clone(&opts.stop),
                 )
                 .map_err(|err| Error::backend(self.name(), err.to_string()))?
             }
             Err(err) => return Err(Error::backend(self.name(), err.to_string())),
         };
-        let mut imported = import_cpuprofile(&bytes, Runtime::Node)
-            .map_err(|err| Error::backend(self.name(), err.to_string()))?;
-        // Keep Profiler.stop's document so `--format cpuprofile` does not rebuild it.
-        imported.raw_cpuprofile = Some(bytes);
-        let profile = finish_profile(imported, target.pid, snapshot.comm, opts, interval_us);
-        tracing::info!(
-            pid = target.pid,
-            samples = anyprof_export::sample_counts(&profile).total,
-            stacks = profile.stacks.len(),
-            "node profile complete"
-        );
-        Ok(Box::new(ReadySession { profile }))
+        Ok(Box::new(NodeSession {
+            cdp,
+            pid: target.pid,
+            comm: snapshot.comm,
+            started_at: Instant::now(),
+            requested_duration: opts.duration,
+            interval_us,
+        }))
     }
 }
 
@@ -160,17 +157,16 @@ fn finish_profile(
     mut profile: Profile,
     pid: u32,
     comm: Option<String>,
-    opts: &RecordOptions,
+    elapsed: Duration,
+    requested_duration: Option<Duration>,
     interval_us: u32,
 ) -> Profile {
     profile.pid = pid;
     if profile.comm.is_none() {
         profile.comm = comm;
     }
-    if profile.duration.is_zero()
-        && let Some(duration) = opts.duration
-    {
-        profile.duration = duration;
+    if profile.duration.is_zero() {
+        profile.duration = requested_duration.unwrap_or(elapsed);
     }
     if profile.period.is_none() {
         profile.period = Some(Duration::from_micros(u64::from(interval_us)));
@@ -206,13 +202,48 @@ fn is_node_name(value: &str) -> bool {
     stem.eq_ignore_ascii_case("node") || stem.eq_ignore_ascii_case("nodejs")
 }
 
-struct ReadySession {
-    profile: Profile,
+struct NodeSession {
+    cdp: CdpSession,
+    pid: u32,
+    comm: Option<String>,
+    started_at: Instant,
+    requested_duration: Option<Duration>,
+    interval_us: u32,
 }
 
-impl Session for ReadySession {
+impl Session for NodeSession {
     fn stop(self: Box<Self>) -> Result<Profile, Error> {
-        Ok(self.profile)
+        let Self {
+            cdp,
+            pid,
+            comm,
+            started_at,
+            requested_duration,
+            interval_us,
+        } = *self;
+        let bytes = cdp
+            .stop()
+            .map_err(|err| Error::backend("node", err.to_string()))?;
+        let elapsed = started_at.elapsed();
+        let mut imported = import_cpuprofile(&bytes, Runtime::Node)
+            .map_err(|err| Error::backend("node", err.to_string()))?;
+        // Keep Profiler.stop's document so `--format cpuprofile` does not rebuild it.
+        imported.raw_cpuprofile = Some(bytes);
+        let profile = finish_profile(
+            imported,
+            pid,
+            comm,
+            elapsed,
+            requested_duration,
+            interval_us,
+        );
+        tracing::info!(
+            pid,
+            samples = anyprof_export::sample_counts(&profile).total,
+            stacks = profile.stacks.len(),
+            "node profile complete"
+        );
+        Ok(profile)
     }
 }
 

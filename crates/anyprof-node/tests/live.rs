@@ -142,19 +142,28 @@ fn profiles_a_live_node_process() {
             ..RecordOptions::default()
         },
     );
-
+    let session = match started {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            panic!("node profile failed: {err}\nnode stderr:\n{stderr}");
+        }
+    };
+    assert!(
+        port_open(port),
+        "inspector port {port} should be open while async NodeSession is active"
+    );
+    thread::sleep(Duration::from_secs(2));
+    let profile_res = session.stop();
     let closed_after_sample = wait_port_closed(port, Duration::from_secs(2));
     let still_alive = child.try_wait().ok().flatten().is_none();
     let _ = child.kill();
     let _ = child.wait();
     let stderr = stderr_thread.join().unwrap_or_default();
-    let session = match started {
-        Ok(session) => session,
-        Err(err) => panic!("node profile failed: {err}\nnode stderr:\n{stderr}"),
-    };
-    let profile = session
-        .stop()
-        .unwrap_or_else(|err| panic!("stop failed: {err}\nnode stderr:\n{stderr}"));
+    let profile =
+        profile_res.unwrap_or_else(|err| panic!("stop failed: {err}\nnode stderr:\n{stderr}"));
     assert!(
         still_alive,
         "node exited during sampling\nnode stderr:\n{stderr}"
@@ -263,6 +272,7 @@ fn uninspected_node_closes_port_9229_and_keep_inspector_leaves_it_open() {
             },
         )
         .expect("sample uninspected node");
+    thread::sleep(Duration::from_millis(300));
     let profile = session.stop().expect("stop session");
     assert!(profile.total_weight() > 0);
     assert!(
@@ -286,6 +296,7 @@ fn uninspected_node_closes_port_9229_and_keep_inspector_leaves_it_open() {
             },
         )
         .expect("re-sample node with keep_inspector");
+    thread::sleep(Duration::from_millis(300));
     let _ = session.stop().expect("stop second session");
     assert!(
         port_open(port),
@@ -353,6 +364,7 @@ fn preexisting_inspect_zero_port_stays_open_after_sampling() {
             },
         )
         .expect("sample node started with --inspect=0");
+    thread::sleep(Duration::from_millis(400));
     let profile = session.stop().expect("stop session");
     assert!(profile.total_weight() > 0);
     thread::sleep(Duration::from_millis(150));

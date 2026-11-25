@@ -152,7 +152,12 @@ struct SampleContext<'a> {
     unwind_cache: &'a mut LinuxUnwindCache,
 }
 
-pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, Error> {
+pub(crate) fn record(
+    target: &Target,
+    opts: &RecordOptions,
+    session_stop: &anyprof_core::StopGate,
+    ready_tx: &std::sync::mpsc::SyncSender<Result<(), Error>>,
+) -> Result<Profile, Error> {
     let interval = opts.sampling_interval.unwrap_or(PERF_SAMPLING_INTERVAL);
     if interval < Duration::from_micros(1) {
         return Err(Error::backend(
@@ -176,28 +181,25 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
 
     let (sampler, _attr) = open_events(target.pid, period, opts.include_kernel)?;
     let mut sampler = sampler;
-    let images = load_images(target.pid);
+    let images = load_images(target.pid, opts.language_unwind);
     let mut unwinder = LinuxUnwinder::new();
     for image in &images {
         image.register_unwind_modules(&mut unwinder);
     }
     let mut unwind_cache = LinuxUnwindCache::new();
     let go_images: Vec<GoImage> = images.iter().filter_map(|image| image.go.clone()).collect();
-    let python = python::attach_linux(target.pid);
-    let java = crate::java::attach_linux(target.pid);
-    let kernel_symbols = if opts.include_kernel {
-        load_kallsyms()
-    } else {
-        Vec::new()
-    };
-    tracing::debug!(
-        pid = target.pid,
-        images = images.len(),
-        kernel_symbols = kernel_symbols.len(),
-        "native symbol tables loaded"
-    );
+    let python = opts
+        .language_unwind
+        .allows_python()
+        .then(|| python::attach_linux(target.pid))
+        .flatten();
+    let java = opts
+        .language_unwind
+        .allows_java()
+        .then(|| crate::java::attach_linux(target.pid))
+        .flatten();
 
-    if !opts.stop.stop_requested()
+    if !stop_requested(opts, session_stop)
         && let Err(errno) = sampler.enable()
     {
         return Err(Error::backend(
@@ -208,6 +210,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             ),
         ));
     }
+    let _ = ready_tx.send(Ok(()));
 
     let live_vm = python.is_some() || java.is_some();
     let started = Instant::now();
@@ -225,7 +228,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         unwind_cache: &mut unwind_cache,
     };
     loop {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             break;
         }
         if opts
@@ -263,9 +266,9 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
             }
         }
         if live_vm {
-            poll_events(&mut sampler.events, wake, opts);
+            poll_events(&mut sampler.events, wake, opts, session_stop);
         } else {
-            wait_until(wake, opts);
+            wait_until(wake, opts, session_stop);
         }
     }
     sampler.disable();
@@ -276,6 +279,7 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         &mut perf_origin,
         &mut collector,
     ));
+    let elapsed = started.elapsed();
     if lost > 0 {
         tracing::warn!(lost, pid = target.pid, "perf ring buffer dropped samples");
         eprintln!(
@@ -289,6 +293,18 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         );
     }
 
+    let kernel_symbols = if opts.include_kernel {
+        load_kallsyms()
+    } else {
+        Vec::new()
+    };
+    tracing::debug!(
+        pid = target.pid,
+        images = images.len(),
+        kernel_symbols = kernel_symbols.len(),
+        "native symbol tables loaded"
+    );
+
     let comm = inspect(target.pid).and_then(|snapshot| snapshot.comm);
     Ok(finish_profile(
         target.pid,
@@ -296,9 +312,13 @@ pub(crate) fn record(target: &Target, opts: &RecordOptions) -> Result<Profile, E
         collector,
         &images,
         &kernel_symbols,
-        started.elapsed(),
+        elapsed,
         interval,
     ))
+}
+
+fn stop_requested(opts: &RecordOptions, session_stop: &anyprof_core::StopGate) -> bool {
+    opts.stop.stop_requested() || session_stop.stop_requested()
 }
 
 fn open_events(
@@ -1074,12 +1094,16 @@ fn kernel_frame(symbols: &[Kallsym], addr: u64, leaf: bool) -> Frame {
 
 const MAX_MAPPED_IMAGES: usize = 4096;
 
-fn load_images(pid: u32) -> Vec<UserImage> {
+fn load_images(pid: u32, language_unwind: anyprof_core::LanguageUnwind) -> Vec<UserImage> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
-    images_from_maps(pid, &text)
+    images_from_maps(pid, &text, language_unwind)
 }
 
-fn images_from_maps(pid: u32, text: &str) -> Vec<UserImage> {
+fn images_from_maps(
+    pid: u32,
+    text: &str,
+    language_unwind: anyprof_core::LanguageUnwind,
+) -> Vec<UserImage> {
     let spans = maps::parse_maps(text);
     let mut order = Vec::new();
     let mut groups: HashMap<String, Vec<MapSpan>> = HashMap::new();
@@ -1096,20 +1120,35 @@ fn images_from_maps(pid: u32, text: &str) -> Vec<UserImage> {
             continue;
         };
         let open_path = maps::resolve_mapped_path(pid, &mapped_path);
-        images.push(image_from_group(&mapped_path, &open_path, &group));
+        images.push(image_from_group(
+            &mapped_path,
+            &open_path,
+            &group,
+            language_unwind,
+        ));
     }
     images
 }
 
-fn image_from_group(mapped_path: &str, open_path: &Path, group: &[MapSpan]) -> UserImage {
-    let mut image = image_from_elf(mapped_path, open_path, group);
+fn image_from_group(
+    mapped_path: &str,
+    open_path: &Path,
+    group: &[MapSpan],
+    language_unwind: anyprof_core::LanguageUnwind,
+) -> UserImage {
+    let mut image = image_from_elf(mapped_path, open_path, group, language_unwind);
     // One scan per mapped file. libc and the dynamic linker miss and stay
     // native; the Rust executable hits and labels its `::` paths.
     image.rust_image = crate::rust_image::file_is_rust(open_path);
     image
 }
 
-fn image_from_elf(mapped_path: &str, open_path: &Path, group: &[MapSpan]) -> UserImage {
+fn image_from_elf(
+    mapped_path: &str,
+    open_path: &Path,
+    group: &[MapSpan],
+    language_unwind: anyprof_core::LanguageUnwind,
+) -> UserImage {
     let start = group.iter().map(|span| span.start).min().unwrap_or(0);
     let end = group.iter().map(|span| span.end).max().unwrap_or(start);
     let module = maps::module_name(mapped_path);
@@ -1136,7 +1175,10 @@ fn image_from_elf(mapped_path: &str, open_path: &Path, group: &[MapSpan]) -> Use
     if !exec_spans.is_empty() {
         image.exec_spans = exec_spans;
     }
-    image.go = go_sym::open_image_at(open_path, bias);
+    image.go = language_unwind
+        .allows_go()
+        .then(|| go_sym::open_image_at(open_path, bias))
+        .flatten();
     image
 }
 
@@ -1284,9 +1326,9 @@ fn ioctl_req(fd: i32, request: libc::Ioctl) -> bool {
     unsafe { libc::ioctl(fd, request, 0) == 0 }
 }
 
-fn wait_until(deadline: Instant, opts: &RecordOptions) {
+fn wait_until(deadline: Instant, opts: &RecordOptions, session_stop: &anyprof_core::StopGate) {
     while Instant::now() < deadline {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1297,11 +1339,16 @@ fn wait_until(deadline: Instant, opts: &RecordOptions) {
     }
 }
 
-fn poll_events(events: &mut [Mapped], deadline: Instant, opts: &RecordOptions) {
+fn poll_events(
+    events: &mut [Mapped],
+    deadline: Instant,
+    opts: &RecordOptions,
+    session_stop: &anyprof_core::StopGate,
+) {
     let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(events.len());
     let mut indices: Vec<usize> = Vec::with_capacity(events.len());
     while Instant::now() < deadline {
-        if opts.stop.stop_requested() {
+        if stop_requested(opts, session_stop) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());

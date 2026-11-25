@@ -73,18 +73,20 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p anyprof-cli --all-targets --features self-update -- -D warnings
       - name: Check Linux musl
         if: startsWith(matrix.os, 'ubuntu-')
-        # Type-check the release target. musl-gcc is only for the updater's C
-        # build script. This does not link the binary or run cargo-dist.
+        # Type-check the release target (including optional self-update). musl-gcc
+        # is for the updater's C build script. This does not link the binary or run cargo-dist.
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
           if [ "$(uname -m)" = "aarch64" ]; then
-            CC_aarch64_unknown_linux_musl=musl-gcc cargo check --workspace --locked --target aarch64-unknown-linux-musl
+            CC_aarch64_unknown_linux_musl=musl-gcc cargo check --workspace --all-features --locked --target aarch64-unknown-linux-musl
           else
-            CC_x86_64_unknown_linux_musl=musl-gcc cargo check --workspace --locked --target x86_64-unknown-linux-musl
+            CC_x86_64_unknown_linux_musl=musl-gcc cargo check --workspace --all-features --locked --target x86_64-unknown-linux-musl
           fi
       - name: Check CPython offsets against the installed headers
         if: startsWith(matrix.os, 'ubuntu-')
@@ -176,7 +178,9 @@ jobs:
           echo "kptr_restrict=$(cat /proc/sys/kernel/kptr_restrict)"
           echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo absent)"
       - name: Test
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --locked
+          cargo test -p anyprof-cli --features self-update --bins --test cli --locked
         env:
           # x86_64/macOS/Windows runner images ship Chrome; ubuntu-24.04-arm does not.
           ANYPROF_REQUIRE_CHROME: ${{ matrix.os != 'ubuntu-24.04-arm' && '1' || '0' }}
@@ -232,7 +236,9 @@ jobs:
           rustc --version | grep -q '^rustc 1\.88\.0 '
           grep -q '^rust-version = "1.88"$' Cargo.toml
       - name: Build
-        run: cargo build --workspace --all-targets --locked
+        run: |
+          cargo build --workspace --all-targets --locked
+          cargo check -p anyprof-cli --all-targets --features self-update --locked
       - name: Test
         run: cargo test --workspace --locked
         env:
