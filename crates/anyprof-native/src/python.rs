@@ -938,11 +938,11 @@ fn candidate_paths(pid: u32) -> Vec<PathBuf> {
         out.push(exe);
     }
     for span in spans {
-        let path = crate::maps::live_path(&span.path);
-        if !mentions_python(path) {
+        let mapped = crate::maps::live_path(&span.path);
+        if !mentions_python(mapped) {
             continue;
         }
-        let path = PathBuf::from(path);
+        let path = crate::maps::resolve_mapped_path(pid, mapped);
         if !out.contains(&path) {
             out.push(path);
         }
@@ -955,25 +955,35 @@ fn candidate_paths(pid: u32) -> Vec<PathBuf> {
 pub(crate) fn attach_linux(pid: u32) -> Option<PythonVm> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
     let spans = crate::maps::parse_maps(&text);
-    let mut grouped: Vec<(PathBuf, Vec<crate::maps::MapSpan>)> = Vec::new();
+    let mut grouped: Vec<(String, Vec<crate::maps::MapSpan>)> = Vec::new();
     for span in spans {
-        let path = PathBuf::from(crate::maps::live_path(&span.path));
-        if let Some((_, group)) = grouped.iter_mut().find(|(existing, _)| existing == &path) {
+        let mapped = crate::maps::live_path(&span.path).to_string();
+        if let Some((_, group)) = grouped.iter_mut().find(|(existing, _)| existing == &mapped) {
             group.push(span);
         } else {
-            grouped.push((path, vec![span]));
+            grouped.push((mapped, vec![span]));
         }
     }
-    let exe = anyprof_core::executable_file(pid);
-    let mut ordered = Vec::new();
-    if let Some(exe) = &exe
-        && let Some(pos) = grouped.iter().position(|(path, _)| path == exe)
+    let exe_target = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|link| crate::maps::live_path(&link.to_string_lossy()).to_string());
+    let exe_file = anyprof_core::executable_file(pid);
+    let mut ordered: Vec<(PathBuf, Vec<crate::maps::MapSpan>)> = Vec::new();
+    if let Some(target) = &exe_target
+        && let Some(pos) = grouped.iter().position(|(mapped, _)| mapped == target)
     {
-        ordered.push(grouped.remove(pos));
+        let (mapped, group) = grouped.remove(pos);
+        let resolved = crate::maps::resolve_mapped_path(pid, &mapped);
+        if resolved != Path::new(&mapped) || resolved.is_file() {
+            ordered.push((resolved, group));
+        } else if let Some(exe) = exe_file {
+            ordered.push((exe, group));
+        }
     }
-    for item in grouped {
-        if mentions_python(&item.0.to_string_lossy()) {
-            ordered.push(item);
+    for (mapped, group) in grouped {
+        if mentions_python(&mapped) {
+            let resolved = crate::maps::resolve_mapped_path(pid, &mapped);
+            ordered.push((resolved, group));
         }
     }
     for (path, spans) in ordered {

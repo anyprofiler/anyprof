@@ -460,7 +460,7 @@ fn open_linux(pid: u32) -> Result<JavaVm, String> {
     let (path, spans) = linux_libjvm(pid)?;
     let file = elf_hotspot(&path)?;
     let arch = file.arch;
-    let slide = elf_slide(&spans, &path, file.load_offset, file.load_vaddr).ok_or_else(|| {
+    let slide = elf_slide(&spans, file.load_offset, file.load_vaddr).ok_or_else(|| {
         format!(
             "libjvm at {} is mapped, but its load bias could not be resolved",
             path.display()
@@ -1156,16 +1156,17 @@ fn linux_libjvm(pid: u32) -> Result<(PathBuf, Vec<crate::maps::MapSpan>), String
     let text = std::fs::read_to_string(format!("/proc/{pid}/maps"))
         .map_err(|_| format!("pid {pid} is not a HotSpot process (its maps could not be read)"))?;
     let spans = crate::maps::parse_maps(&text);
-    let path = spans
+    let mapped = spans
         .iter()
         .map(|span| crate::maps::live_path(&span.path))
         .find(|path| is_libjvm(path))
-        .ok_or_else(|| format!("pid {pid} is not a HotSpot process (libjvm was not found)"))?;
-    let path = PathBuf::from(path);
+        .ok_or_else(|| format!("pid {pid} is not a HotSpot process (libjvm was not found)"))?
+        .to_string();
     let owned = spans
         .into_iter()
-        .filter(|span| Path::new(crate::maps::live_path(&span.path)) == path)
+        .filter(|span| crate::maps::live_path(&span.path) == mapped)
         .collect();
+    let path = crate::maps::resolve_mapped_path(pid, &mapped);
     Ok((path, owned))
 }
 
@@ -1383,17 +1384,10 @@ fn elf_reject(path: &Path) -> String {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn elf_slide(
-    spans: &[crate::maps::MapSpan],
-    path: &Path,
-    load_offset: u64,
-    load_vaddr: u64,
-) -> Option<u64> {
+fn elf_slide(spans: &[crate::maps::MapSpan], load_offset: u64, load_vaddr: u64) -> Option<u64> {
     spans
         .iter()
-        .find(|span| {
-            Path::new(crate::maps::live_path(&span.path)) == path && span.offset == load_offset
-        })
+        .find(|span| span.offset == load_offset)
         .map(|span| span.start.wrapping_sub(load_vaddr))
 }
 
