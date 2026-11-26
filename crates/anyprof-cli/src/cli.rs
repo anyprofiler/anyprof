@@ -37,6 +37,13 @@ pub enum Command {
     /// no network access.
     #[command(visible_alias = "v")]
     View(ViewArgs),
+    /// Compare two profiles and inspect regressions or open a differential flame graph.
+    ///
+    /// Accepts any mix of `.cpuprofile`, pprof (`.pb.gz`), speedscope JSON, and
+    /// collapsed stacks. Prints top regressions (`+Δ`) and improvements (`-Δ`),
+    /// optionally writes a `.json`, `.md`, or `.txt` report via `-o`, and serves
+    /// an interactive Differential Flame Graph on `127.0.0.1` with `-w` / `--web`.
+    Diff(DiffArgs),
     /// Upgrade this install to the latest GitHub release.
     ///
     /// Works for copies installed by the shell or PowerShell release installer.
@@ -240,6 +247,42 @@ impl ViewerArgs {
             None
         }
     }
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "\
+Examples:
+  anyprof diff before.pb.gz after.pb.gz
+  anyprof diff baseline.cpuprofile current.cpuprofile -w
+  anyprof diff old.collapsed new.collapsed -o diff.md --top 15
+  anyprof diff before.json after.json -o diff.json --hide-system")]
+pub struct DiffArgs {
+    /// Baseline ("before") profile: `.cpuprofile`, pprof, speedscope JSON, or collapsed stacks.
+    #[arg(value_name = "BEFORE")]
+    pub before: PathBuf,
+
+    /// Comparison ("after") profile: `.cpuprofile`, pprof, speedscope JSON, or collapsed stacks.
+    #[arg(value_name = "AFTER")]
+    pub after: PathBuf,
+
+    /// Optional report file to write (`.json`, `.md`, or `.txt`).
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Maximum number of top regressions and improvements to display.
+    #[arg(short = 'n', long, default_value_t = 10, value_name = "N")]
+    pub top: usize,
+
+    /// Exclude kernel frames and frames mapped from system libraries.
+    #[arg(long)]
+    pub hide_system: bool,
+
+    /// Open an interactive Differential Flame Graph in the built-in viewer.
+    #[arg(short = 'w', long)]
+    pub web: bool,
+
+    #[command(flatten)]
+    pub viewer: ViewerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -806,5 +849,36 @@ mod tests {
             panic!("expected record");
         };
         assert!(args.keep_inspector);
+    }
+
+    #[test]
+    fn diff_parses_flags_and_viewer_options() {
+        let cli = Cli::try_parse_from([
+            "anyprof",
+            "diff",
+            "before.pb.gz",
+            "after.pb.gz",
+            "-o",
+            "report.md",
+            "-n",
+            "15",
+            "--hide-system",
+            "-w",
+            "--no-open",
+            "--port",
+            "8124",
+        ])
+        .unwrap();
+        let Command::Diff(args) = cli.command else {
+            panic!("expected diff");
+        };
+        assert_eq!(args.before.as_os_str(), "before.pb.gz");
+        assert_eq!(args.after.as_os_str(), "after.pb.gz");
+        assert_eq!(args.output.as_deref().unwrap().as_os_str(), "report.md");
+        assert_eq!(args.top, 15);
+        assert!(args.hide_system);
+        assert!(args.web);
+        assert!(args.viewer.no_open);
+        assert_eq!(args.viewer.port, Some(8124));
     }
 }

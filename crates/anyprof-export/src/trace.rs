@@ -380,6 +380,12 @@ impl Trace {
         let start = start as usize;
         &self.stack_frames[start..start + len as usize]
     }
+
+    pub(crate) fn for_each_sample(&self, mut f: impl FnMut(&[u32], u64)) {
+        for sample in &self.samples {
+            f(self.stack(sample.stack), sample.weight);
+        }
+    }
 }
 
 /// Read a cpuprofile, speedscope, pprof, or collapsed-stack profile.

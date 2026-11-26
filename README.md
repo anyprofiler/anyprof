@@ -70,6 +70,10 @@ anyprof rec -p 1234 -d 10s -k                    # include Linux kernel frames
 anyprof view profile.cpuprofile
 anyprof view cpu.pb.gz --no-open --port 8123
 
+# Compare before/after profiles and open a Differential Flame Graph
+anyprof diff before.pb.gz after.pb.gz -w
+anyprof diff baseline.cpuprofile current.cpuprofile -o diff.md
+
 # Convert between collapsed, speedscope, pprof, and cpuprofile
 anyprof conv -i profile.cpuprofile -o cpu.collapsed -t collapsed
 anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
@@ -105,8 +109,16 @@ anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 | `--web-timeout <DURATION>` | Automatically stop the local server after `<DURATION>` (e.g. `10m`). |
 
 - **Supported inputs**: `.cpuprofile`, `pprof` (`.pb.gz` or raw protobuf), Speedscope JSON, and `.collapsed` stacks (plain or gzip-compressed, up to 256 MiB / 8,192 stack depth).
-- **Honest timelines**: Time-series tracks are rendered only when the file contains real sample timestamps/intervals (e.g. V8 `.cpuprofile` `timeDeltas` or timed Speedscope profiles) — never fabricated from folded counts.
+- **Honest timelines**: Time-series tracks are rendered only when the file contains real sample timestamps/intervals (e.g. V8 `.cpuprofile` `timeDeltas` or timed Speedscope profiles) — never fabricated from folded counts, with interactive `[t0, t1]` range drag-brushing to isolate spikes.
 - **Security**: Binds `127.0.0.1` only, gates every route behind a 128-bit random `/t/<token>/` prefix compared in constant time, serves embedded static assets with zero filesystem traversal, renders symbol names strictly via `textContent` / Canvas, and enforces a strict `Content-Security-Policy` (no `eval`, no remote origins).
+
+### `anyprof diff`
+
+Compares any two profiles (`BEFORE` vs `AFTER`), prints top regressions (`+Δ`) and improvements (`-Δ`), optionally exports `.json` / `.md` / `.txt` via `-o`, and serves an interactive Differential Flame Graph (red regressions, blue improvements, union-span widths so 100%-eliminated stacks remain visible) via `-w` / `--web`:
+
+```bash
+anyprof diff <BEFORE> <AFTER> [-o <REPORT>] [-n <TOP>] [--hide-system] [-w]
+```
 
 ### `anyprof convert` (alias `conv`)
 

@@ -35,6 +35,50 @@ pub fn show(path: &Path, bytes: Vec<u8>, viewer: &ViewerArgs) -> anyhow::Result<
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "profile".to_string());
     let server = Viewer::bind(&name, bytes, viewer.port.unwrap_or(0))?;
+    serve_viewer(server, &format!("Viewing {}", path.display()), viewer)
+}
+
+/// Serve `before` and `after` in differential viewer mode until Ctrl+C or timeout.
+pub fn show_diff(
+    before_path: &Path,
+    before: Vec<u8>,
+    after_path: &Path,
+    after: Vec<u8>,
+    viewer: &ViewerArgs,
+) -> anyhow::Result<()> {
+    if before.is_empty() {
+        return Err(anyhow!("{} is empty", before_path.display()));
+    }
+    if after.is_empty() {
+        return Err(anyhow!("{} is empty", after_path.display()));
+    }
+    let before_name = before_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "before".to_string());
+    let after_name = after_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "after".to_string());
+    let server = Viewer::bind_diff(
+        &before_name,
+        before,
+        &after_name,
+        after,
+        viewer.port.unwrap_or(0),
+    )?;
+    serve_viewer(
+        server,
+        &format!(
+            "Viewing diff {} -> {}",
+            before_path.display(),
+            after_path.display()
+        ),
+        viewer,
+    )
+}
+
+fn serve_viewer(server: Viewer, headline: &str, viewer: &ViewerArgs) -> anyhow::Result<()> {
     let url = server.url();
     let stop = StopGate::new();
     // Serving has nothing left to save, so the first Ctrl+C stops the server
@@ -43,7 +87,7 @@ pub fn show(path: &Path, bytes: Vec<u8>, viewer: &ViewerArgs) -> anyhow::Result<
     stop.begin_stopping();
     interrupt::route_to(&stop)?;
 
-    eprintln!("Viewing {} at {url}", path.display());
+    eprintln!("{headline} at {url}");
     match anyprof_web::open_browser(&url, viewer.no_open) {
         Launch::Opened => eprintln!("Opened your default browser."),
         Launch::Skipped(reason) => print_fallback(&url, server.port(), reason),

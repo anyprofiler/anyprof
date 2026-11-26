@@ -543,3 +543,85 @@ fn convert_collapsed_to_speedscope() {
     let _ = std::fs::remove_file(&input);
     let _ = std::fs::remove_file(&output);
 }
+
+#[test]
+fn diff_reports_regressions_writes_outputs_and_serves_web_viewer() {
+    let dir = std::env::temp_dir().join(format!("anyprof-diff-cli-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let before = dir.join("before.collapsed");
+    let after = dir.join("after.collapsed");
+    std::fs::write(&before, "main;old_hot 40\nmain;steady 10\n").unwrap();
+    std::fs::write(&after, "main;new_reg 70\nmain;steady 10\n").unwrap();
+
+    // Viewer flags without `--web` must fail cleanly.
+    let bad = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+        .arg("diff")
+        .arg(&before)
+        .arg(&after)
+        .arg("--no-open")
+        .output()
+        .expect("run anyprof diff");
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("requires --web"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // Terminal + JSON report.
+    let json_out = dir.join("diff.json");
+    let md_out = dir.join("diff.md");
+    let res = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+        .arg("diff")
+        .arg(&before)
+        .arg(&after)
+        .arg("-o")
+        .arg(&json_out)
+        .output()
+        .expect("run anyprof diff json");
+    assert!(
+        res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(
+        stdout.contains("new_reg") && stdout.contains("old_hot") && stdout.contains("+30"),
+        "{stdout}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_out).unwrap()).unwrap();
+    assert_eq!(parsed["deltaTotal"].as_i64(), Some(30));
+    assert_eq!(parsed["regressions"][0]["name"].as_str(), Some("new_reg"));
+    assert_eq!(parsed["improvements"][0]["name"].as_str(), Some("old_hot"));
+
+    // Markdown report + `--web --no-open --web-timeout 400ms`.
+    let web_res = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+        .arg("diff")
+        .arg(&before)
+        .arg(&after)
+        .arg("-o")
+        .arg(&md_out)
+        .args(["-w", "--no-open", "--web-timeout", "400ms"])
+        .output()
+        .expect("run anyprof diff --web");
+    assert!(
+        web_res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&web_res.stderr)
+    );
+    let md_text = std::fs::read_to_string(&md_out).unwrap();
+    assert!(
+        md_text.contains("## Top Regressions") && md_text.contains("`new_reg`"),
+        "{md_text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&web_res.stderr).contains("http://127.0.0.1:"),
+        "{}",
+        String::from_utf8_lossy(&web_res.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

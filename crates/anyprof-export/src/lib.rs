@@ -12,6 +12,7 @@
 
 mod collapsed;
 mod cpuprofile;
+mod diff;
 mod error;
 mod pprof;
 mod proto;
@@ -23,6 +24,9 @@ use anyprof_core::{Profile, Runtime};
 
 pub use anyprof_core::Format;
 pub use cpuprofile::import_cpuprofile;
+pub use diff::{
+    DiffAggregate, DiffFunctionRow, DiffQuery, DiffTrace, DiffTreeNode, diff_aggregate, load_diff,
+};
 pub use error::Error;
 pub use trace::{
     Activity, Aggregate, FunctionRow, Query, Trace, TrackKind, TreeNode, ViewFrame, ViewThread,

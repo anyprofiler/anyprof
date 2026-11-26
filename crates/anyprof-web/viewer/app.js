@@ -189,6 +189,10 @@ function formatBytes(value) {
   return value + " B";
 }
 
+function isDiff() {
+  return Boolean(state.session && state.session.mode === "diff");
+}
+
 function formatWeight(value) {
   const kind = state.session ? state.session.weightKind : "count";
   if (kind === "sampled-time" || kind === "cpu-time" || kind === "duration") {
@@ -197,6 +201,22 @@ function formatWeight(value) {
   }
   if (kind === "bytes") return formatBytes(value);
   return formatCount(value);
+}
+
+function formatSignedWeight(delta) {
+  const num = Number(delta) || 0;
+  if (num === 0) return "0";
+  const sign = num > 0 ? "+" : "-";
+  return sign + formatWeight(Math.abs(num));
+}
+
+function formatSignedPercent(delta, baseline) {
+  const num = Number(delta) || 0;
+  const base = Number(baseline) || 0;
+  if (num === 0) return "0%";
+  if (base <= 0) return num > 0 ? "new" : "-100%";
+  const pct = (num / base) * 100;
+  return (pct > 0 ? "+" : "") + pct.toFixed(1) + "%";
 }
 
 function formatPercent(value, total) {
@@ -335,10 +355,16 @@ function showError(message) {
 function renderMeta() {
   const session = state.session;
   $("file-name").textContent = session.name || "profile";
-  document.title = (session.name || "profile") + " — anyprof";
+  document.title = (session.name || "profile") + (isDiff() ? " — anyprof diff" : " — anyprof");
   const parts = [];
   parts.push(session.format);
-  parts.push(formatCount(session.samples) + " samples");
+  if (isDiff() && session.before && session.after) {
+    parts.push(
+      formatCount(session.before.samples) + " → " + formatCount(session.after.samples) + " samples"
+    );
+  } else {
+    parts.push(formatCount(session.samples) + " samples");
+  }
   parts.push(weightLabel());
   if (session.wallNs != null) parts.push("wall " + formatNs(session.wallNs));
   if (session.periodNs != null) parts.push("period " + formatNs(session.periodNs));
@@ -354,7 +380,69 @@ function renderMeta() {
     : "No frame is classified as a kernel frame or a system library";
 }
 
+function renderDiffOverview() {
+  const overview = $("overview");
+  clear(overview);
+  const session = state.session;
+  const baseTotal = state.tree ? Number(state.tree.baselineTotal || 0) : Number(session.before.total || 0);
+  const compTotal = state.tree ? Number(state.tree.comparisonTotal || 0) : Number(session.after.total || 0);
+  const deltaTotal = state.tree
+    ? Number(state.tree.deltaTotal || 0)
+    : compTotal - baseTotal;
+
+  const box = el("div", "diff-overview");
+  box.dataset.testid = "diff-overview";
+
+  const summary = el("div", "diff-summary");
+  const basePill = el("span", "diff-pill");
+  basePill.dataset.testid = "diff-baseline-pill";
+  basePill.append(
+    el("span", "diff-pill-label", "Baseline (" + session.before.name + ")"),
+    el("strong", "num", formatWeight(baseTotal))
+  );
+
+  const afterPill = el("span", "diff-pill");
+  afterPill.dataset.testid = "diff-after-pill";
+  afterPill.append(
+    el("span", "diff-pill-label", "After (" + session.after.name + ")"),
+    el("strong", "num", formatWeight(compTotal))
+  );
+
+  const deltaPill = el("span", "diff-pill");
+  deltaPill.dataset.testid = "diff-delta-pill";
+  const deltaCls = deltaTotal > 0 ? "num delta-pos" : deltaTotal < 0 ? "num delta-neg" : "num";
+  deltaPill.append(
+    el("span", "diff-pill-label", "Net Δ"),
+    el(
+      "strong",
+      deltaCls,
+      formatSignedWeight(deltaTotal) + " (" + formatSignedPercent(deltaTotal, baseTotal) + ")"
+    )
+  );
+
+  summary.append(basePill, el("span", "diff-arrow", "→"), afterPill, deltaPill);
+  if (session.notes && session.notes.length) {
+    summary.append(el("span", "muted", session.notes.join(" · ")));
+  }
+
+  const legend = el("div", "diff-legend");
+  legend.append(
+    el("span", "delta-neg", "Faster (−Δ)"),
+    el("span", "diff-scale"),
+    el("span", "delta-pos", "Slower (+Δ)")
+  );
+
+  box.append(summary, legend);
+  overview.append(box);
+  document.documentElement.dataset.timeline = "0";
+  renderTrackFilter();
+}
+
 function renderOverview() {
+  if (isDiff()) {
+    renderDiffOverview();
+    return;
+  }
   const overview = $("overview");
   clear(overview);
   const session = state.session;
@@ -1082,6 +1170,7 @@ async function refreshTree() {
     }
   }
 
+  if (isDiff()) renderDiffOverview();
   updateRangeControls();
   renderPane();
   renderInspector();
@@ -1112,20 +1201,41 @@ function expandDefaults() {
   }
 }
 
-function compareNodes(a, b) {
+function compareMetricRows(a, b) {
   const dir = state.sortDir;
   if (state.sortKey === "name") {
     const an = frameOf(a.frame).name;
     const bn = frameOf(b.frame).name;
-    return an < bn ? -dir : an > bn ? dir : a.id - b.id;
+    return an < bn ? -dir : an > bn ? dir : 0;
   }
   if (state.sortKey === "loc") {
     const al = formatLocationShort(frameOf(a.frame));
     const bl = formatLocationShort(frameOf(b.frame));
-    return al < bl ? -dir : al > bl ? dir : b.weight - a.weight || a.id - b.id;
+    return al < bl ? -dir : al > bl ? dir : Number(b.weight || 0) - Number(a.weight || 0);
   }
-  if (state.sortKey === "self") return (a.self - b.self) * dir || b.weight - a.weight || a.id - b.id;
-  return (a.weight - b.weight) * dir || (b.self - a.self) || a.id - b.id;
+  if (state.sortKey === "baseline") {
+    return (Number(a.baseline || 0) - Number(b.baseline || 0)) * dir
+      || Math.abs(Number(b.delta || 0)) - Math.abs(Number(a.delta || 0));
+  }
+  if (state.sortKey === "comparison") {
+    return (Number(a.comparison || 0) - Number(b.comparison || 0)) * dir
+      || Math.abs(Number(b.delta || 0)) - Math.abs(Number(a.delta || 0));
+  }
+  if (state.sortKey === "delta") {
+    return (Number(a.delta || 0) - Number(b.delta || 0)) * dir
+      || Math.abs(Number(b.deltaSelf || 0)) - Math.abs(Number(a.deltaSelf || 0))
+      || Number(b.comparison || 0) - Number(a.comparison || 0);
+  }
+  if (state.sortKey === "deltaSelf") {
+    return (Number(a.deltaSelf || 0) - Number(b.deltaSelf || 0)) * dir
+      || Math.abs(Number(b.delta || 0)) - Math.abs(Number(a.delta || 0));
+  }
+  if (state.sortKey === "self") return (a.self - b.self) * dir || b.weight - a.weight;
+  return (a.weight - b.weight) * dir || (b.self - a.self);
+}
+
+function compareNodes(a, b) {
+  return compareMetricRows(a, b) || (a.id - b.id);
 }
 
 function kidsOf(key) {
@@ -1278,48 +1388,43 @@ function headerLabel(key, text) {
   return text + (state.sortDir < 0 ? " ⌄" : " ⌃");
 }
 
+function makeSortHead(key, labelText, testId, extraClass) {
+  const btn = el(
+    "button",
+    (extraClass ? extraClass + " " : "") + (state.sortKey === key ? "active-sort" : ""),
+    headerLabel(key, labelText)
+  );
+  btn.type = "button";
+  if (testId) btn.dataset.testid = testId;
+  btn.addEventListener("click", () => setSort(key));
+  return btn;
+}
+
 function columnHeader() {
-  const header = el("div", "cols");
-  const weight = el(
-    "button",
-    "weight-head" + (state.sortKey === "weight" ? " active-sort" : ""),
-    headerLabel("weight", "Weight")
-  );
-  weight.type = "button";
-  weight.dataset.testid = "col-weight";
-  weight.addEventListener("click", () => setSort("weight"));
-
-  const self = el(
-    "button",
-    "self-head" + (state.sortKey === "self" ? " active-sort" : ""),
-    headerLabel("self", "Self Weight")
-  );
-  self.type = "button";
-  self.dataset.testid = "col-self";
-  self.addEventListener("click", () => setSort("self"));
-
   const symWrap = el("div", "sym-head-wrap");
-  const name = el(
-    "button",
-    "name-head" + (state.sortKey === "name" ? " active-sort" : ""),
-    headerLabel("name", "Symbol Names")
-  );
-  name.type = "button";
-  name.dataset.testid = "col-symbol";
-  name.addEventListener("click", () => setSort("name"));
-
-  const loc = el(
-    "button",
-    "loc-head" + (state.sortKey === "loc" ? " active-sort" : ""),
-    headerLabel("loc", "Library")
-  );
-  loc.type = "button";
-  loc.dataset.testid = "col-location";
+  const name = makeSortHead("name", "Symbol Names", "col-symbol", "name-head");
+  const loc = makeSortHead("loc", "Library", "col-location", "loc-head");
   loc.title = "Sort by library or source location";
-  loc.addEventListener("click", () => setSort("loc"));
-
   symWrap.append(name, loc);
-  header.append(weight, self, symWrap);
+
+  if (isDiff()) {
+    const header = el("div", "cols diff-cols");
+    header.append(
+      makeSortHead("baseline", "Baseline", "col-baseline", "weight-head"),
+      makeSortHead("comparison", "After", "col-after", "weight-head"),
+      makeSortHead("delta", "Δ Weight", "col-delta", "weight-head"),
+      makeSortHead("deltaSelf", "Δ Self", "col-delta-self", "self-head"),
+      symWrap
+    );
+    return header;
+  }
+
+  const header = el("div", "cols");
+  header.append(
+    makeSortHead("weight", "Weight", "col-weight", "weight-head"),
+    makeSortHead("self", "Self Weight", "col-self", "self-head"),
+    symWrap
+  );
   return header;
 }
 
@@ -1330,6 +1435,61 @@ function setSort(key) {
     state.sortDir = (key === "name" || key === "loc") ? 1 : -1;
   }
   renderPane();
+}
+
+function diffRefTotal() {
+  if (!state.tree) return 1;
+  return Math.max(
+    1,
+    Number(state.tree.baselineTotal || 0),
+    Number(state.tree.comparisonTotal || 0),
+    Number(state.tree.spanTotal || 0)
+  );
+}
+
+function diffPlainCell(value, total) {
+  const cell = el("div", "diff-num-cell");
+  const numVal = Number(value) || 0;
+  const share = total > 0 ? Math.min(100, Math.max(0, (numVal / total) * 100)) : 0;
+  if (share >= 0.5) {
+    const bar = el("span", "cell-bar cell-bar-weight");
+    bar.style.width = share.toFixed(1) + "%";
+    cell.append(bar);
+  }
+  cell.append(el("span", "num" + (numVal === 0 ? " muted" : ""), formatWeight(numVal)));
+  return cell;
+}
+
+function diffDeltaCell(delta, baseline, refTotal) {
+  const cell = el("div", "diff-num-cell");
+  const num = Number(delta) || 0;
+  const share = refTotal > 0 ? Math.min(100, Math.max(0, (Math.abs(num) / refTotal) * 100)) : 0;
+  if (share >= 0.5 && num !== 0) {
+    const bar = el("span", "cell-bar " + (num > 0 ? "cell-bar-reg" : "cell-bar-imp"));
+    bar.style.width = share.toFixed(1) + "%";
+    cell.append(bar);
+  }
+  const cls = num > 0 ? "num delta-pos" : num < 0 ? "num delta-neg" : "num muted";
+  const span = el("span", cls, formatSignedWeight(num));
+  if (num !== 0) {
+    cell.title = formatSignedWeight(num) + " (" + formatSignedPercent(num, baseline) + ")";
+  }
+  cell.append(span);
+  return cell;
+}
+
+function diffDeltaSelfCell(deltaSelf, refTotal, frame) {
+  const cell = el("div", "diff-self-cell");
+  const num = Number(deltaSelf) || 0;
+  const share = refTotal > 0 ? Math.min(100, Math.max(0, (Math.abs(num) / refTotal) * 100)) : 0;
+  if (share >= 0.5 && num !== 0) {
+    const bar = el("span", "cell-bar " + (num > 0 ? "cell-bar-reg" : "cell-bar-imp"));
+    bar.style.width = share.toFixed(1) + "%";
+    cell.append(bar);
+  }
+  const cls = num > 0 ? "num delta-pos" : num < 0 ? "num delta-neg" : "num muted";
+  cell.append(el("span", cls, formatSignedWeight(num)), catIcon(frame));
+  return cell;
 }
 
 function weightCell(value, total) {
@@ -1383,7 +1543,8 @@ function inlineLocation(frame, frameId, nodeId) {
 }
 
 function treeRow(node) {
-  const row = el("div", "row");
+  const diffMode = isDiff();
+  const row = el("div", diffMode ? "row diff-row" : "row");
   row.dataset.testid = "tree-row";
   row.dataset.node = String(node.id);
   row.setAttribute("role", "treeitem");
@@ -1437,11 +1598,22 @@ function treeRow(node) {
     });
     name.append(focusBtn);
   }
-  row.append(
-    weightCell(node.weight, state.tree.total),
-    selfCell(node.self, state.tree.total, frame),
-    name
-  );
+  if (diffMode) {
+    const ref = diffRefTotal();
+    row.append(
+      diffPlainCell(node.baseline, ref),
+      diffPlainCell(node.comparison, ref),
+      diffDeltaCell(node.delta, node.baseline, ref),
+      diffDeltaSelfCell(node.deltaSelf, ref, frame),
+      name
+    );
+  } else {
+    row.append(
+      weightCell(node.weight, state.tree.total),
+      selfCell(node.self, state.tree.total, frame),
+      name
+    );
+  }
   row.addEventListener("click", () => selectNode(node));
   row.addEventListener("dblclick", () => {
     if (frame.file) openSourceForFrame(node.frame, node.id);
@@ -1480,24 +1652,12 @@ function focusNodeInTree(node) {
 function renderFunctions() {
   const pane = $("pane");
   clear(pane);
+  const diffMode = isDiff();
   const rows = state.tree.functions.slice();
   const filtered = state.query
     ? rows.filter((row) => frameMatches(row.frame))
     : rows;
-  filtered.sort((a, b) => {
-    if (state.sortKey === "name") {
-      const an = frameOf(a.frame).name;
-      const bn = frameOf(b.frame).name;
-      return an < bn ? -state.sortDir : an > bn ? state.sortDir : 0;
-    }
-    if (state.sortKey === "loc") {
-      const al = formatLocationShort(frameOf(a.frame));
-      const bl = formatLocationShort(frameOf(b.frame));
-      return al < bl ? -state.sortDir : al > bl ? state.sortDir : b.weight - a.weight;
-    }
-    if (state.sortKey === "self") return (a.self - b.self) * state.sortDir || b.weight - a.weight;
-    return (a.weight - b.weight) * state.sortDir || b.self - a.self;
-  });
+  filtered.sort(compareMetricRows);
   if (!filtered.length) {
     pane.append(el("div", "empty", "No functions match."));
     return;
@@ -1512,6 +1672,7 @@ function renderFunctions() {
   scroll.append(top, body, bottom);
   table.append(scroll);
   pane.append(table);
+  const ref = diffMode ? diffRefTotal() : state.tree.total;
   const paint = () => {
     const height = scroll.clientHeight || 400;
     const start = Math.max(0, Math.floor(scroll.scrollTop / ROW) - 4);
@@ -1522,7 +1683,7 @@ function renderFunctions() {
     clear(body);
     for (const row of slice) {
       const frame = frameOf(row.frame);
-      const line = el("div", "fn-row row");
+      const line = el("div", diffMode ? "fn-row row diff-row" : "fn-row row");
       line.dataset.testid = "function-row";
       line.dataset.frame = String(row.frame);
       line.setAttribute("aria-selected", row.frame === state.selectedFrame ? "true" : "false");
@@ -1536,11 +1697,21 @@ function renderFunctions() {
       if (state.multiRuntime && frame.runtime && frame.runtime !== "native" && frame.runtime !== "kernel") {
         name.append(el("span", "rt-badge", frame.runtime));
       }
-      line.append(
-        weightCell(row.weight, state.tree.total),
-        selfCell(row.self, state.tree.total, frame),
-        name
-      );
+      if (diffMode) {
+        line.append(
+          diffPlainCell(row.baseline, ref),
+          diffPlainCell(row.comparison, ref),
+          diffDeltaCell(row.delta, row.baseline, ref),
+          diffDeltaSelfCell(row.deltaSelf, ref, frame),
+          name
+        );
+      } else {
+        line.append(
+          weightCell(row.weight, ref),
+          selfCell(row.self, ref, frame),
+          name
+        );
+      }
       line.addEventListener("click", () => {
         state.selectedFrame = row.frame;
         const candidate = state.tree.nodes.find((item) => item.frame === row.frame);
@@ -1605,6 +1776,8 @@ async function renderSource() {
     return;
   }
 
+  const diffSource = body.mode === "diff" || isDiff();
+
   if (!body.available) {
     const card = el("div", "source-unavailable");
     card.dataset.testid = "source-unavailable";
@@ -1614,11 +1787,12 @@ async function renderSource() {
       const hotWrap = el("div", "source-hot-list");
       hotWrap.append(el("p", null, "Recorded sample weights by line in this file:"));
       for (const item of body.hotLines) {
-        hotWrap.append(el(
-          "div",
-          "source-path",
-          "Line " + item.line + "  ·  Weight " + formatWeight(item.weight) + "  ·  Self " + formatWeight(item.self)
-        ));
+        const summaryText = diffSource
+          ? ("Line " + item.line + "  ·  Baseline " + formatWeight(item.baseline)
+            + " → After " + formatWeight(item.comparison)
+            + "  ·  Δ Self " + formatSignedWeight(item.deltaSelf))
+          : ("Line " + item.line + "  ·  Weight " + formatWeight(item.weight) + "  ·  Self " + formatWeight(item.self));
+        hotWrap.append(el("div", "source-path", summaryText));
       }
       card.append(hotWrap);
     }
@@ -1626,52 +1800,88 @@ async function renderSource() {
     return;
   }
 
-  const cols = el("div", "source-cols");
-  cols.append(
-    el("span", null, "Line"),
-    el("span", null, "Weight"),
-    el("span", null, "Self"),
-    el("span", null, "Source")
-  );
+  const cols = el("div", diffSource ? "source-cols diff-source-cols" : "source-cols");
+  if (diffSource) {
+    cols.append(
+      el("span", null, "Line"),
+      el("span", null, "Baseline"),
+      el("span", null, "After"),
+      el("span", null, "Δ Self"),
+      el("span", null, "Source")
+    );
+  } else {
+    cols.append(
+      el("span", null, "Line"),
+      el("span", null, "Weight"),
+      el("span", null, "Self"),
+      el("span", null, "Source")
+    );
+  }
   wrap.append(cols);
 
   const scroll = el("div", "source-scroll");
   scroll.dataset.testid = "source-rows";
   let targetEl = null;
-  const total = state.tree ? state.tree.total : 0;
+  const total = diffSource ? diffRefTotal() : (state.tree ? state.tree.total : 0);
 
   for (const item of body.lines || []) {
-    const classes = ["source-row"];
-    if (item.weight > 0 || item.self > 0) classes.push("source-hot");
+    const classes = [diffSource ? "source-row diff-source-row" : "source-row"];
+    if (diffSource) {
+      if (Number(item.deltaSelf) > 0) classes.push("source-reg");
+      else if (Number(item.deltaSelf) < 0) classes.push("source-imp");
+      else if (item.baseline > 0 || item.comparison > 0) classes.push("source-hot");
+    } else if (item.weight > 0 || item.self > 0) {
+      classes.push("source-hot");
+    }
     if (body.line && item.line === body.line) classes.push("source-target");
     const row = el("div", classes.join(" "));
     row.dataset.testid = "source-line";
     row.dataset.line = String(item.line);
 
     const ln = el("span", "source-ln", String(item.line));
-    const wCell = el("span", "source-metric");
-    if (item.weight > 0) {
-      const pct = total > 0 ? Math.min(100, (item.weight / total) * 100) : 0;
-      if (pct >= 0.5) {
-        const bar = el("span", "cell-bar cell-bar-weight");
-        bar.style.width = pct.toFixed(1) + "%";
-        wCell.append(bar);
-      }
-      wCell.append(document.createTextNode(formatWeight(item.weight)));
-    }
-    const sCell = el("span", "source-metric");
-    if (item.self > 0) {
-      const pct = total > 0 ? Math.min(100, (item.self / total) * 100) : 0;
-      if (pct >= 0.5) {
-        const bar = el("span", "cell-bar cell-bar-self");
-        bar.style.width = pct.toFixed(1) + "%";
-        sCell.append(bar);
-      }
-      sCell.append(document.createTextNode(formatWeight(item.self)));
-    }
     const code = el("span", "source-code");
     code.append(highlight(item.text, state.query));
-    row.append(ln, wCell, sCell, code);
+
+    if (diffSource) {
+      const bCell = el("span", "source-metric");
+      if (item.baseline > 0) bCell.append(document.createTextNode(formatWeight(item.baseline)));
+      const aCell = el("span", "source-metric");
+      if (item.comparison > 0) aCell.append(document.createTextNode(formatWeight(item.comparison)));
+      const dCell = el("span", "source-metric");
+      const ds = Number(item.deltaSelf || 0);
+      if (ds !== 0) {
+        const pct = total > 0 ? Math.min(100, (Math.abs(ds) / total) * 100) : 0;
+        if (pct >= 0.5) {
+          const bar = el("span", "cell-bar " + (ds > 0 ? "cell-bar-reg" : "cell-bar-imp"));
+          bar.style.width = pct.toFixed(1) + "%";
+          dCell.append(bar);
+        }
+        dCell.append(el("span", ds > 0 ? "delta-pos" : "delta-neg", formatSignedWeight(ds)));
+      }
+      row.append(ln, bCell, aCell, dCell, code);
+    } else {
+      const wCell = el("span", "source-metric");
+      if (item.weight > 0) {
+        const pct = total > 0 ? Math.min(100, (item.weight / total) * 100) : 0;
+        if (pct >= 0.5) {
+          const bar = el("span", "cell-bar cell-bar-weight");
+          bar.style.width = pct.toFixed(1) + "%";
+          wCell.append(bar);
+        }
+        wCell.append(document.createTextNode(formatWeight(item.weight)));
+      }
+      const sCell = el("span", "source-metric");
+      if (item.self > 0) {
+        const pct = total > 0 ? Math.min(100, (item.self / total) * 100) : 0;
+        if (pct >= 0.5) {
+          const bar = el("span", "cell-bar cell-bar-self");
+          bar.style.width = pct.toFixed(1) + "%";
+          sCell.append(bar);
+        }
+        sCell.append(document.createTextNode(formatWeight(item.self)));
+      }
+      row.append(ln, wCell, sCell, code);
+    }
     scroll.append(row);
     if (body.line && item.line === body.line) targetEl = row;
   }
@@ -1700,7 +1910,10 @@ function renderFlameZoomBar(bar) {
   clear(bar);
   const crumbs = el("div", "flame-crumbs");
   if (state.zoomNode == null || !state.byId.has(state.zoomNode)) {
-    crumbs.append(el("span", "muted", "Click any bar to zoom into its subtree  ·  Esc resets"));
+    const hint = isDiff()
+      ? "Differential Flame Graph (width = union span, red = +Δ slower, blue = −Δ faster)  ·  Click any bar to zoom"
+      : "Click any bar to zoom into its subtree  ·  Esc resets";
+    crumbs.append(el("span", "muted", hint));
     bar.append(crumbs);
     return;
   }
@@ -1717,7 +1930,12 @@ function renderFlameZoomBar(bar) {
     const node = chain[i];
     const last = i === chain.length - 1;
     crumbs.append(el("span", "flame-sep", "›"));
-    const label = frameOf(node.frame).name + (last ? " (" + formatPercent(node.weight, state.tree.total) + ")" : "");
+    const suffix = last
+      ? (isDiff()
+        ? " (" + formatSignedWeight(node.delta) + ")"
+        : " (" + formatPercent(node.weight, state.tree.total) + ")")
+      : "";
+    const label = frameOf(node.frame).name + suffix;
     const btn = el("button", "flame-crumb" + (last ? " active" : ""), label);
     btn.type = "button";
     btn.addEventListener("click", () => {
@@ -1831,6 +2049,10 @@ function bindFlameSplitter(splitter, band) {
   });
 }
 
+function flameMetric(node) {
+  return isDiff() ? Number(node.span || 0) : Number(node.weight || 0);
+}
+
 function flameLayout(rowH, pixelWidth) {
   const rects = [];
   const minimum = 0.5 / Math.max(1, pixelWidth);
@@ -1872,10 +2094,11 @@ function flameLayout(rowH, pixelWidth) {
         isContext: false,
       });
       const kids = kidsOf(item.node.id).filter((kid) => !show || show.has(kid.id));
+      const parentMetric = flameMetric(item.node);
       let childCursor = item.x;
       const next = [];
       for (const kid of kids) {
-        const childWidth = item.node.weight ? (item.width * kid.weight) / item.node.weight : 0;
+        const childWidth = parentMetric ? (item.width * flameMetric(kid)) / parentMetric : 0;
         if (childWidth >= minimum) {
           next.push({
             node: kid,
@@ -1893,11 +2116,11 @@ function flameLayout(rowH, pixelWidth) {
   }
 
   const roots = kidsOf("root").filter((node) => !show || show.has(node.id));
-  const total = roots.reduce((sum, node) => sum + node.weight, 0) || 1;
+  const total = roots.reduce((sum, node) => sum + flameMetric(node), 0) || 1;
   const pending = [];
   let cursor = 0;
   for (const root of roots) {
-    const width = root.weight / total;
+    const width = flameMetric(root) / total;
     pending.push({ node: root, x: cursor, y: 0, width, level: 0 });
     cursor += width;
   }
@@ -1914,10 +2137,11 @@ function flameLayout(rowH, pixelWidth) {
       isContext: false,
     });
     const kids = kidsOf(item.node.id).filter((kid) => !show || show.has(kid.id));
+    const parentMetric = flameMetric(item.node);
     let childCursor = item.x;
     const next = [];
     for (const kid of kids) {
-      const childWidth = item.node.weight ? (item.width * kid.weight) / item.node.weight : 0;
+      const childWidth = parentMetric ? (item.width * flameMetric(kid)) / parentMetric : 0;
       if (childWidth >= minimum) {
         next.push({
           node: kid,
@@ -1943,6 +2167,37 @@ function flameColor(frame, dark) {
   return bucket[hash(frame.name) % bucket.length];
 }
 
+function lerpRgb(a, b, t) {
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * t),
+    Math.round(a[1] + (b[1] - a[1]) * t),
+    Math.round(a[2] + (b[2] - a[2]) * t),
+  ];
+}
+
+function diffFlameColor(node, dark) {
+  const delta = Number(node.delta || 0);
+  if (delta === 0) {
+    return dark ? [68, 78, 94] : [206, 214, 226];
+  }
+  const denom = Math.max(
+    1,
+    Number(node.baseline || 0),
+    Number(node.comparison || 0),
+    Number(node.span || 1)
+  );
+  const ratio = Math.min(1, Math.abs(delta) / denom);
+  const t = Math.min(1, 0.3 + 0.7 * Math.pow(ratio, 0.65));
+  if (delta > 0) {
+    return dark
+      ? lerpRgb([116, 56, 58], [206, 52, 48], t)
+      : lerpRgb([248, 204, 200], [236, 86, 78], t);
+  }
+  return dark
+    ? lerpRgb([46, 78, 122], [38, 108, 216], t)
+    : lerpRgb([198, 222, 250], [76, 142, 238], t);
+}
+
 function drawFlame() {
   const canvas = $("flame");
   if (!canvas) return;
@@ -1953,6 +2208,7 @@ function drawFlame() {
   const height = Math.max(rowH, levels * rowH);
   const ratio = window.devicePixelRatio || 1;
   const dark = isDark();
+  const diffMode = isDiff();
   canvas.width = Math.floor(width * ratio);
   canvas.height = Math.floor(height * ratio);
   canvas.style.width = width + "px";
@@ -1967,7 +2223,7 @@ function drawFlame() {
     const pixel = rect.width * width;
     if (pixel < 0.5) continue;
     const frame = frameOf(rect.node.frame);
-    const color = flameColor(frame, dark);
+    const color = diffMode ? diffFlameColor(rect.node, dark) : flameColor(frame, dark);
     const selected = rect.node.id === state.selectedNode || (state.selectedNode == null && rect.node.frame === state.selectedFrame);
     const matched = state.query ? frameMatches(rect.node.frame) : true;
     const barH = Math.max(8, rect.height - 1);
@@ -1976,19 +2232,32 @@ function drawFlame() {
     if (rect.isContext) ctx.globalAlpha = 0.58;
     else if (state.query && !matched) ctx.globalAlpha = 0.42;
 
-    ctx.fillStyle = selected
+    ctx.fillStyle = (selected && !diffMode)
       ? selectBg
       : "rgb(" + color[0] + "," + color[1] + "," + color[2] + ")";
-    ctx.fillRect(rect.x * width + 0.5, rect.y + 0.5, Math.max(0, pixel - 1), barH);
+    const barX = rect.x * width + 0.5;
+    const barY = rect.y + 0.5;
+    const barW = Math.max(0, pixel - 1);
+    ctx.fillRect(barX, barY, barW, barH);
+    if (selected && diffMode && barW >= 2) {
+      ctx.strokeStyle = dark ? "#ffffff" : "#18181b";
+      ctx.lineWidth = 1.25;
+      ctx.strokeRect(barX + 0.5, barY + 0.5, Math.max(0, barW - 1), Math.max(0, barH - 1));
+    }
 
     if (pixel > 32) {
-      ctx.fillStyle = selected ? "#ffffff" : textColor;
+      ctx.fillStyle = (selected && !diffMode) ? "#ffffff" : textColor;
       ctx.font = "11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
       ctx.beginPath();
       ctx.rect(rect.x * width + 2, rect.y, Math.max(0, pixel - 4), barH);
       ctx.clip();
       const loc = formatLocationShort(frame);
-      const caption = (pixel > 150 && loc) ? (frame.name + " (" + loc + ")") : frame.name;
+      let caption = frame.name;
+      if (diffMode && pixel > 120 && rect.node.delta) {
+        caption += " (" + formatSignedWeight(rect.node.delta) + ")";
+      } else if (!diffMode && pixel > 150 && loc) {
+        caption += " (" + loc + ")";
+      }
       ctx.fillText(caption, rect.x * width + 4, rect.y + Math.min(barH - 4, 13));
     }
     ctx.restore();
@@ -2005,11 +2274,21 @@ function drawFlame() {
     const loc = formatLocationShort(frame);
     const parts = [frame.name];
     if (loc) parts.push(loc);
-    parts.push(formatWeight(hit.node.weight) + " (" + formatPercent(hit.node.weight, state.tree.total) + ")");
-    if (hit.node.self > 0) parts.push("self " + formatWeight(hit.node.self));
+    if (diffMode) {
+      parts.push(
+        "Baseline " + formatWeight(hit.node.baseline) + " → After " + formatWeight(hit.node.comparison)
+      );
+      parts.push(
+        "Δ " + formatSignedWeight(hit.node.delta) + " (" + formatSignedPercent(hit.node.delta, hit.node.baseline) + ")"
+      );
+      if (hit.node.deltaSelf) parts.push("Δ Self " + formatSignedWeight(hit.node.deltaSelf));
+    } else {
+      parts.push(formatWeight(hit.node.weight) + " (" + formatPercent(hit.node.weight, state.tree.total) + ")");
+      if (hit.node.self > 0) parts.push("self " + formatWeight(hit.node.self));
+    }
     tip.hidden = false;
     tip.textContent = parts.join("  ·  ");
-    tip.style.left = Math.min(event.clientX + 12, window.innerWidth - 460) + "px";
+    tip.style.left = Math.min(event.clientX + 12, window.innerWidth - 480) + "px";
     tip.style.top = event.clientY + 14 + "px";
   };
   canvas.onmouseleave = () => {
@@ -2055,6 +2334,7 @@ function pathThroughSelection() {
   if (state.selectedNode == null || !state.tree) return null;
   const selected = state.byId.get(state.selectedNode);
   if (!selected) return null;
+  const diffMode = isDiff();
   const seen = new Set();
   const up = [];
   let cursor = selected;
@@ -2070,7 +2350,16 @@ function pathThroughSelection() {
   while (cursor) {
     const kids = (state.byParent.get(cursor.id) || []).slice();
     if (!kids.length) break;
-    kids.sort((left, right) => Number(right.weight) - Number(left.weight) || left.id - right.id);
+    if (diffMode) {
+      kids.sort(
+        (left, right) =>
+          Math.abs(Number(right.delta || 0)) - Math.abs(Number(left.delta || 0))
+          || Number(right.span || 0) - Number(left.span || 0)
+          || left.id - right.id
+      );
+    } else {
+      kids.sort((left, right) => Number(right.weight) - Number(left.weight) || left.id - right.id);
+    }
     const next = kids[0];
     if (!next || seen.has(next.id)) break;
     seen.add(next.id);
@@ -2083,18 +2372,31 @@ function pathThroughSelection() {
 function renderInspector() {
   const heavy = $("heaviest");
   clear(heavy);
+  const diffMode = isDiff();
   const through = pathThroughSelection();
   const label = $("heaviest-label");
   const scope = $("heaviest-scope");
   const items = through
-    ? through.map((node) => ({ frameId: node.frame, nodeId: node.id, weight: node.weight }))
+    ? through.map((node) => ({
+        frameId: node.frame,
+        nodeId: node.id,
+        weight: node.weight,
+        delta: node.delta,
+        baseline: node.baseline,
+      }))
     : state.tree
       ? state.tree.heaviest.map((frameId) => {
           const row = (state.tree.functions || []).find((f) => f.frame === frameId);
-          return { frameId, nodeId: null, weight: row ? row.weight : 0 };
+          return {
+            frameId,
+            nodeId: null,
+            weight: row ? row.weight : 0,
+            delta: row ? row.delta : 0,
+            baseline: row ? row.baseline : 0,
+          };
         })
       : [];
-  if (label) label.textContent = "Heaviest Stack Trace";
+  if (label) label.textContent = diffMode ? "Strongest Delta Path" : "Heaviest Stack Trace";
   if (scope) {
     scope.textContent = through
       ? "Through the selected function"
@@ -2108,16 +2410,27 @@ function renderInspector() {
       const item = el("li", "heavy-row");
       item.dataset.frame = String(entry.frameId);
       if (entry.nodeId != null) item.dataset.node = String(entry.nodeId);
-      const pct = state.tree && state.tree.total > 0
-        ? formatPercent(entry.weight, state.tree.total)
-        : "";
       const fullLoc = formatLocationFull(frame);
       const shortLoc = formatLocationShort(frame);
-      item.title = frame.name
-        + (fullLoc ? " — " + fullLoc : "")
-        + (pct ? " (" + pct + ")" : "");
 
-      const weightEl = el("span", "heavy-weight", formatWeight(entry.weight));
+      let weightEl;
+      if (diffMode) {
+        const d = Number(entry.delta || 0);
+        const cls = d > 0 ? "heavy-weight delta-pos" : d < 0 ? "heavy-weight delta-neg" : "heavy-weight";
+        weightEl = el("span", cls, formatSignedWeight(d));
+        item.title = frame.name
+          + (fullLoc ? " — " + fullLoc : "")
+          + " (" + formatSignedWeight(d) + ")";
+      } else {
+        const pct = state.tree && state.tree.total > 0
+          ? formatPercent(entry.weight, state.tree.total)
+          : "";
+        weightEl = el("span", "heavy-weight", formatWeight(entry.weight));
+        item.title = frame.name
+          + (fullLoc ? " — " + fullLoc : "")
+          + (pct ? " (" + pct + ")" : "");
+      }
+
       const bodyEl = el("div", "heavy-body");
       bodyEl.append(el("div", "heavy-fn", frame.name));
       if (shortLoc) {
@@ -2185,10 +2498,22 @@ function renderInspector() {
   if (frame.module) addDetail(detail, "Module", frame.module);
   if (frame.address) addDetail(detail, "Address", frame.address);
   addDetail(detail, "System library", frame.system ? "yes" : "no");
-  const weight = node ? node.weight : row ? row.weight : 0;
-  const self = node ? node.self : row ? row.self : 0;
-  addDetail(detail, "Weight", formatWeight(weight) + " (" + formatPercent(weight, state.tree.total) + ")");
-  addDetail(detail, "Self Weight", formatWeight(self) + " (" + formatPercent(self, state.tree.total) + ")");
+  if (diffMode) {
+    const src = node || row || {};
+    const base = Number(src.baseline || 0);
+    const comp = Number(src.comparison || 0);
+    const d = Number(src.delta || 0);
+    const ds = Number(src.deltaSelf || 0);
+    addDetail(detail, "Baseline", formatWeight(base));
+    addDetail(detail, "After", formatWeight(comp));
+    addDetail(detail, "Δ Weight", formatSignedWeight(d) + " (" + formatSignedPercent(d, base) + ")");
+    addDetail(detail, "Δ Self", formatSignedWeight(ds));
+  } else {
+    const weight = node ? node.weight : row ? row.weight : 0;
+    const self = node ? node.self : row ? row.self : 0;
+    addDetail(detail, "Weight", formatWeight(weight) + " (" + formatPercent(weight, state.tree.total) + ")");
+    addDetail(detail, "Self Weight", formatWeight(self) + " (" + formatPercent(self, state.tree.total) + ")");
+  }
 }
 
 function addDetail(detail, name, value) {
@@ -2382,6 +2707,17 @@ async function main() {
     return;
   }
   state.session = session;
+  if (isDiff()) {
+    state.sortKey = "delta";
+    state.sortDir = -1;
+    state.pane = "flame";
+    state.previousPane = "flame";
+    for (const button of document.querySelectorAll(".tabs button")) {
+      button.setAttribute("aria-selected", button.dataset.pane === "flame" ? "true" : "false");
+    }
+    const heavyBy = document.querySelector(".heavy-by");
+    if (heavyBy) heavyBy.textContent = "by |Δ Weight|";
+  }
   const userRuntimes = new Set();
   for (const frame of session.frames || []) {
     const rt = frame.runtime || "native";

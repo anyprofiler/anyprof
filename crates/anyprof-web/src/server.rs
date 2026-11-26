@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-use anyprof_export::{Trace, load_trace};
+use anyprof_export::{DiffTrace, Trace, load_diff, load_trace};
 
 use crate::Error;
 use crate::assets;
@@ -31,7 +31,7 @@ pub enum StopReason {
     TimedOut,
 }
 
-/// A localhost HTTP server for one profile and the built-in viewer.
+/// A localhost HTTP server for one profile (or a differential pair) and the built-in viewer.
 ///
 /// Everything lives under `/t/<token>/`, where the token is 128 random bits.
 /// Any other path, including a wrong token, is a 404.
@@ -49,22 +49,28 @@ impl Viewer {
     /// be parsed still starts the server; the page explains why.
     pub fn bind(name: &str, profile: Vec<u8>, port: u16) -> Result<Self, Error> {
         let token = Token::generate().map_err(|err| Error::Random(err.to_string()))?;
-        let server = Server::http(("127.0.0.1", port)).map_err(|source| Error::Bind {
-            port,
-            message: source.to_string(),
-        })?;
-        let port = server
-            .server_addr()
-            .to_ip()
-            .map(|addr| addr.port())
-            .ok_or_else(|| Error::Bind {
-                port,
-                message: "listener has no IP address".to_string(),
-            })?;
+        let (server, port) = bind_listener(port)?;
         Ok(Self {
             server,
             port,
             routes: Routes::new(token, name, profile),
+        })
+    }
+
+    /// Listen on `127.0.0.1:port` in differential mode comparing `before` and `after`.
+    pub fn bind_diff(
+        before_name: &str,
+        before: Vec<u8>,
+        after_name: &str,
+        after: Vec<u8>,
+        port: u16,
+    ) -> Result<Self, Error> {
+        let token = Token::generate().map_err(|err| Error::Random(err.to_string()))?;
+        let (server, port) = bind_listener(port)?;
+        Ok(Self {
+            server,
+            port,
+            routes: Routes::new_diff(token, before_name, before, after_name, after),
         })
     }
 
@@ -144,25 +150,91 @@ impl Viewer {
     }
 }
 
+fn bind_listener(port: u16) -> Result<(Server, u16), Error> {
+    let server = Server::http(("127.0.0.1", port)).map_err(|source| Error::Bind {
+        port,
+        message: source.to_string(),
+    })?;
+    let bound = server
+        .server_addr()
+        .to_ip()
+        .map(|addr| addr.port())
+        .ok_or_else(|| Error::Bind {
+            port,
+            message: "listener has no IP address".to_string(),
+        })?;
+    Ok((server, bound))
+}
+
+enum RouteMode {
+    Single {
+        name: String,
+        profile: Arc<[u8]>,
+        trace: Result<Box<Trace>, String>,
+    },
+    Diff {
+        name: String,
+        before_name: String,
+        after_name: String,
+        before: Arc<[u8]>,
+        after: Arc<[u8]>,
+        diff: Result<Box<DiffTrace>, String>,
+    },
+}
+
 struct Routes {
     token: Token,
-    name: String,
-    profile: Arc<[u8]>,
-    trace: Result<Trace, String>,
+    mode: RouteMode,
     profile_requests: AtomicUsize,
     announced: std::sync::atomic::AtomicBool,
 }
 
 impl Routes {
     fn new(token: Token, name: &str, profile: Vec<u8>) -> Self {
-        let trace = load_trace(&profile).map_err(|err| err.to_string());
+        let trace = load_trace(&profile)
+            .map(Box::new)
+            .map_err(|err| err.to_string());
         Self {
             token,
-            name: name.to_string(),
-            profile: profile.into(),
-            trace,
+            mode: RouteMode::Single {
+                name: name.to_string(),
+                profile: profile.into(),
+                trace,
+            },
             profile_requests: AtomicUsize::new(0),
             announced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn new_diff(
+        token: Token,
+        before_name: &str,
+        before: Vec<u8>,
+        after_name: &str,
+        after: Vec<u8>,
+    ) -> Self {
+        let diff = load_diff(&before, &after)
+            .map(Box::new)
+            .map_err(|err| err.to_string());
+        Self {
+            token,
+            mode: RouteMode::Diff {
+                name: format!("{before_name} → {after_name}"),
+                before_name: before_name.to_string(),
+                after_name: after_name.to_string(),
+                before: before.into(),
+                after: after.into(),
+                diff,
+            },
+            profile_requests: AtomicUsize::new(0),
+            announced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn total_bytes(&self) -> usize {
+        match &self.mode {
+            RouteMode::Single { profile, .. } => profile.len(),
+            RouteMode::Diff { before, after, .. } => before.len().saturating_add(after.len()),
         }
     }
 
@@ -171,7 +243,7 @@ impl Routes {
             .announced
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            tracing::info!(bytes = self.profile.len(), "browser fetched the profile");
+            tracing::info!(bytes = self.total_bytes(), "browser fetched the profile");
         }
     }
 
@@ -197,38 +269,93 @@ impl Routes {
             Some("profile") => {
                 self.profile_requests.fetch_add(1, Ordering::Relaxed);
                 self.announce();
-                Reply::ok(
-                    "application/octet-stream",
-                    Body::Shared(Arc::clone(&self.profile)),
-                )
+                let payload = match &self.mode {
+                    RouteMode::Single { profile, .. } => Arc::clone(profile),
+                    RouteMode::Diff { after, .. } => Arc::clone(after),
+                };
+                Reply::ok("application/octet-stream", Body::Shared(payload))
             }
+            Some("before") => match &self.mode {
+                RouteMode::Diff { before, .. } => {
+                    self.profile_requests.fetch_add(1, Ordering::Relaxed);
+                    self.announce();
+                    Reply::ok("application/octet-stream", Body::Shared(Arc::clone(before)))
+                }
+                RouteMode::Single { .. } => Reply::not_found(),
+            },
+            Some("after") => match &self.mode {
+                RouteMode::Diff { after, .. } => {
+                    self.profile_requests.fetch_add(1, Ordering::Relaxed);
+                    self.announce();
+                    Reply::ok("application/octet-stream", Body::Shared(Arc::clone(after)))
+                }
+                RouteMode::Single { .. } => Reply::not_found(),
+            },
             Some("session") => {
                 self.announce();
-                match &self.trace {
-                    Ok(trace) => Reply::json(200, &query::session_json(&self.name, trace)),
-                    Err(message) => Reply::json_error(422, message),
+                match &self.mode {
+                    RouteMode::Single { name, trace, .. } => match trace {
+                        Ok(trace) => Reply::json(200, &query::session_json(name, trace)),
+                        Err(message) => Reply::json_error(422, message),
+                    },
+                    RouteMode::Diff {
+                        name,
+                        before_name,
+                        after_name,
+                        diff,
+                        ..
+                    } => match diff {
+                        Ok(diff) => Reply::json(
+                            200,
+                            &query::diff_session_json(name, before_name, after_name, diff),
+                        ),
+                        Err(message) => Reply::json_error(422, message),
+                    },
                 }
             }
-            Some("tree") => match &self.trace {
-                Ok(trace) => match query::tree_json(trace, query) {
-                    Ok(body) => Reply::json(200, &body),
-                    Err(message) => Reply::json_error(400, &message),
+            Some("tree") => match &self.mode {
+                RouteMode::Single { trace, .. } => match trace {
+                    Ok(trace) => match query::tree_json(trace, query) {
+                        Ok(body) => Reply::json(200, &body),
+                        Err(message) => Reply::json_error(400, &message),
+                    },
+                    Err(message) => Reply::json_error(422, message),
                 },
-                Err(message) => Reply::json_error(422, message),
+                RouteMode::Diff { diff, .. } => match diff {
+                    Ok(diff) => match query::diff_tree_json(diff, query) {
+                        Ok(body) => Reply::json(200, &body),
+                        Err(message) => Reply::json_error(400, &message),
+                    },
+                    Err(message) => Reply::json_error(422, message),
+                },
             },
-            Some("timeline") => match &self.trace {
-                Ok(trace) => match query::timeline_json(trace, query) {
-                    Ok(body) => Reply::json(200, &body),
-                    Err(message) => Reply::json_error(422, &message),
+            Some("timeline") => match &self.mode {
+                RouteMode::Single { trace, .. } => match trace {
+                    Ok(trace) => match query::timeline_json(trace, query) {
+                        Ok(body) => Reply::json(200, &body),
+                        Err(message) => Reply::json_error(422, &message),
+                    },
+                    Err(message) => Reply::json_error(422, message),
                 },
-                Err(message) => Reply::json_error(422, message),
+                RouteMode::Diff { .. } => {
+                    Reply::json_error(422, "differential profiles do not have a timeline")
+                }
             },
-            Some("source") => match &self.trace {
-                Ok(trace) => match query::source_json(trace, query) {
-                    Ok(body) => Reply::json(200, &body),
-                    Err(message) => Reply::json_error(400, &message),
+            Some("source") => match &self.mode {
+                RouteMode::Single { trace, .. } => match trace {
+                    Ok(trace) => match query::source_json(trace, query) {
+                        Ok(body) => Reply::json(200, &body),
+                        Err(message) => Reply::json_error(400, &message),
+                    },
+                    Err(message) => Reply::json_error(422, message),
                 },
-                Err(message) => Reply::json_error(422, message),
+                RouteMode::Diff { diff, .. } => match diff {
+                    Ok(diff) => match query::diff_source_json(diff, query) {
+                        Ok(body) => Reply::json(200, &body),
+                        Err(message) => Reply::json_error(400, &message),
+                    },
+                    Err(message) => Reply::json_error(422, message),
+                },
             },
             Some(name) => self.asset(name, accepts_gzip),
         }

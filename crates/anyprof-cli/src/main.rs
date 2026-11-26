@@ -1,5 +1,6 @@
 mod cli;
 mod convert;
+mod diff;
 mod interrupt;
 mod output;
 mod proc_match;
@@ -36,6 +37,10 @@ fn try_main() -> Result<ExitCode> {
         }
         Command::View(args) => {
             view::run(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Diff(args) => {
+            diff::run(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Update => {

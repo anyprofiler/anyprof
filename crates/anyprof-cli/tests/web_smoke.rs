@@ -94,6 +94,7 @@ fn viewer_renders_profiles_in_headless_chrome() {
     for (path, kind) in &cases {
         check_one(&mut cdp, path, kind, artifacts.as_deref().unwrap_or(&dir));
     }
+    check_diff(&mut cdp, &dir, artifacts.as_deref().unwrap_or(&dir));
     drop(cdp);
     drop(browser);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1267,6 +1268,219 @@ fn assert_deep_zoom_and_source(cdp: &mut Cdp, session: Option<&str>, name: &str)
     );
 }
 
+fn check_diff(cdp: &mut Cdp, dir: &Path, keep: &Path) {
+    let src_path = dir.join("diff_service.py");
+    std::fs::write(
+        &src_path,
+        "def handle_request(req):\n    user = validate_auth(req)\n    data = legacy_regex(req)\n    body = serialize_json(data)\n    return fast_router(user, body)\n",
+    )
+    .unwrap();
+    let src_escaped = src_path.to_string_lossy().replace('\\', "/");
+
+    let before_json = format!(
+        r#"{{
+  "$schema": "https://www.speedscope.app/file-format-schema.json",
+  "shared": {{
+    "frames": [
+      {{"name": "[python] handle_request", "file": "{src_escaped}", "line": 1}},
+      {{"name": "[python] validate_auth", "file": "{src_escaped}", "line": 2}},
+      {{"name": "[python] legacy_regex", "file": "{src_escaped}", "line": 3}},
+      {{"name": "[python] serialize_json", "file": "{src_escaped}", "line": 4}},
+      {{"name": "[python] fast_router", "file": "{src_escaped}", "line": 5}}
+    ]
+  }},
+  "profiles": [{{
+    "type": "sampled",
+    "name": "before",
+    "unit": "milliseconds",
+    "startValue": 0,
+    "endValue": 100,
+    "samples": [[0, 2], [0, 3], [0, 1], [0, 4]],
+    "weights": [50, 20, 15, 15]
+  }}]
+}}"#
+    );
+    let after_json = format!(
+        r#"{{
+  "$schema": "https://www.speedscope.app/file-format-schema.json",
+  "shared": {{
+    "frames": [
+      {{"name": "[python] handle_request", "file": "{src_escaped}", "line": 1}},
+      {{"name": "[python] validate_auth", "file": "{src_escaped}", "line": 2}},
+      {{"name": "[python] serialize_json", "file": "{src_escaped}", "line": 4}},
+      {{"name": "[python] fast_router", "file": "{src_escaped}", "line": 5}},
+      {{"name": "[rust] simd_escape", "file": "{src_escaped}", "line": 4}}
+    ]
+  }},
+  "profiles": [{{
+    "type": "sampled",
+    "name": "after",
+    "unit": "milliseconds",
+    "startValue": 0,
+    "endValue": 135,
+    "samples": [[0, 2, 4], [0, 2], [0, 1], [0, 3]],
+    "weights": [55, 35, 30, 15]
+  }}]
+}}"#
+    );
+
+    let before = dir.join("baseline.speedscope.json");
+    let after = dir.join("current.speedscope.json");
+    std::fs::write(&before, before_json).unwrap();
+    std::fs::write(&after, after_json).unwrap();
+
+    let viewer = ViewerProcess::start_diff(&before, &after);
+    eprintln!("diff: {}", viewer.url);
+
+    let target = cdp.call(None, "Target.createTarget", json!({ "url": "about:blank" }));
+    let target_id = target["targetId"].as_str().unwrap().to_string();
+    let attached = cdp.call(
+        None,
+        "Target.attachToTarget",
+        json!({ "targetId": target_id, "flatten": true }),
+    );
+    let session_id = attached["sessionId"].as_str().unwrap().to_string();
+    let session = Some(session_id.as_str());
+    for method in ["Runtime.enable", "Log.enable", "Page.enable"] {
+        cdp.call(session, method, json!({}));
+    }
+    cdp.call(
+        session,
+        "Emulation.setDeviceMetricsOverride",
+        json!({ "width": 1280, "height": 820, "deviceScaleFactor": 2, "mobile": false }),
+    );
+    cdp.events.clear();
+    cdp.call(session, "Page.navigate", json!({ "url": viewer.url }));
+
+    assert!(
+        wait_for(
+            cdp,
+            session,
+            "document.documentElement.dataset.ready === '1' && !!document.querySelector('[data-testid=diff-overview]') && !!document.querySelector('[data-testid=flame]')"
+        ),
+        "diff viewer did not finish loading"
+    );
+
+    let inspect = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": r#"(function () {
+                const overview = document.querySelector('[data-testid=diff-overview]');
+                const cols = [...document.querySelectorAll('.cols.diff-cols button')].map(b => b.textContent.trim());
+                const rows = [...document.querySelectorAll('[data-testid=tree-row]')].map(r => r.textContent);
+                const posCount = document.querySelectorAll('.delta-pos').length;
+                const negCount = document.querySelectorAll('.delta-neg').length;
+                const canvas = document.querySelector('[data-testid=flame]');
+                const ctx = canvas.getContext('2d');
+                const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                let redPixels = 0;
+                let bluePixels = 0;
+                for (let i = 0; i < data.length; i += 16) {
+                    const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+                    if (a > 200) {
+                        if (r > 170 && r > g + 55 && r > b + 55) redPixels += 1;
+                        if (b > 170 && b > r + 55 && b > g + 20) bluePixels += 1;
+                    }
+                }
+                return {
+                    overview: overview ? overview.textContent : '',
+                    cols,
+                    rowText: rows.join('\n'),
+                    posCount,
+                    negCount,
+                    redPixels,
+                    bluePixels
+                };
+            })()"#,
+            "returnByValue": true,
+        }),
+    )["result"]["value"]
+        .clone();
+
+    let overview_text = inspect["overview"].as_str().unwrap_or("");
+    let row_text = inspect["rowText"].as_str().unwrap_or("");
+    assert!(
+        overview_text.contains("Baseline")
+            && overview_text.contains("After")
+            && overview_text.contains("Net Δ"),
+        "diff overview missing pills: {overview_text:?}"
+    );
+    assert!(
+        row_text.contains("serialize_json")
+            && row_text.contains("legacy_regex")
+            && row_text.contains("simd_escape"),
+        "diff tree must include regressions, new frames, and 100%-eliminated stacks:\n{row_text}"
+    );
+    assert!(
+        inspect["posCount"].as_u64().unwrap_or(0) > 0
+            && inspect["negCount"].as_u64().unwrap_or(0) > 0,
+        "diff view missing signed +delta / -delta badges: {inspect}"
+    );
+    assert!(
+        inspect["redPixels"].as_u64().unwrap_or(0) > 50
+            && inspect["bluePixels"].as_u64().unwrap_or(0) > 50,
+        "differential flame graph must paint both red (+delta) and blue (-delta) bars: {inspect}"
+    );
+
+    let shot_light = cdp.call(
+        session,
+        "Page.captureScreenshot",
+        json!({ "format": "png" }),
+    );
+    std::fs::write(
+        keep.join("diff-flamegraph-light.png"),
+        base64_decode(shot_light["data"].as_str().unwrap()),
+    )
+    .unwrap();
+
+    // Switch to dark theme and capture dark differential flame graph screenshot too.
+    cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "document.querySelector('.theme button[data-theme=\"dark\"]').click()",
+            "returnByValue": true,
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(80));
+    let shot_dark = cdp.call(
+        session,
+        "Page.captureScreenshot",
+        json!({ "format": "png" }),
+    );
+    std::fs::write(
+        keep.join("diff-flamegraph-dark.png"),
+        base64_decode(shot_dark["data"].as_str().unwrap()),
+    )
+    .unwrap();
+
+    // Click inline file:line link on serialize_json to verify diff source gutter.
+    cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "[...document.querySelectorAll('.loc-link')].find(el => el.textContent.includes('diff_service.py:4')).click()",
+            "returnByValue": true,
+        }),
+    );
+    assert!(
+        wait_for(
+            cdp,
+            session,
+            "!!document.querySelector('.source-cols.diff-source-cols') && !!document.querySelector('.source-row.source-reg') && !!document.querySelector('.source-row.source-imp')"
+        ),
+        "diff source view did not render Baseline/After/Delta Self columns and red/blue line highlights"
+    );
+
+    let problems = cdp.problems();
+    assert!(
+        problems.is_empty(),
+        "diff viewer logged errors: {problems:#?}"
+    );
+    cdp.call(None, "Target.closeTarget", json!({ "targetId": target_id }));
+}
+
 struct ViewerProcess {
     child: Child,
     url: String,
@@ -1276,11 +1490,27 @@ struct ViewerProcess {
 
 impl ViewerProcess {
     fn start(path: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_anyprof"))
-            .arg("-v")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_anyprof"));
+        cmd.arg("-v")
             .arg("view")
             .arg(path)
-            .args(["--no-open", "--web-timeout", "5m"])
+            .args(["--no-open", "--web-timeout", "5m"]);
+        Self::spawn_cmd(cmd)
+    }
+
+    fn start_diff(before: &Path, after: &Path) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_anyprof"));
+        cmd.arg("-v").arg("diff").arg(before).arg(after).args([
+            "-w",
+            "--no-open",
+            "--web-timeout",
+            "5m",
+        ]);
+        Self::spawn_cmd(cmd)
+    }
+
+    fn spawn_cmd(mut cmd: Command) -> Self {
+        let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -1299,7 +1529,7 @@ impl ViewerProcess {
         let url = loop {
             let line = lines
                 .recv_timeout(Duration::from_secs(30))
-                .unwrap_or_else(|_| panic!("anyprof view printed no URL: {seen:#?}"));
+                .unwrap_or_else(|_| panic!("anyprof viewer printed no URL: {seen:#?}"));
             let url = line
                 .split_whitespace()
                 .find(|word| word.starts_with("http://127.0.0.1:"))
