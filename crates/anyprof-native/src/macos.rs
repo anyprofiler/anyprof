@@ -401,15 +401,36 @@ impl Task {
         let pid_i = i32::try_from(pid).map_err(|_| {
             Error::backend("native", format!("pid {pid} does not fit in a Mach pid"))
         })?;
-        let mut port: mach_port_t = 0;
-        // SAFETY: `task_for_pid` writes one send right into `port`. The kernel
-        // rejects the call (typically kern return 5) unless we are root or
-        // hold a debugger entitlement. The port is deallocated in `Drop`.
-        let kr = unsafe { task_for_pid(mach_task_self(), pid_i, &mut port) };
-        if kr != KERN_SUCCESS || port == 0 {
-            return Err(Error::backend("native", permission_message(pid, kr)));
+        // When attaching to a freshly spawned launcher stub (for example
+        // `Python.framework/.../bin/python3.14` calling `POSIX_SPAWN_SETEXEC`
+        // into `Python.app/Contents/MacOS/Python`), XNU can finish its
+        // `taskgated-helper` check (`kr == KERN_SUCCESS`) just as
+        // `exec_mach_imgact` terminates the stub's `task_t` and installs a new
+        // `task_t`, causing `convert_task_to_port` to write `MACH_PORT_NULL`
+        // (`port == 0`) for a still-live `pid`. Retry until the post-exec task
+        // port settles.
+        let mut last_kr: kern_return_t = KERN_SUCCESS;
+        for attempt in 0..40u32 {
+            let mut port: mach_port_t = 0;
+            // SAFETY: `task_for_pid` writes one send right into `port`. The
+            // kernel rejects the call (typically kern return 5) unless we are
+            // root or hold a debugger entitlement. The port is deallocated in
+            // `Drop`.
+            let kr = unsafe { task_for_pid(mach_task_self(), pid_i, &mut port) };
+            if kr == KERN_SUCCESS && port != 0 {
+                return Ok(Self { port });
+            }
+            last_kr = kr;
+            if kr != KERN_SUCCESS {
+                if attempt >= 2 || !anyprof_core::process_exists(pid) {
+                    break;
+                }
+            } else if !anyprof_core::process_exists(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        Ok(Self { port })
+        Err(Error::backend("native", permission_message(pid, last_kr)))
     }
 
     fn sample_addresses(
