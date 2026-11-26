@@ -297,12 +297,13 @@ fn record_impl(
         let early_interrupt = match opts.duration {
             // When `--time-limit` was given to `xctrace`, let `xctrace` finish its
             // own recording window (including first-boot Instruments XPC daemon
-            // cold start, which can take ~15-25s on fresh VMs) unless `opts.stop`
-            // fired early (Ctrl+C / child exit) or `xctrace` exceeded a 45s grace window.
+            // cold start, which can take 20-60s on heavily loaded CI VMs) unless
+            // `opts.stop` fired early (Ctrl+C / child exit) or `xctrace` exceeded a
+            // 120s grace window.
             Some(limit) => {
                 (opts.stop.stop_requested()
                     && started.elapsed().saturating_add(Duration::from_millis(80)) < limit)
-                    || started.elapsed() > limit.saturating_add(Duration::from_secs(45))
+                    || started.elapsed() > limit.saturating_add(Duration::from_secs(120))
             }
             None => stop_now,
         };
@@ -319,7 +320,7 @@ fn record_impl(
             }
             sent_sigint = true;
         }
-        if sent_sigint && started.elapsed() > Duration::from_secs(60) {
+        if sent_sigint && started.elapsed() > Duration::from_secs(150) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(Error::backend(
