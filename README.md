@@ -4,7 +4,7 @@ Capture CPU profiles from any running process — no code changes, agents, or re
 
 `anyprof` attaches to a live process by PID (or a browser tab over CDP), records CPU samples behind a unified `Backend` model, and writes standard profile formats or opens them directly in a built-in, zero-dependency offline viewer.
 
-- **Multi-runtime**: Node.js, Browser pages (Chrome / Chromium / Edge), C/C++, Rust, Go, Python (CPython 3.11–3.13), and Java (HotSpot JDK 17 / 21 / 25).
+- **Multi-runtime**: Node.js, Browser pages (Chrome / Chromium / Edge), C/C++, Rust, Go, Python (CPython 3.11–3.14), and Java (HotSpot JDK 17 / 21 / 25).
 - **Standard formats**: Collapsed stacks, Speedscope JSON, `pprof` (`.pb.gz`), and V8 `.cpuprofile` — plus format conversion via `anyprof convert`.
 - **Built-in offline viewer**: `anyprof view` (or `anyprof rec -w`) serves an interactive call tree, flat function table, flame graph, and timeline on `127.0.0.1` without uploading data anywhere.
 - **Safe attach**: Never injects code or restarts targets; automatically closes any Node.js inspector port it had to activate.
@@ -18,7 +18,7 @@ Capture CPU profiles from any running process — no code changes, agents, or re
 | **C / C++** | `native` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Mach `task_for_pid` (macOS), `StackWalk64` (Windows), `perf_event_open` (Linux) |
 | **Rust** | `rust` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Native sampler + `rustc-demangle` (`[rust]` frames) |
 | **Go** | `go` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Go 1.18–1.26+ `pclntab` (`pcsp`) unwind; works on stripped (`-s -w`) binaries |
-| **Python** | `python` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | CPython 3.11–3.13 (GIL); walks `_PyRuntime` frame chains (`[python]` + file:line) |
+| **Python** | `python` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | CPython 3.11–3.14 (GIL); walks `_PyRuntime` frame chains (`[python]` + file:line) |
 | **Java** | `java` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | HotSpot JDK 17, 21, 25; walks CodeCache `nmethod` & interpreter frames (`[java]`) |
 
 When `--backend` is omitted, auto-detection checks `node` → `rust` → `go` → `python` → `java` → `native` (`browser` requires `-B` / `--browser` or `-b browser`). Non-native frames are prefixed with `[runtime]` (`[node]`, `[rust]`, `[go]`, `[python]`, `[java]`, `[kernel]`) so mixed stacks preserve frame origin. Other CPU architectures compile cleanly and return not-implemented on `start`.
@@ -142,7 +142,7 @@ anyprof record / view / convert (anyprof-cli)
   ├── anyprof-native    macOS Mach, Windows x64 StackWalk64, Linux x86_64/aarch64 perf_event_open
   ├── anyprof-rust      Rust binary detection & symbol demangling
   ├── anyprof-go        Go 1.18–1.26+ pclntab (pcsp) unwinder
-  ├── anyprof-python    CPython 3.11–3.13 _PyRuntime frame-chain walker
+  ├── anyprof-python    CPython 3.11–3.14 _PyRuntime frame-chain walker
   ├── anyprof-java      HotSpot JDK 17/21/25 CodeCache & interpreter walker
   ├── anyprof-export    collapsed, speedscope, pprof, cpuprofile & viewer trace engine
   └── anyprof-web       Embedded localhost viewer (127.0.0.1/t/<token>/)

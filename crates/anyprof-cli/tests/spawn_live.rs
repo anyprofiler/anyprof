@@ -372,6 +372,7 @@ fn find_python() -> Option<PathBuf> {
     for key in [
         "ANYPROF_PYTHON_312",
         "ANYPROF_PYTHON_313",
+        "ANYPROF_PYTHON_314",
         "ANYPROF_PYTHON_311",
         "ANYPROF_PYTHON",
     ] {
@@ -385,6 +386,7 @@ fn find_python() -> Option<PathBuf> {
     for candidate in [
         "python3.12",
         "python3.13",
+        "python3.14",
         "python3.11",
         "python3",
         "python",
@@ -392,7 +394,7 @@ fn find_python() -> Option<PathBuf> {
         let out = Command::new(candidate)
             .args([
                 "-c",
-                "import sys; print(sys.executable if (3, 11) <= sys.version_info[:2] <= (3, 13) else '')",
+                "import sys; print(sys.executable if (3, 11) <= sys.version_info[:2] <= (3, 14) else '')",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -423,9 +425,9 @@ fn spawn_python_captures_interpreter_frames_as_parent() {
     let _guard = live_lock();
     let Some(python) = find_python() else {
         if required() {
-            panic!("supported CPython 3.11..3.13 was not found");
+            panic!("supported CPython 3.11..3.14 was not found");
         }
-        eprintln!("skipping spawn_python test: no CPython 3.11..3.13 found");
+        eprintln!("skipping spawn_python test: no CPython 3.11..3.14 found");
         return;
     };
 

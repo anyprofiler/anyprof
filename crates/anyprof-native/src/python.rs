@@ -20,17 +20,18 @@
 //! two pure-Python threads show up as the GIL switches. Parked threads are
 //! not walked.
 //!
-//! Layouts that are walked: the default GIL builds of 3.11, 3.12, and 3.13.
-//! 3.11 and 3.12 use offsets checked against those headers (`current_frame`
-//! is 8 in 3.11 because `_PyCFrame` starts with `use_tracing`, and compact
-//! ASCII data starts at 48 because `PyASCIIObject` still has `wstr`). 3.13
-//! reads `_Py_DebugOffsets` from the file when `free_threaded` is 0. Any
-//! other version, a free-threaded build, or a table that does not match
-//! that 3.13 layout is not walked. Selecting the python backend then fails
-//! instead of recording native interpreter frames under that name. On Linux
-//! the frame read is `process_vm_readv`, which needs ptrace attach
-//! permission; a denied read is the same kind of error. 32-bit images are
-//! not walked.
+//! Layouts that are walked: the default GIL builds of 3.11, 3.12, 3.13, and
+//! 3.14. 3.11 and 3.12 use offsets checked against those headers
+//! (`current_frame` is 8 in 3.11 because `_PyCFrame` starts with
+//! `use_tracing`, and compact ASCII data starts at 48 because `PyASCIIObject`
+//! still has `wstr`). 3.13 and 3.14 read `_Py_DebugOffsets` from the file when
+//! `free_threaded` is 0 (3.14 also untags `_PyStackRef` on `f_executable` and
+//! skips `owner >= 3` entry shim frames). Any other version, a free-threaded
+//! build, or a table that does not match that minor version's layout is not
+//! walked. Selecting the python backend then fails instead of recording native
+//! interpreter frames under that name. On Linux the frame read is
+//! `process_vm_readv`, which needs ptrace attach permission; a denied read is
+//! the same kind of error. 32-bit images are not walked.
 
 use std::path::{Path, PathBuf};
 
@@ -96,6 +97,10 @@ struct Offsets {
     frame_code: u64,
     frame_previous: u64,
     frame_instr: u64,
+    /// Byte offset of `_PyInterpreterFrame.owner` (`char`), when present.
+    frame_owner: Option<u64>,
+    /// True on CPython 3.14, where `f_executable` is a tagged `_PyStackRef`.
+    stackref_executable: bool,
     code_filename: u64,
     code_qualname: u64,
     code_linetable: u64,
@@ -104,9 +109,9 @@ struct Offsets {
     str_state: u64,
     str_length: u64,
     /// Compact ASCII data. 48 on 3.11 (`wstr` is still in `PyASCIIObject`),
-    /// 40 on 3.12 and 3.13.
+    /// 40 on 3.12, 3.13, and 3.14.
     str_ascii: u64,
-    /// Compact non-ASCII data. 72 on 3.11, 56 on 3.12 and 3.13.
+    /// Compact non-ASCII data. 72 on 3.11, 56 on 3.12, 3.13, and 3.14.
     str_compact: u64,
     bytes_size: u64,
     bytes_data: u64,
@@ -192,13 +197,28 @@ impl PythonVm {
     ) -> Option<Vec<PyName>> {
         let mut frame = self.current_frame(thread, read)?;
         let mut out = Vec::new();
-        for index in 0..MAX_PY_FRAMES {
-            if !plausible_ptr(frame) {
+        for _ in 0..(MAX_PY_FRAMES * 2) {
+            if out.len() >= MAX_PY_FRAMES || !plausible_ptr(frame) {
                 break;
+            }
+            if let Some(owner_off) = self.offsets.frame_owner {
+                let owner = read_u8(read, frame.checked_add(owner_off)?)?;
+                // `FRAME_OWNED_BY_THREAD` (0), `GENERATOR` (1), and `FRAME_OBJECT` (2)
+                // execute Python code objects; `FRAME_OWNED_BY_INTERPRETER` / `CSTACK`
+                // (`>= 3`) are entry/C-stack shim frames whose `previous` links to the
+                // outer Python caller (or NULL at the root).
+                if owner >= 3 {
+                    let next = read_ptr(read, frame.checked_add(self.offsets.frame_previous)?)?;
+                    if next == frame {
+                        break;
+                    }
+                    frame = next;
+                    continue;
+                }
             }
             match self.one_frame(frame, read) {
                 Some(name) => out.push(name),
-                None if index == 0 => return None,
+                None if out.is_empty() => return None,
                 None => break,
             }
             let next = read_ptr(read, frame.checked_add(self.offsets.frame_previous)?)?;
@@ -228,7 +248,15 @@ impl PythonVm {
         frame: u64,
         read: &mut impl FnMut(u64, &mut [u8]) -> bool,
     ) -> Option<PyName> {
-        let code = read_ptr(read, frame.checked_add(self.offsets.frame_code)?)?;
+        let code_slot = frame.checked_add(self.offsets.frame_code)?;
+        let code = if self.offsets.stackref_executable {
+            read_stackref_ptr(read, code_slot)?
+        } else {
+            read_ptr(read, code_slot)?
+        };
+        if !plausible_ptr(code) {
+            return None;
+        }
         let name = read_unicode(
             read,
             code.checked_add(self.offsets.code_qualname)?,
@@ -361,6 +389,14 @@ fn plausible_ptr(addr: u64) -> bool {
     (0x1000..crate::walk::USER_ADDR_LIMIT).contains(&addr) && addr.is_multiple_of(8)
 }
 
+fn read_u8(read: &mut impl FnMut(u64, &mut [u8]) -> bool, addr: u64) -> Option<u8> {
+    if addr < 0x1000 {
+        return None;
+    }
+    let mut buf = [0u8; 1];
+    read(addr, &mut buf).then_some(buf[0])
+}
+
 fn read_u64(read: &mut impl FnMut(u64, &mut [u8]) -> bool, addr: u64) -> Option<u64> {
     if addr < 0x1000 {
         return None;
@@ -375,6 +411,22 @@ fn read_ptr(read: &mut impl FnMut(u64, &mut [u8]) -> bool, addr: u64) -> Option<
         return Some(0);
     }
     plausible_ptr(value).then_some(value)
+}
+
+fn read_stackref_ptr(read: &mut impl FnMut(u64, &mut [u8]) -> bool, addr: u64) -> Option<u64> {
+    let raw = read_u64(read, addr)?;
+    // In CPython 3.14 default GIL builds (`Py_TAG_BITS = 3`, `Py_TAG_REFCNT = 1`),
+    // object `_PyStackRef` values carry tag 0 (mortal) or 1 (immortal/deferred),
+    // and `PyStackRef_NULL` is 1 (`raw & !3 == 0`). Tags 2 and 3 (`Py_INT_TAG`)
+    // are not object pointers.
+    if (raw & 3) > 1 {
+        return None;
+    }
+    let ptr = raw & !3;
+    if ptr == 0 {
+        return Some(0);
+    }
+    plausible_ptr(ptr).then_some(ptr)
 }
 
 fn read_i32(read: &mut impl FnMut(u64, &mut [u8]) -> bool, addr: u64) -> Option<i32> {
@@ -500,6 +552,8 @@ fn fixed_312() -> Offsets {
         frame_code: 0,
         frame_previous: 8,
         frame_instr: 56,
+        frame_owner: Some(70),
+        stackref_executable: false,
         code_filename: 112,
         code_qualname: 128,
         code_linetable: 136,
@@ -528,6 +582,8 @@ fn fixed_311() -> Offsets {
         frame_code: 32,
         frame_previous: 48,
         frame_instr: 56,
+        frame_owner: None,
+        stackref_executable: false,
         code_filename: 112,
         code_qualname: 128,
         code_linetable: 136,
@@ -547,21 +603,21 @@ fn fixed_311() -> Offsets {
 fn layout_for(path: &Path, image: &PythonImage) -> Result<Offsets, String> {
     let Some((major, minor, micro)) = read_version(path, image) else {
         return Err(
-            "CPython was detected from `_PyRuntime`, but `Py_Version` is not exported. The default GIL builds of 3.11, 3.12, and 3.13 export that symbol. This process was not walked"
+            "CPython was detected from `_PyRuntime`, but `Py_Version` is not exported. The default GIL builds of 3.11, 3.12, 3.13, and 3.14 export that symbol. This process was not walked"
                 .to_string(),
         );
     };
     let label = format!("{major}.{minor}.{micro}");
-    if major != 3 || !matches!(minor, 11..=13) {
+    if major != 3 || !matches!(minor, 11..=14) {
         return Err(format!(
-            "CPython {label} was detected and is not walked. Supported builds are the default GIL layouts of 3.11, 3.12, and 3.13"
+            "CPython {label} was detected and is not walked. Supported builds are the default GIL layouts of 3.11, 3.12, 3.13, and 3.14"
         ));
     }
     let cookie = runtime_cookie(path, image);
     if matches!(minor, 11 | 12) {
         if cookie {
             return Err(format!(
-                "CPython {label} was detected, but `_PyRuntime` starts with the 3.13 `xdebugpy` cookie. That build is not walked"
+                "CPython {label} was detected, but `_PyRuntime` starts with the `xdebugpy` cookie. That build is not walked"
             ));
         }
         return Ok(if minor == 11 {
@@ -582,10 +638,10 @@ fn layout_for(path: &Path, image: &PythonImage) -> Result<Offsets, String> {
         .unwrap_or(u64::MAX);
     if free != 0 {
         return Err(format!(
-            "CPython {label} free-threaded build was detected and is not walked. Supported builds are the default GIL layouts of 3.11, 3.12, and 3.13"
+            "CPython {label} free-threaded build was detected and is not walked. Supported builds are the default GIL layouts of 3.11, 3.12, 3.13, and 3.14"
         ));
     }
-    debug_offsets(path, image.runtime_file).ok_or_else(|| {
+    debug_offsets(path, image.runtime_file, minor).ok_or_else(|| {
         format!(
             "CPython {label} was detected, but its `_Py_DebugOffsets` table is not a supported GIL layout. This build was not walked"
         )
@@ -607,19 +663,102 @@ fn runtime_cookie(path: &Path, image: &PythonImage) -> bool {
     read_file(path, image.runtime_file, &mut cookie).is_some() && &cookie == b"xdebugpy"
 }
 
-fn debug_offsets(path: &Path, runtime_file: u64) -> Option<Offsets> {
+struct DebugSlots {
+    thread_size: u64,
+    tstate_next: u64,
+    current_frame: u64,
+    native_thread_id: u64,
+    frame_size: u64,
+    frame_previous: u64,
+    frame_code: u64,
+    frame_instr: u64,
+    frame_owner: u64,
+    code_size: u64,
+    code_filename: u64,
+    code_qualname: u64,
+    code_linetable: u64,
+    code_firstlineno: u64,
+    code_adaptive: u64,
+    bytes_object: u64,
+    bytes_size: u64,
+    bytes_data: u64,
+    unicode_object: u64,
+    str_state: u64,
+    str_length: u64,
+    str_ascii: u64,
+    stackref_executable: bool,
+}
+
+const SLOTS_313: DebugSlots = DebugSlots {
+    thread_size: 152,
+    tstate_next: 168,
+    current_frame: 184,
+    native_thread_id: 200,
+    frame_size: 224,
+    frame_previous: 232,
+    frame_code: 240,
+    frame_instr: 248,
+    frame_owner: 264,
+    code_size: 272,
+    code_filename: 280,
+    code_qualname: 296,
+    code_linetable: 304,
+    code_firstlineno: 312,
+    code_adaptive: 344,
+    bytes_object: 512,
+    bytes_size: 520,
+    bytes_data: 528,
+    unicode_object: 536,
+    str_state: 544,
+    str_length: 552,
+    str_ascii: 560,
+    stackref_executable: false,
+};
+
+const SLOTS_314: DebugSlots = DebugSlots {
+    thread_size: 176,
+    tstate_next: 192,
+    current_frame: 208,
+    native_thread_id: 224,
+    frame_size: 248,
+    frame_previous: 256,
+    frame_code: 264,
+    frame_instr: 272,
+    frame_owner: 288,
+    code_size: 312,
+    code_filename: 320,
+    code_qualname: 336,
+    code_linetable: 344,
+    code_firstlineno: 352,
+    code_adaptive: 384,
+    bytes_object: 592,
+    bytes_size: 600,
+    bytes_data: 608,
+    unicode_object: 616,
+    str_state: 624,
+    str_length: 632,
+    str_ascii: 640,
+    stackref_executable: true,
+};
+
+fn debug_offsets(path: &Path, runtime_file: u64, minor: u32) -> Option<Offsets> {
+    let slots = match minor {
+        13 => &SLOTS_313,
+        14 => &SLOTS_314,
+        _ => return None,
+    };
     let at = |slot: u64| read_file_u64(path, runtime_file.checked_add(slot)?);
     // Sizes are the first field of each group in `_Py_DebugOffsets`.
-    // 3.13's interpreter state is far larger than 4 KiB, so the bound is
+    // 3.13+ interpreter state is far larger than 4 KiB, so the bound is
     // that size rather than a fixed cap. An inserted field in a later
     // minor version makes an offset fall outside its size.
     let runtime_size = at(24)?;
     let interp_size = at(48)?;
-    let thread_size = at(152)?;
-    let frame_size = at(224)?;
-    let code_size = at(272)?;
-    let bytes_object = at(512)?;
-    let unicode_object = at(536)?;
+    let thread_size = at(slots.thread_size)?;
+    let frame_size = at(slots.frame_size)?;
+    let code_size = at(slots.code_size)?;
+    let bytes_object = at(slots.bytes_object)?;
+    let unicode_object = at(slots.unicode_object)?;
     if !plausible_size(runtime_size, 64, 1 << 20)
         || !plausible_size(interp_size, 64, 1 << 20)
         || !plausible_size(thread_size, 32, 4096)
@@ -633,24 +772,29 @@ fn debug_offsets(path: &Path, runtime_file: u64) -> Option<Offsets> {
     let interpreters_head = at(40)?;
     let interp_next = at(64)?;
     let threads_head = at(72)?;
-    let tstate_next = at(168)?;
-    let current_frame = at(184)?;
-    let native_thread_id = at(200)?;
-    let frame_previous = at(232)?;
-    let frame_code = at(240)?;
-    let frame_instr = at(248)?;
-    let code_filename = at(280)?;
-    let code_qualname = at(296)?;
-    let code_linetable = at(304)?;
-    let code_firstlineno = at(312)?;
-    let code_adaptive = at(344)?;
-    let bytes_size = at(520)?;
-    let bytes_data = at(528)?;
-    let str_state = at(544)?;
-    let str_length = at(552)?;
-    let str_ascii = at(560)?;
-    // 3.13 compact non-ASCII data follows `utf8_length` and `utf8`.
+    let tstate_next = at(slots.tstate_next)?;
+    let current_frame = at(slots.current_frame)?;
+    let native_thread_id = at(slots.native_thread_id)?;
+    let frame_previous = at(slots.frame_previous)?;
+    let frame_code = at(slots.frame_code)?;
+    let frame_instr = at(slots.frame_instr)?;
+    let frame_owner_raw = at(slots.frame_owner)?;
+    let code_filename = at(slots.code_filename)?;
+    let code_qualname = at(slots.code_qualname)?;
+    let code_linetable = at(slots.code_linetable)?;
+    let code_firstlineno = at(slots.code_firstlineno)?;
+    let code_adaptive = at(slots.code_adaptive)?;
+    let bytes_size = at(slots.bytes_size)?;
+    let bytes_data = at(slots.bytes_data)?;
+    let str_state = at(slots.str_state)?;
+    let str_length = at(slots.str_length)?;
+    let str_ascii = at(slots.str_ascii)?;
+    // 3.13 and 3.14 compact non-ASCII data follows `utf8_length` and `utf8`.
     let str_compact = str_ascii.checked_add(16)?;
+    // `owner` is a 1-byte `char` inside `_PyInterpreterFrame` (not 4-byte aligned).
+    if frame_owner_raw == 0 || frame_owner_raw >= frame_size {
+        return None;
+    }
     let inside = [
         (interpreters_head, runtime_size),
         (interp_next, interp_size),
@@ -672,7 +816,7 @@ fn debug_offsets(path: &Path, runtime_file: u64) -> Option<Offsets> {
         (str_length, unicode_object),
     ];
     // `frame_code`, `frame_previous`, and `interp_next` may be zero.
-    // The rest are fields past the start of their struct in every 3.13 build.
+    // The rest are fields past the start of their struct in every 3.13/3.14 build.
     let required = [
         interpreters_head,
         threads_head,
@@ -711,6 +855,8 @@ fn debug_offsets(path: &Path, runtime_file: u64) -> Option<Offsets> {
         frame_code,
         frame_previous,
         frame_instr,
+        frame_owner: Some(frame_owner_raw),
+        stackref_executable: slots.stackref_executable,
         code_filename,
         code_qualname,
         code_linetable,
@@ -803,13 +949,13 @@ enum Support {
 /// Refuses a python-backend profile that would not contain Python frames.
 ///
 /// Detection only looks for `_PyRuntime`. This then requires one of the
-/// walked layouts: the default GIL builds of 3.11, 3.12, and 3.13. Anything
-/// else, including an older CPython, 3.14, and a free-threaded 3.13, is an
-/// error. On Linux `x86_64` and `aarch64` a supported process is also probed
-/// with `process_vm_readv`. `EPERM` and `EACCES` are errors that name the errno
-/// and `kernel.yama.ptrace_scope`. anyprof does not change that sysctl.
-/// Either failure returns before a native interpreter stack can be recorded
-/// under the python backend.
+/// walked layouts: the default GIL builds of 3.11, 3.12, 3.13, and 3.14.
+/// Anything else, including an older CPython, 3.15+, and a free-threaded
+/// build, is an error. On Linux `x86_64` and `aarch64` a supported process is
+/// also probed with `process_vm_readv`. `EPERM` and `EACCES` are errors that
+/// name the errno and `kernel.yama.ptrace_scope`. anyprof does not change that
+/// sysctl. Either failure returns before a native interpreter stack can be
+/// recorded under the python backend.
 pub fn prepare_python(pid: u32) -> Result<(), Error> {
     if pid == 0 {
         return Ok(());
@@ -1237,6 +1383,7 @@ mod tests {
         put(&mut bytes, 232, 8);
         put(&mut bytes, 240, 0);
         put(&mut bytes, 248, 56);
+        put(&mut bytes, 264, 70);
         put(&mut bytes, 272, 208);
         put(&mut bytes, 280, 112);
         put(&mut bytes, 296, 128);
@@ -1271,6 +1418,8 @@ mod tests {
         assert_eq!(offsets.interpreters_head, 632);
         assert_eq!(offsets.interp_next, 7_264);
         assert_eq!(offsets.frame_code, 0);
+        assert_eq!(offsets.frame_owner, Some(70));
+        assert!(!offsets.stackref_executable);
         assert_eq!(offsets.str_ascii, 40);
         assert_eq!(offsets.str_compact, 56);
         assert!(offsets.cframe.is_none());
@@ -1279,15 +1428,22 @@ mod tests {
         let err = layout_for(&path, &image).expect_err("a corrupt table is not walked");
         assert!(err.contains("not a supported GIL layout"), "{err}");
 
-        // The same table with a 3.14 version must be rejected even though
-        // every 3.13 slot is still in range. The version is the gate.
+        // A 3.13 table stamped as 3.14 fails 3.14 slot validation, and 3.15 is
+        // rejected at the version gate.
+        let mut wrong_minor = bytes.clone();
+        wrong_minor[40] = 0x78;
+        let version_at = 568;
+        wrong_minor[version_at..version_at + 4].copy_from_slice(&0x030E_00F0u32.to_le_bytes());
+        std::fs::write(&path, &wrong_minor).unwrap();
+        let err = layout_for(&path, &image).expect_err("3.13 table is not a valid 3.14 layout");
+        assert!(err.contains("not a supported GIL layout"), "{err}");
+
         let mut later = bytes.clone();
         later[40] = 0x78;
-        let version_at = 568;
-        later[version_at..version_at + 4].copy_from_slice(&0x030E_00F0u32.to_le_bytes());
+        later[version_at..version_at + 4].copy_from_slice(&0x030F_00F0u32.to_le_bytes());
         std::fs::write(&path, &later).unwrap();
-        let err = layout_for(&path, &image).expect_err("3.14 is not walked");
-        assert!(err.contains("3.14.0"), "{err}");
+        let err = layout_for(&path, &image).expect_err("3.15 is not walked");
+        assert!(err.contains("3.15.0"), "{err}");
         assert!(err.contains("not walked"), "{err}");
 
         // A free-threaded 3.13 keeps the cookie and the version. The flag
@@ -1301,6 +1457,164 @@ mod tests {
         assert!(err.contains("free-threaded"), "{err}");
         assert!(err.contains("not walked"), "{err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn debug_offsets_accept_a_314_interpreter_and_untag_stackref() {
+        let mut bytes = vec![0u8; 648];
+        bytes[..8].copy_from_slice(b"xdebugpy");
+        let put = |buf: &mut [u8], slot: usize, value: u64| {
+            buf[slot..slot + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut bytes, 24, 290_000);
+        put(&mut bytes, 40, 640);
+        put(&mut bytes, 48, 200_000);
+        put(&mut bytes, 64, 7_280);
+        put(&mut bytes, 72, 7_360);
+        put(&mut bytes, 176, 320);
+        put(&mut bytes, 192, 8);
+        put(&mut bytes, 208, 72);
+        put(&mut bytes, 224, 160);
+        put(&mut bytes, 248, 88);
+        put(&mut bytes, 256, 8);
+        put(&mut bytes, 264, 0);
+        put(&mut bytes, 272, 56);
+        put(&mut bytes, 288, 74);
+        put(&mut bytes, 312, 216);
+        put(&mut bytes, 320, 112);
+        put(&mut bytes, 336, 128);
+        put(&mut bytes, 344, 136);
+        put(&mut bytes, 352, 68);
+        put(&mut bytes, 384, 208);
+        put(&mut bytes, 592, 40);
+        put(&mut bytes, 600, 16);
+        put(&mut bytes, 608, 32);
+        put(&mut bytes, 616, 64);
+        put(&mut bytes, 624, 32);
+        put(&mut bytes, 632, 16);
+        put(&mut bytes, 640, 40);
+        let version_at = bytes.len();
+        bytes.extend_from_slice(&0x030E_02F0u32.to_le_bytes());
+        let path =
+            std::env::temp_dir().join(format!("anyprof-py314-offsets-{}", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let image = PythonImage {
+            runtime: 0,
+            runtime_file: 0,
+            version: 0,
+            version_file: Some(version_at as u64),
+            eval: 0,
+            eval_size: 0,
+            loads: Vec::new(),
+            text_vmaddr: 0,
+            image_base: 0,
+        };
+        let offsets = layout_for(&path, &image).expect("3.14 layout");
+        assert!(offsets.stackref_executable);
+        assert_eq!(offsets.frame_owner, Some(74));
+        let _ = std::fs::remove_file(&path);
+
+        // Build a synthetic 3.14 memory image where `leaf_py` has an immortal
+        // `_PyStackRef` (`code | 1`), followed by a `FRAME_OWNED_BY_INTERPRETER`
+        // shim frame (`owner = 3`, `PyStackRef_None`), followed by `outer_py`.
+        let base = 0x10_0000usize;
+        let mut mem = vec![0u8; 0x8000];
+        let write_u64 = |m: &mut [u8], addr: u64, val: u64| {
+            let off = (addr as usize) - base;
+            m[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        };
+        let write_i32 = |m: &mut [u8], addr: u64, val: i32| {
+            let off = (addr as usize) - base;
+            m[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        let write_ascii = |m: &mut [u8], addr: u64, s: &str| {
+            write_u64(m, addr + 16, s.len() as u64);
+            let off = (addr as usize) - base;
+            // kind = 1 (`1 << 2`), compact = 1 (`1 << 5`), ascii = 1 (`1 << 6`)
+            m[off + 32] = (1 << 2) | (1 << 5) | (1 << 6);
+            m[off + 40..off + 40 + s.len()].copy_from_slice(s.as_bytes());
+        };
+
+        let runtime = base as u64;
+        let interp = (base + 0x1000) as u64;
+        let tstate = (base + 0x3000) as u64;
+        let frame_leaf = (base + 0x3400) as u64;
+        let frame_shim = (base + 0x3500) as u64;
+        let frame_outer = (base + 0x3600) as u64;
+        let code_leaf = (base + 0x4000) as u64;
+        let code_outer = (base + 0x4200) as u64;
+        let py_none = (base + 0x4400) as u64;
+        let str_leaf = (base + 0x4600) as u64;
+        let str_outer = (base + 0x4800) as u64;
+        let str_file = (base + 0x4a00) as u64;
+
+        write_u64(&mut mem, runtime + 640, interp);
+        write_u64(&mut mem, interp + 7_360, tstate);
+        write_u64(&mut mem, tstate + 72, frame_leaf);
+        #[cfg(windows)]
+        write_i32(&mut mem, tstate + 160, 77);
+        #[cfg(not(windows))]
+        write_u64(&mut mem, tstate + 160, 77);
+
+        write_ascii(&mut mem, str_leaf, "work_314");
+        write_ascii(&mut mem, str_outer, "entry_314");
+        write_ascii(&mut mem, str_file, "app314.py");
+
+        write_u64(&mut mem, code_leaf + 112, str_file);
+        write_u64(&mut mem, code_leaf + 128, str_leaf);
+        write_i32(&mut mem, code_leaf + 68, 42);
+
+        write_u64(&mut mem, code_outer + 112, str_file);
+        write_u64(&mut mem, code_outer + 128, str_outer);
+        write_i32(&mut mem, code_outer + 68, 10);
+
+        // `frame_leaf`: tagged `_PyStackRef` (`code_leaf | 1`), `owner = 0`
+        write_u64(&mut mem, frame_leaf, code_leaf | 1);
+        write_u64(&mut mem, frame_leaf + 8, frame_shim);
+        write_u64(&mut mem, frame_leaf + 56, code_leaf + 208);
+
+        // `frame_shim`: `owner = 3` (`FRAME_OWNED_BY_INTERPRETER`), `PyStackRef_None` (`py_none | 1`)
+        write_u64(&mut mem, frame_shim, py_none | 1);
+        write_u64(&mut mem, frame_shim + 8, frame_outer);
+        mem[(frame_shim as usize) - base + 74] = 3;
+
+        // `frame_outer`: mortal `_PyStackRef` (`code_outer`), `owner = 0`
+        write_u64(&mut mem, frame_outer, code_outer);
+        write_u64(&mut mem, frame_outer + 8, 0);
+        write_u64(&mut mem, frame_outer + 56, code_outer + 208);
+
+        let vm = PythonVm {
+            runtime,
+            image_start: 0x2000,
+            image_end: 0x4000,
+            offsets,
+        };
+        let mut reader = |addr: u64, out: &mut [u8]| -> bool {
+            let Some(off) = (addr as usize).checked_sub(base) else {
+                return false;
+            };
+            let Some(slice) = mem.get(off..off + out.len()) else {
+                return false;
+            };
+            out.copy_from_slice(slice);
+            true
+        };
+        let walked = vm.frames(77, 0x2500, &mut reader).expect("3.14 frames");
+        assert_eq!(
+            walked,
+            vec![
+                PyName {
+                    name: "work_314".to_string(),
+                    file: "app314.py".to_string(),
+                    line: 42,
+                },
+                PyName {
+                    name: "entry_314".to_string(),
+                    file: "app314.py".to_string(),
+                    line: 10,
+                },
+            ]
+        );
     }
 
     #[test]
