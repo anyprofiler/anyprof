@@ -51,10 +51,12 @@ mod rust_image;
 mod snapshot;
 mod symbol;
 mod walk;
+mod xctrace;
 
 pub use java::{pid_is_hotspot, prepare_java};
 pub use python::{pid_is_cpython, prepare_python};
 pub use rust_image::file_is_rust;
+pub use xctrace::XctraceBackend;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -229,6 +231,53 @@ fn spawn_native_session(target: Target, opts: RecordOptions) -> Result<Box<dyn S
                 "native sampler exited before signaling startup",
             )),
             Err(_) => Err(Error::backend("native", "native sampler thread panicked")),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_xctrace_session(
+    target: Target,
+    opts: RecordOptions,
+) -> Result<Box<dyn Session>, Error> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), Error>>(1);
+    let session_stop = anyprof_core::StopGate::new();
+    let worker_stop = std::sync::Arc::clone(&session_stop);
+    let pid = target.pid;
+    let worker = std::thread::Builder::new()
+        .name("anyprof-xctrace".to_string())
+        .spawn(move || -> Result<anyprof_core::Profile, Error> {
+            let res = xctrace::record_direct(&target, &opts, &worker_stop, &ready_tx);
+            if let Ok(ref profile) = res {
+                tracing::info!(
+                    pid,
+                    samples = profile.total_weight(),
+                    stacks = profile.stacks.len(),
+                    "xctrace profile complete"
+                );
+            }
+            res
+        })
+        .map_err(|err| {
+            Error::backend("xctrace", format!("spawning xctrace sampler thread: {err}"))
+        })?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(Box::new(ActiveSession {
+            session_stop,
+            worker: Some(worker),
+        })),
+        Ok(Err(err)) => {
+            let _ = worker.join();
+            Err(err)
+        }
+        Err(_) => match worker.join() {
+            Ok(Err(err)) => Err(err),
+            Ok(Ok(_)) => Err(Error::backend(
+                "xctrace",
+                "xctrace sampler exited before signaling startup",
+            )),
+            Err(_) => Err(Error::backend("xctrace", "xctrace sampler thread panicked")),
         },
     }
 }

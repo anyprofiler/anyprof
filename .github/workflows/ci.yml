@@ -211,6 +211,59 @@ jobs:
           ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
           ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}
           ANYPROF_PYTHON_314: ${{ steps.py314.outputs.python-path }}
+      - name: Verify non-root macOS sampling via xctrace and anyprof setup (no sudo)
+        if: startsWith(matrix.os, 'macos-')
+        env:
+          PY314: ${{ steps.py314.outputs.python-path }}
+        run: |
+          set -eu
+          cargo build -p anyprof-cli --locked
+          cat << 'EOF' > /tmp/nonroot_burn.cpp
+          #include <cstdint>
+          __attribute__((noinline)) uint64_t burn_xctrace(uint64_t x) {
+              for (int i = 0; i < 4096; ++i) {
+                  x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+                  asm volatile("" : "+r"(x));
+              }
+              return x;
+          }
+          int main() {
+              volatile uint64_t sink = 1;
+              while (true) { sink = burn_xctrace(sink); }
+          }
+          EOF
+          clang++ -std=c++17 -O1 -g -fno-omit-frame-pointer -o /tmp/nonroot_burn /tmp/nonroot_burn.cpp
+          /tmp/nonroot_burn &
+          BURN_PID=$!
+          trap 'kill "$BURN_PID" 2>/dev/null || true' EXIT
+          sleep 0.2
+
+          # 1. Zero-config / zero-sudo / zero-DevToolsSecurity sampling via Instruments xctrace.
+          # Apple Virtualization.framework arm64 VMs (kern.hv_vmm_present=1 on arm64) omit
+          # hardware PMU counters needed by Time Profiler; Intel runners and bare-metal Macs have them.
+          VMM_PRESENT=$(/usr/sbin/sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)
+          if [ "$(uname -m)" != "arm64" ] || [ "$VMM_PRESENT" != "1" ]; then
+            ./target/debug/anyprof rec -b xctrace -p "$BURN_PID" -d 1s -f collapsed -o /tmp/nonroot-xc.collapsed
+            grep -q "burn_xctrace" /tmp/nonroot-xc.collapsed
+            ./target/debug/anyprof rec -p "$BURN_PID" -d 1s -f collapsed -o /tmp/nonroot-fallback.collapsed
+            grep -q "burn_xctrace" /tmp/nonroot-fallback.collapsed
+          else
+            echo "Skipping xctrace Time Profiler PMU check on arm64 guest VM (kern.hv_vmm_present=1)"
+          fi
+
+          # 2. Mach task_for_pid sampling without sudo after 'anyprof setup --yes'
+          sudo /usr/sbin/DevToolsSecurity -enable
+          sudo security authorizationdb write system.privilege.taskport.debug allow
+          sudo security authorizationdb write system.privilege.taskport allow
+          ./target/debug/anyprof setup --yes --binary ./target/debug/anyprof
+          codesign -dv --entitlements - ./target/debug/anyprof
+          ANYPROF_DISABLE_XCTRACE=1 ./target/debug/anyprof rec -p "$BURN_PID" -d 1s -f collapsed -o /tmp/nonroot-mach.collapsed
+          grep -q "burn_xctrace" /tmp/nonroot-mach.collapsed
+
+          printf 'def nonroot_spin():\n    x = 0\n    while True:\n        x += 1\nnonroot_spin()\n' > /tmp/nonroot_spin.py
+          codesign -dv "$PY314" || true
+          ANYPROF_DISABLE_XCTRACE=1 ./target/debug/anyprof rec -d 1s -f collapsed -o /tmp/nonroot-py.collapsed -- "$PY314" /tmp/nonroot_spin.py
+          grep -q "\[python\] nonroot_spin" /tmp/nonroot-py.collapsed
       - name: Upload viewer screenshots
         if: always()
         uses: actions/upload-artifact@v4

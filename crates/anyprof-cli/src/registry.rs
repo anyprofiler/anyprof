@@ -2,19 +2,20 @@ use anyprof_browser::BrowserBackend;
 use anyprof_core::Registry;
 use anyprof_go::GoBackend;
 use anyprof_java::JavaBackend;
-use anyprof_native::NativeBackend;
+use anyprof_native::{NativeBackend, XctraceBackend};
 use anyprof_node::NodeBackend;
 use anyprof_python::PythonBackend;
 use anyprof_rust::RustBackend;
 
-/// Node is the first-class pid backend. The browser backend is explicit
-/// (`--browser`) and never matches a pid. Rust, Go, Python, and Java are more
-/// specific than native, so they stay ahead of the fallback. Native matches
-/// any live pid.
+/// Node is the first-class pid backend. Browser (`--browser`) and xctrace
+/// (`-b xctrace`) are explicit and never match a pid during auto-detection.
+/// Rust, Go, Python, and Java are more specific than native, so they stay ahead
+/// of the fallback. Native matches any live pid.
 pub fn default_registry() -> Registry {
     Registry::new(vec![
         Box::new(NodeBackend),
         Box::new(BrowserBackend),
+        Box::new(XctraceBackend),
         Box::new(RustBackend),
         Box::new(GoBackend),
         Box::new(PythonBackend),
@@ -30,16 +31,18 @@ mod tests {
     use anyprof_core::{Backend, Format};
     use anyprof_go::GoBackend;
     use anyprof_java::JavaBackend;
-    use anyprof_native::NativeBackend;
+    use anyprof_native::{NativeBackend, XctraceBackend};
     use anyprof_node::NodeBackend;
     use anyprof_python::PythonBackend;
     use anyprof_rust::RustBackend;
 
     #[test]
-    fn detection_order_is_node_browser_rust_go_python_java_native() {
+    fn detection_order_is_node_browser_xctrace_rust_go_python_java_native() {
         assert_eq!(
             default_registry().names(),
-            vec!["node", "browser", "rust", "go", "python", "java", "native"]
+            vec![
+                "node", "browser", "xctrace", "rust", "go", "python", "java", "native"
+            ]
         );
     }
 
@@ -47,6 +50,7 @@ mod tests {
     fn each_backend_defaults_to_its_ecosystem_format() {
         assert_eq!(NodeBackend.default_format(), Format::Cpuprofile);
         assert_eq!(BrowserBackend.default_format(), Format::Cpuprofile);
+        assert_eq!(XctraceBackend.default_format(), Format::Pprof);
         assert_eq!(RustBackend.default_format(), Format::Pprof);
         assert_eq!(GoBackend.default_format(), Format::Pprof);
         assert_eq!(PythonBackend.default_format(), Format::Speedscope);

@@ -36,6 +36,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 #[cfg(not(any(
+    target_os = "macos",
     all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -96,16 +97,22 @@ fn unprivileged_native_record_explains_sudo() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id().to_string();
-    let output = anyprof(&["rec", "-b", "native", "-p", &pid, "-d", "1s"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+        .env("ANYPROF_DISABLE_XCTRACE", "1")
+        .args(["rec", "-b", "native", "-p", &pid, "-d", "1s"])
+        .output()
+        .expect("run anyprof");
     let _ = child.kill();
     let _ = child.wait();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "unprivileged native record should fail:\n{stderr}"
+        "unprivileged native record without xctrace should fail:\n{stderr}"
     );
     assert!(
-        stderr.contains("task_for_pid") && (stderr.contains("sudo") || stderr.contains("root")),
+        stderr.contains("task_for_pid")
+            && stderr.contains("anyprof setup")
+            && (stderr.contains("sudo") || stderr.contains("root")),
         "{stderr}"
     );
 }

@@ -209,6 +209,7 @@ fn record_dispatches_through_detection_and_stops_without_a_profile() {
     )))]
     let pid = std::process::id().to_string();
     let output = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+        .env("ANYPROF_DISABLE_XCTRACE", "1")
         .args(["record", "--pid", pid.as_str(), "--duration", "1s", "-o"])
         .arg(&output_path)
         .output()
@@ -624,4 +625,75 @@ fn diff_reports_regressions_writes_outputs_and_serves_web_viewer() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn setup_help_and_entitlement_signing() {
+    let help = anyprof(&["setup", "--help"]);
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        stdout.contains("--yes") && stdout.contains("--identity"),
+        "{stdout}"
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        let copy_dir =
+            std::env::temp_dir().join(format!("anyprof-setup-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&copy_dir);
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        let bin_copy = copy_dir.join("anyprof-copy");
+        std::fs::copy(env!("CARGO_BIN_EXE_anyprof"), &bin_copy).unwrap();
+
+        let run = Command::new(env!("CARGO_BIN_EXE_anyprof"))
+            .args(["setup", "--yes", "--binary"])
+            .arg(&bin_copy)
+            .output()
+            .expect("run anyprof setup");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "anyprof setup failed: {stderr}");
+        assert!(
+            stderr.contains("com.apple.security.cs.debugger"),
+            "{stderr}"
+        );
+
+        let ent = Command::new("codesign")
+            .args(["-d", "--entitlements", ":-"])
+            .arg(&bin_copy)
+            .output()
+            .expect("codesign -d --entitlements");
+        let ent_xml = format!(
+            "{}{}",
+            String::from_utf8_lossy(&ent.stdout),
+            String::from_utf8_lossy(&ent.stderr)
+        );
+        assert!(
+            ent_xml.contains("com.apple.security.cs.debugger"),
+            "expected debugger entitlement in signed binary: {ent_xml}"
+        );
+
+        let plist = Command::new("otool")
+            .arg("-P")
+            .arg(&bin_copy)
+            .output()
+            .expect("otool -P");
+        let plist_text = String::from_utf8_lossy(&plist.stdout);
+        assert!(
+            plist_text.contains("SecTaskAccess") && plist_text.contains("allowed"),
+            "expected embedded __TEXT,__info_plist with SecTaskAccess=allowed: {plist_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&copy_dir);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let run = anyprof(&["setup", "--yes"]);
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
 }

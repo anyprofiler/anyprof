@@ -206,7 +206,7 @@ fn spawn_short_lived_fixture_captures_profile_and_propagates_exit_code() {
         .arg(&out_pb)
         .arg("--")
         .arg(&binary)
-        .args(["0", "1200"])
+        .args(["0", "2500"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

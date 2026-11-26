@@ -6,6 +6,7 @@ mod output;
 mod proc_match;
 mod record;
 mod registry;
+mod setup;
 mod update;
 mod view;
 
@@ -41,6 +42,10 @@ fn try_main() -> Result<ExitCode> {
         }
         Command::Diff(args) => {
             diff::run(args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Setup(args) => {
+            setup::run(args)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Update => {

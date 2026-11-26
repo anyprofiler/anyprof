@@ -15,13 +15,14 @@ Capture CPU profiles from any running process — no code changes, agents, or re
 | --- | --- | --- | --- | --- | --- | --- |
 | **Node.js** | `node` | 10,000 Hz · `.cpuprofile` | Supported | Supported | Supported | Activates V8 inspector (`SIGUSR1` / `_debugProcess`); closes temporary port on exit |
 | **Browser** | `browser` | 10,000 Hz · `.cpuprofile` | Supported | Supported | Supported | Connects to `--remote-debugging-port` (`127.0.0.1:9222`); match tab by URL, title, or ID |
-| **C / C++** | `native` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Mach `task_for_pid` (macOS), `StackWalk64` (Windows), `perf_event_open` (Linux) |
-| **Rust** | `rust` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Native sampler + `rustc-demangle` (`[rust]` frames) |
-| **Go** | `go` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Go 1.18–1.26+ `pclntab` (`pcsp`) unwind; works on stripped (`-s -w`) binaries |
-| **Python** | `python` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | CPython 3.11–3.14 (GIL); stitches C/C++/Rust extensions onto `[python]` frame chains |
-| **Java** | `java` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | HotSpot JDK 17, 21, 25; stitches JNI/FFM native frames onto CodeCache & interpreter `[java]` stacks |
+| **C / C++** | `native` | 99 Hz · `pprof` (`.pb.gz`) | Supported | Supported | Supported | Mach `task_for_pid` / Instruments `xctrace` (macOS), `StackWalk64` (Windows), `perf_event_open` (Linux) |
+| **Rust** | `rust` | 99 Hz · `pprof` (`.pb.gz`) | Supported | Supported | Supported | Native sampler + `rustc-demangle` (`[rust]` frames) |
+| **Go** | `go` | 99 Hz · `pprof` (`.pb.gz`) | Supported | Supported | Supported | Go 1.18–1.26+ `pclntab` (`pcsp`) unwind; works on stripped (`-s -w`) binaries |
+| **Python** | `python` | 99 Hz · `speedscope` | Supported | Supported | Supported | CPython 3.11–3.14 (GIL); stitches C/C++/Rust extensions onto `[python]` frame chains |
+| **Java** | `java` | 99 Hz · `speedscope` | Supported | Supported | Supported | HotSpot JDK 17, 21, 25; stitches JNI/FFM native frames onto CodeCache & interpreter `[java]` stacks |
+| **Instruments** | `xctrace` | 1,000 Hz · `pprof` (`.pb.gz`) | Supported | — | — | Explicit `-b xctrace` (or automatic non-root fallback) via Apple Instruments `Time Profiler` |
 
-When `--backend` is omitted, auto-detection checks `node` → `rust` → `go` → `python` → `java` → `native` (`browser` requires `-B` / `--browser` or `-b browser`). Non-native frames are prefixed with `[runtime]` (`[node]`, `[rust]`, `[go]`, `[python]`, `[java]`, `[kernel]`) so mixed stacks preserve frame origin. Other CPU architectures compile cleanly and return not-implemented on `start`.
+When `--backend` is omitted, auto-detection checks `node` → `rust` → `go` → `python` → `java` → `native` (`browser` requires `-B` / `--browser` or `-b browser`; `xctrace` is used via `-b xctrace` or automatic macOS non-root fallback). Non-native frames are prefixed with `[runtime]` (`[node]`, `[rust]`, `[go]`, `[python]`, `[java]`, `[kernel]`) so mixed stacks preserve frame origin. Other CPU architectures compile cleanly and return not-implemented on `start`.
 
 ## Install
 
@@ -61,9 +62,10 @@ anyprof rec -p 1234 -d 10s -w                    # record and open in built-in v
 # Browser tab (start Chrome/Edge with --remote-debugging-port=9222)
 anyprof rec -B -t example.com -d 10s -o page.cpuprofile
 
-# C/C++, Rust, Go, Python, or Java (auto-detected by PID)
-anyprof rec -p 1234 -d 10s                       # Linux (x86_64 & aarch64) & Windows x64
-sudo anyprof rec -p 1234 -d 10s                  # macOS (task_for_pid requires root)
+# C/C++, Rust, Go, Python, or Java (auto-detected by PID; no sudo needed!)
+anyprof setup --yes                              # macOS one-time debugger entitlement sign
+anyprof rec -p 1234 -d 10s                       # macOS, Linux (x86_64 & aarch64), & Windows x64
+anyprof rec -b xctrace -p 1234 -d 10s            # macOS via Apple Instruments Time Profiler
 anyprof rec -p 1234 -d 10s -k                    # include Linux kernel frames
 
 # View any .cpuprofile, .pb.gz, .speedscope.json, or .collapsed file offline
@@ -96,7 +98,7 @@ anyprof conv -i cpu.collapsed -o cpu.pb.gz -t pprof
 | `-F, --frequency <HZ>` | Sampling rate (`1`–`1000000` Hz). Mutually exclusive with `--interval`. |
 | `--interval <DURATION>` | Sampling period (e.g. `100us`, `1ms`, `10ms`). Mutually exclusive with `-F`. |
 | `-k, --kernel` | Include kernel stack frames (supported on Linux `x86_64` & `aarch64`). |
-| `-b, --backend <NAME>` | Force backend: `node`, `browser`, `rust`, `go`, `python`, `java`, or `native` (`-b native` keeps raw C/C++ frames without VM stack replacement). |
+| `-b, --backend <NAME>` | Force backend: `node`, `browser`, `xctrace`, `rust`, `go`, `python`, `java`, or `native` (`-b native` keeps raw C/C++ frames without VM stack replacement). |
 | `-w, --web` | Open the recorded profile in the built-in viewer after saving. |
 | `-v`, `-vv`, `-vvv` | Increase log verbosity (`info`, `debug`, `trace`; also respects `RUST_LOG`). |
 
@@ -130,10 +132,22 @@ anyprof convert -i <INPUT> -o <OUTPUT> [-f <FROM_FORMAT>] -t <TO_FORMAT>
 
 `--from` is inferred automatically from `.collapsed`, `.folded`, `.txt`, `.speedscope.json`, `.json`, `.pb.gz`, `.pprof`, and `.cpuprofile` extensions when omitted.
 
+### `anyprof setup`
+
+Signs the `anyprof` binary on macOS with Hardened Runtime (`--options runtime`) and the `com.apple.security.cs.debugger` entitlement so `task_for_pid` works without `sudo` across Python, Java, Go, Rust, and C/C++:
+
+```bash
+anyprof setup --yes
+anyprof setup --identity "Developer ID Application: Example Corp (TEAMID)" --timestamp
+```
+
 ## Permissions & Platform Notes
 
 - **Node.js**: Requires no root privileges. On macOS/Linux, `anyprof` verifies the target is a `node` binary before sending `SIGUSR1` (avoid signaling during the first milliseconds of startup before Node installs its signal handler). On Windows, `node` must be on `PATH`.
-- **macOS**: Native, Rust, Go, Python, and Java sampling call Mach `task_for_pid` and require `sudo` (`sudo anyprof rec -p <pid>`). Processes protected by SIP or Hardened Runtime cannot be attached. Unwinds standard release C/C++ and Rust binaries via Mach-O Compact Unwind (`__unwind_info`) and `__eh_frame` without requiring `-fno-omit-frame-pointer` or `-C force-frame-pointers=yes`, and resolves system framework symbols directly from `dyld_shared_cache`.
+- **macOS (Zero `sudo`)**:
+  - **Debugger Entitlement (`anyprof setup`)**: Running `anyprof setup --yes` once (with Xcode Developer Mode `DevToolsSecurity -enable` active) signs `anyprof` with `com.apple.security.cs.debugger` (plus embedded `__TEXT,__info_plist` `SecTaskAccess=allowed`), allowing unprivileged `task_for_pid` sampling across C/C++, Rust, Go, Python, and Java without `sudo`.
+  - **Apple Instruments `xctrace` (`-b xctrace` & auto-fallback)**: When Xcode / Instruments is installed, `anyprof` also supports `-b xctrace` and automatically falls back to `xcrun xctrace record --template 'Time Profiler'` for C/C++, Rust, and Go targets if `task_for_pid` is denied as non-root — enriching `xctrace` traces with `[go]` `pclntab`, `[rust]` demangling, and DWARF `file:line`.
+  - **Release Signing & Notarization**: `.github/workflows/release.yml` automatically signs macOS release archives with `assets/macos/entitlements.plist` and upgrades to full Apple Developer ID signing + `notarytool` notarization when `APPLE_CERTIFICATE_P12`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, and `APPLE_TEAM_ID` repository secrets are configured.
 - **Linux (`x86_64` & `aarch64`)**: Uses non-suspending `perf_event_open` (`PERF_COUNT_SW_TASK_CLOCK`) and resolves container paths via `/proc/<pid>/root`.
   - User-space sampling requires `kernel.perf_event_paranoid <= 2` (or `CAP_PERFMON` / `root`).
   - Kernel frames (`-k`) require `kernel.perf_event_paranoid <= 1` and `kernel.kptr_restrict = 0` for `/proc/kallsyms` symbol names.
