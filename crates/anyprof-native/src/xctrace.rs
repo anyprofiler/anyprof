@@ -279,7 +279,7 @@ fn record_impl(
 
     signal_ready(Ok(()));
     let started = Instant::now();
-    let mut sent_sigint = false;
+    let mut sigint_sent_at: Option<Instant> = None;
 
     loop {
         if let Ok(Some(status)) = child.try_wait() {
@@ -296,19 +296,19 @@ fn record_impl(
         let stop_now = opts.stop.stop_requested() || session_stop.stop_requested();
         let early_interrupt = match opts.duration {
             // When `--time-limit` was given to `xctrace`, let `xctrace` finish its
-            // own recording window (including first-boot Instruments XPC daemon
-            // cold start, which can take 20-60s on heavily loaded CI VMs) unless
-            // `opts.stop` fired early (Ctrl+C / child exit) or `xctrace` exceeded a
-            // 120s grace window.
+            // own recording window (including first-boot Instruments `DTServiceHub`
+            // XPC daemon cold start, which can take 80-180s on loaded Intel macOS
+            // VMs) unless `opts.stop` fired early (Ctrl+C / child exit) or
+            // `xctrace` exceeded a 300s grace window.
             Some(limit) => {
                 (opts.stop.stop_requested()
                     && started.elapsed().saturating_add(Duration::from_millis(80)) < limit)
-                    || started.elapsed() > limit.saturating_add(Duration::from_secs(120))
+                    || started.elapsed() > limit.saturating_add(Duration::from_secs(300))
             }
             None => stop_now,
         };
 
-        if early_interrupt && !sent_sigint {
+        if early_interrupt && sigint_sent_at.is_none() {
             const SIGINT: i32 = 2;
             unsafe extern "C" {
                 fn kill(pid: i32, sig: i32) -> i32;
@@ -318,9 +318,9 @@ fn record_impl(
                     let _ = kill(pid_i32, SIGINT);
                 }
             }
-            sent_sigint = true;
+            sigint_sent_at = Some(Instant::now());
         }
-        if sent_sigint && started.elapsed() > Duration::from_secs(150) {
+        if sigint_sent_at.is_some_and(|at| at.elapsed() > Duration::from_secs(45)) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(Error::backend(
