@@ -16,9 +16,9 @@
 //! bytecode at a time; two spinning threads both appear as the lock
 //! switches. This is not a snapshot of every thread.
 //!
-//! The walked layouts are the default GIL builds of CPython 3.11, 3.12, and
-//! 3.13. An older interpreter, 3.14 or later, and a free-threaded build are
-//! detected from `_PyRuntime` and then refused: `start` returns an error
+//! The walked layouts are the default GIL builds of CPython 3.11, 3.12, 3.13,
+//! and 3.14. An older interpreter, 3.15 or later, and a free-threaded build
+//! are detected from `_PyRuntime` and then refused: `start` returns an error
 //! instead of a native profile of the eval loop. On Linux the frame read is
 //! `process_vm_readv`, which needs ptrace attach permission. `perf_event_open`
 //! permission is not enough when `kernel.yama.ptrace_scope` is 1 and the

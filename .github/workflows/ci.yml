@@ -55,6 +55,10 @@ jobs:
         id: py313
         with:
           python-version: "3.13"
+      - uses: actions/setup-python@v5
+        id: py314
+        with:
+          python-version: "3.14"
       - uses: actions/setup-java@v4
         id: java17
         with:
@@ -97,6 +101,7 @@ jobs:
           PY311: ${{ steps.py311.outputs.python-path }}
           PY312: ${{ steps.py312.outputs.python-path }}
           PY313: ${{ steps.py313.outputs.python-path }}
+          PY314: ${{ steps.py314.outputs.python-path }}
         run: |
           set -eu
           check() {
@@ -110,6 +115,7 @@ jobs:
           check "$PY311"
           check "$PY312"
           check "$PY313"
+          check "$PY314"
       - name: Refuse an unrelated Python read at ptrace_scope 1
         if: startsWith(matrix.os, 'ubuntu-')
         # The image default is 1. This step forces that value if a runner
@@ -120,6 +126,7 @@ jobs:
           ANYPROF_PYTHON_311: ${{ steps.py311.outputs.python-path }}
           ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
           ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}
+          ANYPROF_PYTHON_314: ${{ steps.py314.outputs.python-path }}
           ANYPROF_REQUIRE_NATIVE: "1"
         run: |
           set -eu
@@ -153,7 +160,7 @@ jobs:
         # parent->child process_vm_readv without sudo or lowering ptrace_scope.
         env:
           ANYPROF_REQUIRE_NATIVE: "1"
-          ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          ANYPROF_PYTHON_314: ${{ steps.py314.outputs.python-path }}
         run: |
           set -eu
           sudo sysctl kernel.perf_event_paranoid=1
@@ -189,13 +196,13 @@ jobs:
           # after the sysctl step. Windows samples them as the same user. A
           # skip is a failure. The MSRV job does not set this and does not
           # change sysctls. musl is cargo check only, above. Go fixtures use
-          # the toolchain from setup-go. Python fixtures use the three
+          # the toolchain from setup-go. Python fixtures use the four
           # setup-python interpreters and Temurin 17, 21, and 25. They run
           # inside this job, so each Go version also samples 3.11, 3.12, 3.13,
-          # and those three HotSpot releases. The MSRV job does not install a
-          # JDK and does not set ANYPROF_REQUIRE_NATIVE. A JDK that happens to
-          # be on that image may skip a documented permission denial. This
-          # matrix must not.
+          # 3.14, and those three HotSpot releases. The MSRV job does not
+          # install a JDK and does not set ANYPROF_REQUIRE_NATIVE. A JDK that
+          # happens to be on that image may skip a documented permission denial.
+          # This matrix must not.
           ANYPROF_REQUIRE_NATIVE: "1"
           ANYPROF_JAVA_17: ${{ steps.java17.outputs.path }}
           ANYPROF_JAVA_21: ${{ steps.java21.outputs.path }}
@@ -203,6 +210,7 @@ jobs:
           ANYPROF_PYTHON_311: ${{ steps.py311.outputs.python-path }}
           ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
           ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}
+          ANYPROF_PYTHON_314: ${{ steps.py314.outputs.python-path }}
       - name: Upload viewer screenshots
         if: always()
         uses: actions/upload-artifact@v4

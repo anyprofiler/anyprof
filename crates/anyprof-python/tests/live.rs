@@ -691,6 +691,7 @@ os.execv(sys.executable, [sys.executable, script, counter])
             "ANYPROF_PYTHON_311",
             "ANYPROF_PYTHON_312",
             "ANYPROF_PYTHON_313",
+            "ANYPROF_PYTHON_314",
             "ANYPROF_PYTHON",
         ] {
             if let Ok(path) = std::env::var(key)
@@ -700,7 +701,13 @@ os.execv(sys.executable, [sys.executable, script, counter])
             }
         }
         if found.is_empty() {
-            for name in ["python3.12", "python3.13", "python3.11", "python3"] {
+            for name in [
+                "python3.12",
+                "python3.13",
+                "python3.14",
+                "python3.11",
+                "python3",
+            ] {
                 let Ok(output) = Command::new(name)
                     .args(["-c", "import sys; print(sys.executable)"])
                     .output()
@@ -720,7 +727,7 @@ os.execv(sys.executable, [sys.executable, script, counter])
         found.retain(|path| supported_version(path));
         if found.is_empty() {
             if required() {
-                panic!("no CPython 3.11, 3.12, or 3.13 interpreter was found");
+                panic!("no CPython 3.11, 3.12, 3.13, or 3.14 interpreter was found");
             }
             eprintln!("skipping live python sample: no supported interpreter");
         }
@@ -749,7 +756,7 @@ os.execv(sys.executable, [sys.executable, script, counter])
         let minor = parts.next();
         matches!(
             (major, minor),
-            (Some("3"), Some("11") | Some("12") | Some("13"))
+            (Some("3"), Some("11") | Some("12") | Some("13") | Some("14"))
         )
     }
 
@@ -815,6 +822,7 @@ os.execv(sys.executable, [sys.executable, script, counter])
             "ANYPROF_PYTHON_311",
             "ANYPROF_PYTHON_312",
             "ANYPROF_PYTHON_313",
+            "ANYPROF_PYTHON_314",
             "ANYPROF_PYTHON",
         ] {
             if let Ok(value) = std::env::var(key)

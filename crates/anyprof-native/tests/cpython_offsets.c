@@ -21,6 +21,12 @@
 #include <internal/pycore_frame.h>
 #include <internal/pycore_interp.h>
 #include <internal/pycore_runtime.h>
+#if PY_VERSION_HEX >= 0x030D0000
+#include <internal/pycore_debug_offsets.h>
+#endif
+#if PY_VERSION_HEX >= 0x030E0000
+#include <internal/pycore_stackref.h>
+#endif
 
 #include <stdio.h>
 #include <stddef.h>
@@ -70,6 +76,7 @@ int main(void) {
     expect("frame.f_code", offsetof(_PyInterpreterFrame, f_code), 0);
     expect("frame.previous", offsetof(_PyInterpreterFrame, previous), 8);
     expect("frame.prev_instr", offsetof(_PyInterpreterFrame, prev_instr), 56);
+    expect("frame.owner", offsetof(_PyInterpreterFrame, owner), 70);
     expect("code.filename", offsetof(PyCodeObject, co_filename), 112);
     expect("code.qualname", offsetof(PyCodeObject, co_qualname), 128);
     expect("code.linetable", offsetof(PyCodeObject, co_linetable), 136);
@@ -83,8 +90,7 @@ int main(void) {
     expect("bytes.ob_sval", offsetof(PyBytesObject, ob_sval), 32);
 #elif PY_VERSION_HEX >= 0x030D0000 && PY_VERSION_HEX < 0x030E0000
     /* 3.13's walk reads `_Py_DebugOffsets` from the binary. These are the
-     * slot positions in that table, not the struct offsets they point at.
-     * A 3.14 table is a different order and is not accepted. */
+     * slot positions in that table, not the struct offsets they point at. */
     expect("free_threaded", offsetof(_Py_DebugOffsets, free_threaded), 16);
     expect("runtime.size", offsetof(_Py_DebugOffsets, runtime_state.size), 24);
     expect("runtime.head", offsetof(_Py_DebugOffsets, runtime_state.interpreters_head), 40);
@@ -99,6 +105,7 @@ int main(void) {
     expect("frame.previous", offsetof(_Py_DebugOffsets, interpreter_frame.previous), 232);
     expect("frame.executable", offsetof(_Py_DebugOffsets, interpreter_frame.executable), 240);
     expect("frame.instr", offsetof(_Py_DebugOffsets, interpreter_frame.instr_ptr), 248);
+    expect("frame.owner", offsetof(_Py_DebugOffsets, interpreter_frame.owner), 264);
     expect("code.size", offsetof(_Py_DebugOffsets, code_object.size), 272);
     expect("code.filename", offsetof(_Py_DebugOffsets, code_object.filename), 280);
     expect("code.qualname", offsetof(_Py_DebugOffsets, code_object.qualname), 296);
@@ -114,6 +121,46 @@ int main(void) {
     expect("unicode.ascii", offsetof(_Py_DebugOffsets, unicode_object.asciiobject_size), 560);
     expect("ascii", sizeof(PyASCIIObject), 40);
     expect("compact", sizeof(PyCompactUnicodeObject), 56);
+    if (_Py_Debug_Free_Threaded != 0) {
+        fprintf(stderr, "this header is the free-threaded build, which is not walked\n");
+        failures++;
+    }
+#elif PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+    /* 3.14 adds fields to `interpreter_state`, `interpreter_frame`,
+     * `code_object`, and `set_object`, shifting `_Py_DebugOffsets` slots, and
+     * stores a tagged `_PyStackRef` (`Py_TAG_BITS = 3`) in `f_executable`. */
+    expect("free_threaded", offsetof(_Py_DebugOffsets, free_threaded), 16);
+    expect("runtime.size", offsetof(_Py_DebugOffsets, runtime_state.size), 24);
+    expect("runtime.head", offsetof(_Py_DebugOffsets, runtime_state.interpreters_head), 40);
+    expect("interp.size", offsetof(_Py_DebugOffsets, interpreter_state.size), 48);
+    expect("interp.next", offsetof(_Py_DebugOffsets, interpreter_state.next), 64);
+    expect("interp.threads", offsetof(_Py_DebugOffsets, interpreter_state.threads_head), 72);
+    expect("thread.size", offsetof(_Py_DebugOffsets, thread_state.size), 176);
+    expect("thread.next", offsetof(_Py_DebugOffsets, thread_state.next), 192);
+    expect("thread.frame", offsetof(_Py_DebugOffsets, thread_state.current_frame), 208);
+    expect("thread.native", offsetof(_Py_DebugOffsets, thread_state.native_thread_id), 224);
+    expect("frame.size", offsetof(_Py_DebugOffsets, interpreter_frame.size), 248);
+    expect("frame.previous", offsetof(_Py_DebugOffsets, interpreter_frame.previous), 256);
+    expect("frame.executable", offsetof(_Py_DebugOffsets, interpreter_frame.executable), 264);
+    expect("frame.instr", offsetof(_Py_DebugOffsets, interpreter_frame.instr_ptr), 272);
+    expect("frame.owner", offsetof(_Py_DebugOffsets, interpreter_frame.owner), 288);
+    expect("code.size", offsetof(_Py_DebugOffsets, code_object.size), 312);
+    expect("code.filename", offsetof(_Py_DebugOffsets, code_object.filename), 320);
+    expect("code.qualname", offsetof(_Py_DebugOffsets, code_object.qualname), 336);
+    expect("code.linetable", offsetof(_Py_DebugOffsets, code_object.linetable), 344);
+    expect("code.firstlineno", offsetof(_Py_DebugOffsets, code_object.firstlineno), 352);
+    expect("code.adaptive", offsetof(_Py_DebugOffsets, code_object.co_code_adaptive), 384);
+    expect("bytes.size", offsetof(_Py_DebugOffsets, bytes_object.size), 592);
+    expect("bytes.ob_size", offsetof(_Py_DebugOffsets, bytes_object.ob_size), 600);
+    expect("bytes.ob_sval", offsetof(_Py_DebugOffsets, bytes_object.ob_sval), 608);
+    expect("unicode.size", offsetof(_Py_DebugOffsets, unicode_object.size), 616);
+    expect("unicode.state", offsetof(_Py_DebugOffsets, unicode_object.state), 624);
+    expect("unicode.length", offsetof(_Py_DebugOffsets, unicode_object.length), 632);
+    expect("unicode.ascii", offsetof(_Py_DebugOffsets, unicode_object.asciiobject_size), 640);
+    expect("ascii", sizeof(PyASCIIObject), 40);
+    expect("compact", sizeof(PyCompactUnicodeObject), 56);
+    expect("stackref.tag_bits", Py_TAG_BITS, 3);
+    expect("stackref.tag_refcnt", Py_TAG_REFCNT, 1);
     if (_Py_Debug_Free_Threaded != 0) {
         fprintf(stderr, "this header is the free-threaded build, which is not walked\n");
         failures++;

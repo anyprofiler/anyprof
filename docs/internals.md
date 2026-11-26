@@ -50,8 +50,8 @@ This document captures the low-level sampling, stack-unwinding, symbol-resolutio
 
 ### Python (`anyprof-python`)
 
-- **Supported builds**: Default GIL builds of 64-bit CPython **3.11**, **3.12**, and **3.13** (including embedded interpreters and subinterpreters). Older CPython, 3.14+, 32-bit images, and free-threaded (`Py_GIL_DISABLED`) builds are explicitly detected and refused rather than mis-walked.
-- **Frame-chain walk**: Locates `_PyRuntime` (using validated header offsets for 3.11 and 3.12, and `_Py_DebugOffsets` with `xdebugpy` cookie for 3.13), matches the sampled OS thread via `native_thread_id`, and walks `current_frame -> previous`, resolving `co_qualname`, `co_filename`, and PEP 626 `co_linetable` source lines.
+- **Supported builds**: Default GIL builds of 64-bit CPython **3.11**, **3.12**, **3.13**, and **3.14** (including embedded interpreters and subinterpreters). Older CPython, 3.15+, 32-bit images, and free-threaded (`Py_GIL_DISABLED`) builds are explicitly detected and refused rather than mis-walked.
+- **Frame-chain walk**: Locates `_PyRuntime` (using validated header offsets for 3.11 and 3.12, and `_Py_DebugOffsets` with `xdebugpy` cookie for 3.13 and 3.14, including 3.14 `_PyStackRef` untagging on `f_executable` and `owner >= 3` entry-shim skipping), matches the sampled OS thread via `native_thread_id`, and walks `current_frame -> previous`, resolving `co_qualname`, `co_filename`, and PEP 626 `co_linetable` source lines.
 - **Hybrid attribution**: Leaves inside the CPython binary (including C helpers called from `_PyEval_EvalFrameDefault`) resolve to `[python]` frames; leaves in external C/C++/Rust extensions or `libc` retain their native stacks. On Linux, `process_vm_readv` permission is probed up front so `kernel.yama.ptrace_scope=1` against a non-child process fails fast with a clear `EPERM` diagnostic instead of silently emitting eval-loop C frames.
 
 ### Java (`anyprof-java`)
