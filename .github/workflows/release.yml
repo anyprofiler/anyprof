@@ -218,7 +218,7 @@ jobs:
             tar -cJf "$ARCHIVE" -C "$WORK" $TOP_ENTRY
             NEW_SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
             if [ -f "$ARCHIVE.sha256" ]; then
-              printf "%s  %s\n" "$NEW_SHA" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
+              printf "%s *%s\n" "$NEW_SHA" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
             fi
             ARCHIVE_BASE="$(basename "$ARCHIVE")"
             jq --arg name "$ARCHIVE_BASE" --arg sha "$NEW_SHA" '
