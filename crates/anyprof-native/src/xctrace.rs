@@ -135,11 +135,9 @@ pub(crate) fn record_fallback(
     ready_tx: &std::sync::mpsc::SyncSender<Result<(), Error>>,
     attach_err: Error,
 ) -> Result<Profile, Error> {
-    let mut signaled_ok = false;
     let attach_msg = attach_err.to_string();
     let res = record_impl(target, opts, session_stop, "native", |ready| match ready {
         Ok(()) => {
-            signaled_ok = true;
             let _ = ready_tx.send(Ok(()));
         }
         Err(xc_err) => {
@@ -151,7 +149,6 @@ pub(crate) fn record_fallback(
     });
     match res {
         Ok(profile) => Ok(profile),
-        Err(xc_err) if signaled_ok => Err(xc_err),
         Err(xc_err) => Err(Error::backend(
             "native",
             format!("{attach_msg} (Instruments xctrace fallback also failed: {xc_err})"),
@@ -271,12 +268,13 @@ fn record_impl(
         let stop_now = opts.stop.stop_requested() || session_stop.stop_requested();
         let early_interrupt = match opts.duration {
             // When `--time-limit` was given to `xctrace`, let `xctrace` finish its
-            // own recording window unless `opts.stop` fired early (Ctrl+C / child
-            // exit) or `xctrace` exceeded a generous 15s grace window.
+            // own recording window (including first-boot Instruments XPC daemon
+            // cold start, which can take ~15-25s on fresh VMs) unless `opts.stop`
+            // fired early (Ctrl+C / child exit) or `xctrace` exceeded a 45s grace window.
             Some(limit) => {
                 (opts.stop.stop_requested()
                     && started.elapsed().saturating_add(Duration::from_millis(80)) < limit)
-                    || started.elapsed() > limit.saturating_add(Duration::from_secs(15))
+                    || started.elapsed() > limit.saturating_add(Duration::from_secs(45))
             }
             None => stop_now,
         };
@@ -293,7 +291,7 @@ fn record_impl(
             }
             sent_sigint = true;
         }
-        if sent_sigint && started.elapsed() > Duration::from_secs(30) {
+        if sent_sigint && started.elapsed() > Duration::from_secs(60) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(Error::backend(

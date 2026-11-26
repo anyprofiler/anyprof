@@ -37,6 +37,25 @@ fn unprivileged_attach_explains_that_root_is_required() {
         eprintln!("skipping permission denial check: the test process is already root");
         return;
     }
+    if std::env::var_os("ANYPROF_DISABLE_XCTRACE").is_none() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = Command::new(exe)
+            .env("ANYPROF_DISABLE_XCTRACE", "1")
+            .args([
+                "--exact",
+                "unprivileged_attach_explains_that_root_is_required",
+                "--nocapture",
+            ])
+            .output()
+            .expect("re-exec with ANYPROF_DISABLE_XCTRACE=1");
+        assert!(
+            out.status.success(),
+            "unprivileged_attach_explains_that_root_is_required failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        return;
+    }
     let mut child = Command::new("sleep")
         .arg("30")
         .stdin(Stdio::null())
@@ -63,8 +82,8 @@ fn unprivileged_attach_explains_that_root_is_required() {
         "expected the Mach permission error, got: {message}"
     );
     assert!(
-        message.contains("sudo") || message.contains("root"),
-        "expected a root hint, got: {message}"
+        message.contains("anyprof setup") && (message.contains("sudo") || message.contains("root")),
+        "expected setup/root hint, got: {message}"
     );
     assert!(
         message.contains(&pid.to_string()),
