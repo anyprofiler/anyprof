@@ -39,6 +39,8 @@ const state = {
   byId: new Map(),
   byParent: new Map(),
   expanded: new Set(),
+  collapsedPaths: new Set(),
+  manualExpandedPaths: new Set(),
   flat: [],
   selectedNode: null,
   selectedFrame: null,
@@ -57,7 +59,11 @@ const state = {
   sourceGen: 0,
   timeline: null,
   flameHeight: null,
+  multiRuntime: false,
+  brushTimer: null,
 };
+
+const SVG_NS = "http://www.w3.org/2000/svg";
 
 const $ = (id) => document.getElementById(id);
 
@@ -70,6 +76,56 @@ function el(tag, className, text) {
 
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function focusIcon(isFocused) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 12 12");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute(
+    "d",
+    isFocused
+      ? "M3.2 2.2L6 5l2.8-2.8 1 1L7 6l2.8 2.8-1 1L6 7 3.2 9.8l-1-1L5 6 2.2 3.2l1-1z"
+      : "M2.2 5.3h5.7L5.6 3l1-1 4 4-4 4-1-1 2.3-2.3H2.2V5.3z"
+  );
+  svg.appendChild(path);
+  return svg;
+}
+
+function catIcon(frame) {
+  const rt = frame.runtime || "native";
+  let cls = "cat-user";
+  let pathD = "M7 3a2.1 2.1 0 1 1 0 4.2A2.1 2.1 0 0 1 7 3zm-3.8 8.3c0-1.9 1.7-3.1 3.8-3.1s3.8 1.2 3.8 3.1v.5H3.2v-.5z";
+  let title = rt;
+  if (rt === "kernel") {
+    cls = "cat-kernel";
+    pathD = "M2 4.4L7 2l5 2.4v1H2v-1zm1.1 1.9h1.4v4H3.1v-4zm3.2 0h1.4v4H6.3v-4zm3.2 0h1.4v4H9.5v-4zM2 11.1h10v1.2H2v-1.2z";
+    title = "kernel";
+  } else if (frame.system || frame.name === "(idle)" || frame.name === "(program)") {
+    cls = "cat-system";
+    pathD = "M6.1 2h1.8l.3 1.4.9.4 1.2-.8 1.3 1.3-.8 1.2.4.9L12.6 6.7v1.8l-1.4.3-.4.9.8 1.2-1.3 1.3-1.2-.8-.9.4-.3 1.4H6.1l-.3-1.4-.9-.4-1.2.8-1.3-1.3.8-1.2-.4-.9-1.4-.3V6.7l1.4-.3.4-.9-.8-1.2L3.7 3l1.2.8.9-.4.3-1.4zM7 5.2a2.4 2.4 0 1 0 0 4.8 2.4 2.4 0 0 0 0-4.8z";
+    title = frame.system ? (rt + " (system library)") : "runtime";
+  } else if (rt === "python") {
+    cls = "cat-python";
+  } else if (rt === "rust") {
+    cls = "cat-rust";
+  } else if (rt === "go") {
+    cls = "cat-go";
+  } else if (rt === "java") {
+    cls = "cat-java";
+  } else if (rt === "node" || rt === "browser") {
+    cls = "cat-js";
+  }
+  const badge = el("span", "cat-icon " + cls);
+  badge.title = title;
+  badge.setAttribute("aria-hidden", "true");
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 14 14");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", pathD);
+  svg.appendChild(path);
+  badge.appendChild(svg);
+  return badge;
 }
 
 function isDark() {
@@ -559,22 +615,39 @@ function paintSelection(ctx, data, gutter, plotWidth, height, span, edges) {
   const left = Math.max(gutter, Math.min(x0, x1));
   const right = Math.min(gutter + plotWidth, Math.max(x0, x1));
   const wide = Math.max(1, right - left);
+  const dark = isDark();
   ctx.save();
   ctx.beginPath();
   ctx.rect(gutter, 0, plotWidth, height);
   ctx.clip();
   if (!edges) {
-    ctx.fillStyle = "rgba(10, 95, 212, 0.10)";
+    ctx.fillStyle = dark ? "rgba(0, 0, 0, 0.34)" : "rgba(15, 23, 42, 0.08)";
+    if (left > gutter) ctx.fillRect(gutter, 0, left - gutter, height);
+    if (right < gutter + plotWidth) ctx.fillRect(right, 0, gutter + plotWidth - right, height);
+    ctx.fillStyle = dark ? "rgba(10, 132, 255, 0.14)" : "rgba(10, 95, 212, 0.09)";
     ctx.fillRect(left, 0, wide, height);
   } else {
-    ctx.strokeStyle = "rgba(10, 95, 212, 0.9)";
-    ctx.lineWidth = 1;
+    const accent = cssColor("--select", dark ? "#0a84ff" : "#0a5fd4");
+    const rx = Math.max(left + 1, right);
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.25;
     ctx.beginPath();
     ctx.moveTo(left + 0.5, 0);
     ctx.lineTo(left + 0.5, height);
-    ctx.moveTo(Math.max(left + 1, right) - 0.5, 0);
-    ctx.lineTo(Math.max(left + 1, right) - 0.5, height);
+    ctx.moveTo(rx - 0.5, 0);
+    ctx.lineTo(rx - 0.5, height);
+    ctx.moveTo(left, 0.5);
+    ctx.lineTo(rx, 0.5);
+    ctx.moveTo(left, height - 0.5);
+    ctx.lineTo(rx, height - 0.5);
     ctx.stroke();
+    if (height >= 16) {
+      const handleH = Math.min(14, height - 6);
+      const handleY = Math.round((height - handleH) / 2);
+      ctx.fillStyle = accent;
+      ctx.fillRect(left - 2, handleY, 4, handleH);
+      ctx.fillRect(rx - 2, handleY, 4, handleH);
+    }
   }
   ctx.restore();
 }
@@ -587,36 +660,158 @@ function paintRuler(data, gutter, width) {
   const start = Number(data.start);
   const end = Number(data.end);
   const span = Math.max(1, end - start);
+  if (state.selection && span > 0) {
+    const x0 = Math.max(0, Math.min(width, ((state.selection.start - start) / span) * width));
+    const x1 = Math.max(0, Math.min(width, ((state.selection.end - start) / span) * width));
+    const left = Math.min(x0, x1);
+    const right = Math.max(x0, x1);
+    const brush = el("div", "ruler-brush");
+    brush.style.left = left + "px";
+    brush.style.width = Math.max(1, right - left) + "px";
+    ruler.append(brush);
+  }
   const ticks = 4;
   const unit = timeScale(start, end);
   for (let index = 0; index <= ticks; index += 1) {
-    const tick = el("span", null, formatTick(start + (span * index) / ticks, unit));
+    const tick = el("span", "ruler-tick", formatTick(start + (span * index) / ticks, unit));
     tick.style.left = (width * index) / ticks + "px";
     if (index === 0) tick.style.transform = "translateX(0)";
     else if (index === ticks) tick.style.transform = "translateX(-100%)";
     ruler.append(tick);
   }
+  if (!ruler.dataset.bound) {
+    ruler.dataset.bound = "1";
+    bindRulerDrag(ruler);
+  }
 }
 
-function bindTimelineDrag(canvas) {
+function scheduleBrushRefresh() {
+  if (state.brushTimer != null) return;
+  state.brushTimer = setTimeout(() => {
+    state.brushTimer = null;
+    refreshTree();
+  }, 70);
+}
+
+function flushBrushRefresh() {
+  if (state.brushTimer != null) {
+    clearTimeout(state.brushTimer);
+    state.brushTimer = null;
+  }
+  refreshTree();
+}
+
+function clearTimeFilter() {
+  const full = state.session && state.session.timeline;
+  if (!full) return;
+  state.selection = null;
+  state.view = { start: full.start, end: full.end };
+  refreshTimeline();
+  refreshTree();
+}
+
+function bindRulerDrag(ruler) {
   let origin = null;
   let dragged = false;
   let dragging = false;
   const tickAt = (event) => {
     const data = state.timeline;
     if (!data) return 0;
-    const rect = canvas.getBoundingClientRect();
-    const gutter = GUTTER;
-    const plot = Math.max(1, rect.width - gutter);
-    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - gutter) / plot));
+    const rect = ruler.getBoundingClientRect();
+    const plot = Math.max(1, rect.width);
+    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / plot));
     const span = Math.max(1, Number(data.end) - Number(data.start));
     return Math.round(Number(data.start) + ratio * span);
   };
-  canvas.addEventListener("pointerdown", (event) => {
+  ruler.addEventListener("pointerdown", (event) => {
     if (event.button != null && event.button !== 0) return;
     origin = tickAt(event);
     dragged = false;
     dragging = true;
+    try {
+      ruler.setPointerCapture(event.pointerId);
+    } catch (_) {
+      /* capture is optional */
+    }
+  });
+  ruler.addEventListener("pointermove", (event) => {
+    if (!dragging || !state.timeline) return;
+    const next = tickAt(event);
+    if (next !== origin) dragged = true;
+    const start = Math.min(origin, next);
+    const end = Math.max(origin, next);
+    if (end > start) {
+      state.selection = { start, end };
+      drawTimeline();
+      updateRangeControls();
+      scheduleBrushRefresh();
+    }
+  });
+  const finish = () => {
+    if (!dragging) return;
+    dragging = false;
+    origin = null;
+    if (!dragged) state.selection = null;
+    drawTimeline();
+    updateRangeControls();
+    flushBrushRefresh();
+  };
+  ruler.addEventListener("pointerup", finish);
+  ruler.addEventListener("pointercancel", finish);
+}
+
+function bindTimelineDrag(canvas) {
+  let mode = null;
+  let origin = 0;
+  let initialSel = null;
+  let dragged = false;
+  let dragging = false;
+
+  const plotMetrics = () => {
+    const rect = canvas.getBoundingClientRect();
+    const plot = Math.max(1, rect.width - GUTTER);
+    return { rect, plot };
+  };
+
+  const tickAt = (event) => {
+    const data = state.timeline;
+    if (!data) return 0;
+    const { rect, plot } = plotMetrics();
+    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left - GUTTER) / plot));
+    const span = Math.max(1, Number(data.end) - Number(data.start));
+    return Math.round(Number(data.start) + ratio * span);
+  };
+
+  const hitMode = (event) => {
+    const data = state.timeline;
+    if (!data || !state.selection) return "create";
+    const span = Math.max(1, Number(data.end) - Number(data.start));
+    const { rect, plot } = plotMetrics();
+    const x = event.clientX - rect.left - GUTTER;
+    const left = ((state.selection.start - data.start) / span) * plot;
+    const right = ((state.selection.end - data.start) / span) * plot;
+    if (right - left >= 8) {
+      if (Math.abs(x - left) <= 6) return "resize-start";
+      if (Math.abs(x - right) <= 6) return "resize-end";
+      if (x > left + 6 && x < right - 6) return "move";
+    }
+    return "create";
+  };
+
+  const updateCursor = (m, active) => {
+    if (m === "resize-start" || m === "resize-end") canvas.style.cursor = "ew-resize";
+    else if (m === "move") canvas.style.cursor = active ? "grabbing" : "grab";
+    else canvas.style.cursor = "crosshair";
+  };
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event.button != null && event.button !== 0) return;
+    mode = hitMode(event);
+    origin = tickAt(event);
+    initialSel = state.selection ? { start: state.selection.start, end: state.selection.end } : null;
+    dragged = false;
+    dragging = true;
+    updateCursor(mode, true);
     const tip = $("timeline-tip");
     if (tip) tip.hidden = true;
     try {
@@ -625,19 +820,50 @@ function bindTimelineDrag(canvas) {
       /* capture is optional */
     }
   });
+
   canvas.addEventListener("pointermove", (event) => {
     const data = state.timeline;
     if (!data) return;
+    const tip = $("timeline-tip");
     if (dragging) {
       const next = tickAt(event);
       if (next !== origin) dragged = true;
-      const start = Math.min(origin, next);
-      const end = Math.max(origin, next);
-      if (end > start) state.selection = { start, end };
+      const dStart = Number(data.start);
+      const dEnd = Number(data.end);
+      if (mode === "move" && initialSel) {
+        const width = initialSel.end - initialSel.start;
+        let start = initialSel.start + (next - origin);
+        start = Math.max(dStart, Math.min(dEnd - width, start));
+        state.selection = { start: Math.round(start), end: Math.round(start + width) };
+      } else if (mode === "resize-start" && initialSel) {
+        const a = Math.max(dStart, Math.min(dEnd, next));
+        const start = Math.min(a, initialSel.end);
+        const end = Math.max(a, initialSel.end);
+        if (end > start) state.selection = { start, end };
+      } else if (mode === "resize-end" && initialSel) {
+        const b = Math.max(dStart, Math.min(dEnd, next));
+        const start = Math.min(initialSel.start, b);
+        const end = Math.max(initialSel.start, b);
+        if (end > start) state.selection = { start, end };
+      } else {
+        const start = Math.min(origin, next);
+        const end = Math.max(origin, next);
+        if (end > start) state.selection = { start, end };
+      }
       drawTimeline();
+      updateRangeControls();
+      if (tip && state.selection) {
+        tip.hidden = false;
+        tip.textContent = formatRange(state.selection.start, state.selection.end)
+          + "  ·  " + formatNs(state.selection.end - state.selection.start);
+        tip.style.left = Math.min(event.clientX + 12, window.innerWidth - 360) + "px";
+        tip.style.top = event.clientY + 14 + "px";
+      }
+      if (dragged && state.selection) scheduleBrushRefresh();
       return;
     }
-    const tip = $("timeline-tip");
+
+    updateCursor(hitMode(event), false);
     if (!tip) return;
     const rect = canvas.getBoundingClientRect();
     const x = event.clientX - rect.left - GUTTER;
@@ -659,34 +885,75 @@ function bindTimelineDrag(canvas) {
     tip.style.left = Math.min(event.clientX + 12, window.innerWidth - 360) + "px";
     tip.style.top = event.clientY + 14 + "px";
   });
+
   canvas.addEventListener("pointerleave", () => {
     const tip = $("timeline-tip");
     if (tip) tip.hidden = true;
+    if (!dragging) canvas.style.cursor = "crosshair";
   });
-  const finish = () => {
+
+  const finish = (event) => {
     if (!dragging) return;
     dragging = false;
-    origin = null;
     if (!dragged) state.selection = null;
+    const tip = $("timeline-tip");
+    if (tip) tip.hidden = true;
+    updateCursor(event ? hitMode(event) : "create", false);
+    mode = null;
+    origin = 0;
+    initialSel = null;
+    drawTimeline();
     updateRangeControls();
-    refreshTree();
+    flushBrushRefresh();
   };
   canvas.addEventListener("pointerup", finish);
   canvas.addEventListener("pointercancel", finish);
+  canvas.addEventListener("dblclick", () => {
+    const full = state.session && state.session.timeline;
+    if (!full) return;
+    if (state.selection) {
+      state.view = { start: state.selection.start, end: state.selection.end };
+      state.selection = null;
+      refreshTimeline();
+      refreshTree();
+    } else if (state.view.start !== full.start || state.view.end !== full.end) {
+      clearTimeFilter();
+    }
+  });
 }
 
 function updateRangeControls() {
   const zoom = $("zoom-range");
   const reset = $("reset-range");
   const label = $("range-label");
+  const badge = $("time-filter");
   const full = state.session && state.session.timeline;
-  if (!full) return;
+  if (!full) {
+    if (badge) badge.hidden = true;
+    return;
+  }
   const zoomed = state.view.start !== full.start || state.view.end !== full.end;
   if (zoom) zoom.hidden = !state.selection;
   if (reset) reset.hidden = !(zoomed || state.selection);
+  const shown = state.selection || state.view;
   if (label) {
-    const shown = state.selection || state.view;
     label.textContent = formatRange(shown.start, shown.end);
+  }
+  if (badge) {
+    const active = Boolean(state.selection || zoomed);
+    badge.hidden = !active;
+    clear(badge);
+    if (active) {
+      const spanNs = Math.max(0, Number(shown.end) - Number(shown.start));
+      badge.append(el("span", null, formatRange(shown.start, shown.end) + " (" + formatNs(spanNs) + ")"));
+      const clearBtn = el("button", "time-filter-clear", "×");
+      clearBtn.type = "button";
+      clearBtn.dataset.testid = "clear-time-filter";
+      clearBtn.title = "Clear time window filter (Esc)";
+      clearBtn.setAttribute("aria-label", "Clear time window filter");
+      clearBtn.addEventListener("click", clearTimeFilter);
+      badge.append(clearBtn);
+    }
   }
 }
 
@@ -705,7 +972,54 @@ function treeParams() {
   return params;
 }
 
+function nodeFramePath(nodeId) {
+  if (nodeId == null || !state.byId.has(nodeId)) return null;
+  const parts = [];
+  const seen = new Set();
+  let cur = state.byId.get(nodeId);
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    parts.push(cur.frame);
+    cur = cur.parent != null ? state.byId.get(cur.parent) : null;
+  }
+  parts.reverse();
+  return parts.join("/");
+}
+
+function buildPathIndex() {
+  const pathById = new Map();
+  const nodeByPath = new Map();
+  for (const node of state.tree.nodes) {
+    const prefix = node.parent != null ? pathById.get(node.parent) : null;
+    const path = prefix != null ? prefix + "/" + node.frame : String(node.frame);
+    pathById.set(node.id, path);
+    if (!nodeByPath.has(path)) nodeByPath.set(path, node);
+  }
+  return nodeByPath;
+}
+
+function setNodeExpanded(nodeId, open) {
+  const p = nodeFramePath(nodeId);
+  if (open) {
+    state.expanded.add(nodeId);
+    if (p) {
+      state.collapsedPaths.delete(p);
+      state.manualExpandedPaths.add(p);
+    }
+  } else {
+    state.expanded.delete(nodeId);
+    if (p) {
+      state.manualExpandedPaths.delete(p);
+      state.collapsedPaths.add(p);
+    }
+  }
+}
+
 async function refreshTree() {
+  const prevSelectedPath = nodeFramePath(state.selectedNode);
+  const prevSelectedFrame = state.selectedFrame;
+  const prevZoomPath = nodeFramePath(state.zoomNode);
+
   const generation = ++state.generation;
   const response = await fetch("tree?" + treeParams().toString());
   const body = await response.json();
@@ -716,19 +1030,59 @@ async function refreshTree() {
   }
   state.tree = body;
   indexTree();
-  if (state.zoomNode != null && !state.byId.has(state.zoomNode)) {
+  const nodeByPath = buildPathIndex();
+
+  if (prevZoomPath && nodeByPath.has(prevZoomPath)) {
+    state.zoomNode = nodeByPath.get(prevZoomPath).id;
+  } else {
     state.zoomNode = null;
   }
-  if (!state.byId.has(state.selectedNode)) {
+
+  state.expanded.clear();
+  expandDefaults();
+  for (const p of state.manualExpandedPaths) {
+    const mapped = nodeByPath.get(p);
+    if (mapped && (state.byParent.get(mapped.id) || []).length) {
+      state.expanded.add(mapped.id);
+    }
+  }
+  for (const p of state.collapsedPaths) {
+    const mapped = nodeByPath.get(p);
+    if (mapped) state.expanded.delete(mapped.id);
+  }
+
+  if (prevSelectedPath && nodeByPath.has(prevSelectedPath)) {
+    const mapped = nodeByPath.get(prevSelectedPath);
+    state.selectedNode = mapped.id;
+    state.selectedFrame = mapped.frame;
+  } else if (prevSelectedFrame != null) {
+    let best = null;
+    for (const node of state.tree.nodes) {
+      if (node.frame === prevSelectedFrame && (!best || node.weight > best.weight)) {
+        best = node;
+      }
+    }
+    if (best) {
+      state.selectedNode = best.id;
+      state.selectedFrame = best.frame;
+    } else {
+      state.selectedNode = null;
+      state.selectedFrame = null;
+    }
+  } else {
     state.selectedNode = null;
     state.selectedFrame = null;
+  }
+
+  if (state.selectedFrame == null) {
     const roots = kidsOf("root");
     if (roots[0]) {
       state.selectedNode = roots[0].id;
       state.selectedFrame = roots[0].frame;
     }
   }
-  if (state.expanded.size === 0) expandDefaults();
+
+  updateRangeControls();
   renderPane();
   renderInspector();
   document.documentElement.dataset.ready = "1";
@@ -793,6 +1147,24 @@ function frameMatches(frameId) {
 function flatten() {
   const show = state.query ? matchingIds() : null;
   const out = [];
+  if (state.zoomNode != null && state.byId.has(state.zoomNode)) {
+    const chain = zoomAncestors(state.zoomNode);
+    for (let i = 0; i < chain.length - 1; i += 1) {
+      out.push(chain[i]);
+    }
+    const zoomRoot = chain[chain.length - 1];
+    const pending = [zoomRoot];
+    while (pending.length) {
+      const node = pending.pop();
+      if (show && !show.has(node.id) && node.id !== zoomRoot.id) continue;
+      out.push(node);
+      if (!(state.query || state.expanded.has(node.id) || node.id === zoomRoot.id)) continue;
+      const kids = kidsOf(node.id);
+      for (let index = kids.length - 1; index >= 0; index -= 1) pending.push(kids[index]);
+    }
+    state.flat = out;
+    return out;
+  }
   const pending = [];
   const roots = kidsOf("root");
   for (let index = roots.length - 1; index >= 0; index -= 1) pending.push(roots[index]);
@@ -856,6 +1228,12 @@ function renderTree(host, focusId) {
     return;
   }
   const table = el("div", "table");
+  if (!host && state.zoomNode != null && state.byId.has(state.zoomNode)) {
+    const focusBar = el("div", "flame-bar");
+    focusBar.dataset.testid = "tree-focus-bar";
+    renderFlameZoomBar(focusBar);
+    table.append(focusBar);
+  }
   table.append(columnHeader());
   const scroll = el("div", "scroll");
   scroll.dataset.testid = "tree-scroll";
@@ -897,30 +1275,51 @@ function renderTree(host, focusId) {
 
 function headerLabel(key, text) {
   if (state.sortKey !== key) return text;
-  return text + (state.sortDir < 0 ? " ↓" : " ↑");
+  return text + (state.sortDir < 0 ? " ⌄" : " ⌃");
 }
 
 function columnHeader() {
   const header = el("div", "cols");
-  const name = el("button", "name-head", headerLabel("name", "Symbol"));
-  name.type = "button";
-  name.addEventListener("click", () => setSort("name"));
-  const loc = el("button", "loc-head", headerLabel("loc", "Location"));
-  loc.type = "button";
-  loc.addEventListener("click", () => setSort("loc"));
-  const weight = el("button", null, headerLabel("weight", "Weight"));
+  const weight = el(
+    "button",
+    "weight-head" + (state.sortKey === "weight" ? " active-sort" : ""),
+    headerLabel("weight", "Weight")
+  );
   weight.type = "button";
+  weight.dataset.testid = "col-weight";
   weight.addEventListener("click", () => setSort("weight"));
-  const self = el("button", null, headerLabel("self", "Self"));
+
+  const self = el(
+    "button",
+    "self-head" + (state.sortKey === "self" ? " active-sort" : ""),
+    headerLabel("self", "Self Weight")
+  );
   self.type = "button";
+  self.dataset.testid = "col-self";
   self.addEventListener("click", () => setSort("self"));
-  const pct = el("button", null, "%");
-  pct.type = "button";
-  pct.addEventListener("click", () => setSort("weight"));
-  const selfPct = el("button", null, "Self %");
-  selfPct.type = "button";
-  selfPct.addEventListener("click", () => setSort("self"));
-  header.append(name, loc, weight, self, pct, selfPct);
+
+  const symWrap = el("div", "sym-head-wrap");
+  const name = el(
+    "button",
+    "name-head" + (state.sortKey === "name" ? " active-sort" : ""),
+    headerLabel("name", "Symbol Names")
+  );
+  name.type = "button";
+  name.dataset.testid = "col-symbol";
+  name.addEventListener("click", () => setSort("name"));
+
+  const loc = el(
+    "button",
+    "loc-head" + (state.sortKey === "loc" ? " active-sort" : ""),
+    headerLabel("loc", "Library")
+  );
+  loc.type = "button";
+  loc.dataset.testid = "col-location";
+  loc.title = "Sort by library or source location";
+  loc.addEventListener("click", () => setSort("loc"));
+
+  symWrap.append(name, loc);
+  header.append(weight, self, symWrap);
   return header;
 }
 
@@ -933,33 +1332,54 @@ function setSort(key) {
   renderPane();
 }
 
-function metricCell(value, total, barClass) {
-  const cell = el("span", "num");
+function weightCell(value, total) {
+  const cell = el("div", "weight-cell");
   const share = total > 0 ? Math.min(100, Math.max(0, (Number(value) / Number(total)) * 100)) : 0;
   if (share >= 0.5) {
-    const bar = el("span", "cell-bar " + barClass);
+    const bar = el("span", "cell-bar cell-bar-weight");
     bar.style.width = share.toFixed(1) + "%";
     cell.append(bar);
   }
-  cell.append(document.createTextNode(formatWeight(value)));
+  cell.append(
+    el("span", "num w-val", formatWeight(value)),
+    el("span", "num w-pct", formatPercent(value, total))
+  );
   return cell;
 }
 
-function locationCell(frame, frameId, nodeId) {
-  const short = formatLocationShort(frame);
-  const full = formatLocationFull(frame);
-  const cell = el("span", "loc-cell" + (frame.file ? " loc-link" : ""));
-  if (short) {
-    cell.append(highlight(short, state.query));
-    cell.title = frame.file ? full + " (click to view source)" : full;
+function selfCell(value, total, frame) {
+  const cell = el("div", "self-cell");
+  const numVal = Number(value) || 0;
+  const share = total > 0 ? Math.min(100, Math.max(0, (numVal / Number(total)) * 100)) : 0;
+  if (share >= 0.5) {
+    const bar = el("span", "cell-bar cell-bar-self");
+    bar.style.width = share.toFixed(1) + "%";
+    cell.append(bar);
   }
+  if (numVal > 0 && total > 0) {
+    cell.title = "Self weight: " + formatWeight(numVal) + " (" + formatPercent(numVal, total) + ")";
+  }
+  cell.append(
+    el("span", "num self-val" + (numVal === 0 ? " is-zero" : ""), formatWeight(numVal)),
+    catIcon(frame)
+  );
+  return cell;
+}
+
+function inlineLocation(frame, frameId, nodeId) {
+  const short = formatLocationShort(frame);
+  if (!short) return null;
+  const full = formatLocationFull(frame);
+  const span = el("span", "sym-loc" + (frame.file ? " loc-link" : ""));
+  span.append(highlight(short, state.query));
+  span.title = frame.file ? full + " (click to view source)" : full;
   if (frame.file) {
-    cell.addEventListener("click", (event) => {
+    span.addEventListener("click", (event) => {
       event.stopPropagation();
       openSourceForFrame(frameId, nodeId);
     });
   }
-  return cell;
+  return span;
 }
 
 function treeRow(node) {
@@ -970,15 +1390,14 @@ function treeRow(node) {
   row.setAttribute("aria-selected", node.id === state.selectedNode ? "true" : "false");
   const children = state.byParent.get(node.id) || [];
   const name = el("div", "name-cell");
-  name.style.paddingLeft = 6 + node.depth * 14 + "px";
+  name.style.paddingLeft = 8 + node.depth * 14 + "px";
   if (children.length) {
     const twist = el("button", "twist" + (state.expanded.has(node.id) || state.query ? " open" : ""));
     twist.type = "button";
     twist.setAttribute("aria-label", state.expanded.has(node.id) ? "Collapse" : "Expand");
     twist.addEventListener("click", (event) => {
       event.stopPropagation();
-      if (state.expanded.has(node.id)) state.expanded.delete(node.id);
-      else state.expanded.add(node.id);
+      setNodeExpanded(node.id, !state.expanded.has(node.id));
       if (state.pane === "flame") {
         const host = document.querySelector(".flame-tree");
         if (host) renderTree(host);
@@ -994,16 +1413,34 @@ function treeRow(node) {
   const label = el("span", "label");
   label.append(highlight(frame.name, state.query));
   name.append(label);
-  if (frame.runtime && frame.runtime !== "native") {
+  const loc = inlineLocation(frame, node.frame, node.id);
+  if (loc) name.append(loc);
+  if (state.multiRuntime && frame.runtime && frame.runtime !== "native" && frame.runtime !== "kernel") {
     name.append(el("span", "rt-badge", frame.runtime));
   }
+  const isFocused = state.zoomNode === node.id;
+  if (children.length || isFocused) {
+    const focusBtn = el("button", "focus-btn" + (isFocused ? " is-focused" : ""));
+    focusBtn.type = "button";
+    focusBtn.dataset.testid = "focus-subtree";
+    focusBtn.title = isFocused ? "Clear subtree focus (Esc)" : "Focus on subtree";
+    focusBtn.setAttribute("aria-label", focusBtn.title);
+    focusBtn.append(focusIcon(isFocused));
+    focusBtn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      state.zoomNode = isFocused ? null : node.id;
+      if (state.zoomNode != null) setNodeExpanded(node.id, true);
+      state.selectedNode = node.id;
+      state.selectedFrame = node.frame;
+      renderInspector();
+      updateFlameView();
+    });
+    name.append(focusBtn);
+  }
   row.append(
-    name,
-    locationCell(frame, node.frame, node.id),
-    metricCell(node.weight, state.tree.total, "cell-bar-weight"),
-    metricCell(node.self, state.tree.total, "cell-bar-self"),
-    el("span", "num", formatPercent(node.weight, state.tree.total)),
-    el("span", "num", formatPercent(node.self, state.tree.total))
+    weightCell(node.weight, state.tree.total),
+    selfCell(node.self, state.tree.total, frame),
+    name
   );
   row.addEventListener("click", () => selectNode(node));
   row.addEventListener("dblclick", () => {
@@ -1030,7 +1467,7 @@ function focusNodeInTree(node) {
   const seen = new Set();
   while (cur && !seen.has(cur.id)) {
     seen.add(cur.id);
-    state.expanded.add(cur.id);
+    setNodeExpanded(cur.id, true);
     cur = cur.parent != null ? state.byId.get(cur.parent) : null;
   }
   const treeHost = document.querySelector(".flame-tree");
@@ -1090,20 +1527,19 @@ function renderFunctions() {
       line.dataset.frame = String(row.frame);
       line.setAttribute("aria-selected", row.frame === state.selectedFrame ? "true" : "false");
       const name = el("div", "name-cell");
-      name.style.paddingLeft = "8px";
+      name.style.paddingLeft = "10px";
       const label = el("span", "label");
       label.append(highlight(frame.name, state.query));
       name.append(label);
-      if (frame.runtime && frame.runtime !== "native") {
+      const loc = inlineLocation(frame, row.frame, null);
+      if (loc) name.append(loc);
+      if (state.multiRuntime && frame.runtime && frame.runtime !== "native" && frame.runtime !== "kernel") {
         name.append(el("span", "rt-badge", frame.runtime));
       }
       line.append(
-        name,
-        locationCell(frame, row.frame, null),
-        metricCell(row.weight, state.tree.total, "cell-bar-weight"),
-        metricCell(row.self, state.tree.total, "cell-bar-self"),
-        el("span", "num", formatPercent(row.weight, state.tree.total)),
-        el("span", "num", formatPercent(row.self, state.tree.total))
+        weightCell(row.weight, state.tree.total),
+        selfCell(row.self, state.tree.total, frame),
+        name
       );
       line.addEventListener("click", () => {
         state.selectedFrame = row.frame;
@@ -1304,9 +1740,15 @@ function renderFlameZoomBar(bar) {
 }
 
 function updateFlameView() {
+  if (state.pane === "tree") {
+    renderTree();
+    return;
+  }
   const bar = $("flame-zoom-bar");
   if (bar) renderFlameZoomBar(bar);
   drawFlame();
+  const treeHost = document.querySelector(".flame-tree");
+  if (treeHost) renderTree(treeHost, state.selectedNode);
 }
 
 function renderFlame() {
@@ -1652,7 +2094,7 @@ function renderInspector() {
           return { frameId, nodeId: null, weight: row ? row.weight : 0 };
         })
       : [];
-  if (label) label.textContent = through ? "Heaviest path" : "Heaviest stack";
+  if (label) label.textContent = "Heaviest Stack Trace";
   if (scope) {
     scope.textContent = through
       ? "Through the selected function"
@@ -1663,14 +2105,33 @@ function renderInspector() {
   } else {
     for (const entry of items) {
       const frame = frameOf(entry.frameId);
-      const item = el("li", null, frame.name);
+      const item = el("li", "heavy-row");
       item.dataset.frame = String(entry.frameId);
       if (entry.nodeId != null) item.dataset.node = String(entry.nodeId);
-      if (state.tree && state.tree.total > 0 && entry.weight > 0) {
-        item.dataset.share = formatPercent(entry.weight, state.tree.total);
-      }
+      const pct = state.tree && state.tree.total > 0
+        ? formatPercent(entry.weight, state.tree.total)
+        : "";
       const fullLoc = formatLocationFull(frame);
-      item.title = fullLoc ? frame.name + " — " + fullLoc : frame.name;
+      const shortLoc = formatLocationShort(frame);
+      item.title = frame.name
+        + (fullLoc ? " — " + fullLoc : "")
+        + (pct ? " (" + pct + ")" : "");
+
+      const weightEl = el("span", "heavy-weight", formatWeight(entry.weight));
+      const bodyEl = el("div", "heavy-body");
+      bodyEl.append(el("div", "heavy-fn", frame.name));
+      if (shortLoc) {
+        const locEl = el("div", "heavy-loc" + (frame.file ? " loc-link" : ""), shortLoc);
+        if (frame.file) {
+          locEl.addEventListener("click", (event) => {
+            event.stopPropagation();
+            openSourceForFrame(entry.frameId, entry.nodeId);
+          });
+        }
+        bodyEl.append(locEl);
+      }
+      item.append(catIcon(frame), weightEl, bodyEl);
+
       const isSelected = entry.nodeId != null
         ? entry.nodeId === state.selectedNode
         : entry.frameId === state.selectedFrame;
@@ -1726,10 +2187,8 @@ function renderInspector() {
   addDetail(detail, "System library", frame.system ? "yes" : "no");
   const weight = node ? node.weight : row ? row.weight : 0;
   const self = node ? node.self : row ? row.self : 0;
-  addDetail(detail, "Weight", formatWeight(weight));
-  addDetail(detail, "Self", formatWeight(self));
-  addDetail(detail, "Share", formatPercent(weight, state.tree.total));
-  addDetail(detail, "Self share", formatPercent(self, state.tree.total));
+  addDetail(detail, "Weight", formatWeight(weight) + " (" + formatPercent(weight, state.tree.total) + ")");
+  addDetail(detail, "Self Weight", formatWeight(self) + " (" + formatPercent(self, state.tree.total) + ")");
 }
 
 function addDetail(detail, name, value) {
@@ -1762,7 +2221,7 @@ function onKey(event) {
       state.query = "";
       $("search").value = "";
       renderPane();
-    } else if (state.pane === "flame" && state.zoomNode != null) {
+    } else if ((state.pane === "flame" || state.pane === "tree") && state.zoomNode != null) {
       state.zoomNode = null;
       updateFlameView();
     } else if (state.pane === "source") {
@@ -1774,10 +2233,7 @@ function onKey(event) {
         state.session.timeline &&
         (state.view.start !== state.session.timeline.start || state.view.end !== state.session.timeline.end))
     ) {
-      state.selection = null;
-      state.view = { start: state.session.timeline.start, end: state.session.timeline.end };
-      refreshTimeline();
-      refreshTree();
+      clearTimeFilter();
     }
     return;
   }
@@ -1818,7 +2274,7 @@ function onKey(event) {
     event.preventDefault();
     const node = flat[index];
     if ((state.byParent.get(node.id) || []).length && !state.expanded.has(node.id)) {
-      state.expanded.add(node.id);
+      setNodeExpanded(node.id, true);
       if (state.pane === "flame") {
         const host = document.querySelector(".flame-tree");
         if (host) renderTree(host);
@@ -1830,7 +2286,7 @@ function onKey(event) {
     event.preventDefault();
     const node = flat[index];
     if (state.expanded.has(node.id)) {
-      state.expanded.delete(node.id);
+      setNodeExpanded(node.id, false);
       if (state.pane === "flame") {
         const host = document.querySelector(".flame-tree");
         if (host) renderTree(host);
@@ -1863,7 +2319,7 @@ function bindSplitter(splitter, axis) {
         overview.style.height = next + "px";
         overview.style.maxHeight = next + "px";
       } else {
-        const next = Math.max(210, Math.min(window.innerWidth * 0.5, startSize - delta));
+        const next = Math.max(215, Math.min(window.innerWidth * 0.5, startSize - delta));
         inspector.style.width = next + "px";
       }
       if (state.pane === "flame") drawFlame();
@@ -1892,6 +2348,8 @@ async function main() {
     state.invert = !state.invert;
     $("invert").setAttribute("aria-pressed", state.invert ? "true" : "false");
     state.expanded.clear();
+    state.collapsedPaths.clear();
+    state.manualExpandedPaths.clear();
     state.zoomNode = null;
     refreshTree();
   });
@@ -1900,6 +2358,8 @@ async function main() {
     state.hideSystem = !state.hideSystem;
     $("hide-system").setAttribute("aria-pressed", state.hideSystem ? "true" : "false");
     state.expanded.clear();
+    state.collapsedPaths.clear();
+    state.manualExpandedPaths.clear();
     state.zoomNode = null;
     refreshTree();
   });
@@ -1922,6 +2382,12 @@ async function main() {
     return;
   }
   state.session = session;
+  const userRuntimes = new Set();
+  for (const frame of session.frames || []) {
+    const rt = frame.runtime || "native";
+    if (rt !== "kernel") userRuntimes.add(rt);
+  }
+  state.multiRuntime = userRuntimes.size > 1;
   if (session.timeline) {
     state.view = { start: session.timeline.start, end: session.timeline.end };
   }

@@ -415,9 +415,43 @@ fn check_one(cdp: &mut Cdp, path: &Path, kind: &str, keep: &Path) {
             wait_for(
                 cdp,
                 session,
+                "!document.body.innerText.includes('tokenize') && document.body.innerText.includes('commit_frame') && !!document.querySelector('[data-testid=time-filter-badge]') && !document.querySelector('[data-testid=time-filter-badge]').hidden"
+            ),
+            "{name}: the late interval did not keep commit_frame, drop tokenize, and show time-filter-badge"
+        );
+        slide_timeline_brush(cdp, session);
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "document.body.innerText.includes('tokenize') && !document.body.innerText.includes('commit_frame')"
+            ),
+            "{name}: sliding the timeline brush window left did not switch to the early tokenize interval"
+        );
+        cdp.call(
+            session,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.querySelector('[data-testid=clear-time-filter]').click()",
+                "returnByValue": true,
+            }),
+        );
+        assert!(
+            wait_for(
+                cdp,
+                session,
+                "document.body.innerText.includes('tokenize') && document.body.innerText.includes('commit_frame') && document.querySelector('[data-testid=time-filter-badge]').hidden"
+            ),
+            "{name}: clear-time-filter did not restore the full timeline"
+        );
+        drag_timeline(cdp, session);
+        assert!(
+            wait_for(
+                cdp,
+                session,
                 "!document.body.innerText.includes('tokenize') && document.body.innerText.includes('commit_frame')"
             ),
-            "{name}: the late interval did not keep commit_frame and drop tokenize"
+            "{name}: re-dragging the late interval failed"
         );
         let selected = cdp.call(
             session,
@@ -635,6 +669,16 @@ fn assert_studio_chart(cdp: &mut Cdp, session: Option<&str>, name: &str) {
       gap = { ok: share >= 0.35, gap: share, marks: best.marks };
     }
   }
+  const colW = document.querySelector('[data-testid=col-weight]');
+  const colS = document.querySelector('[data-testid=col-self]');
+  const colSym = document.querySelector('[data-testid=col-symbol]');
+  const instrumentsCols = !!(colW && colS && colSym
+    && colW.getBoundingClientRect().left < colS.getBoundingClientRect().left
+    && colS.getBoundingClientRect().left < colSym.getBoundingClientRect().left
+    && row && row.querySelector('.weight-cell .w-val')
+    && row.querySelector('.weight-cell .w-pct')
+    && row.querySelector('.self-cell .self-val')
+    && row.querySelector('.self-cell .cat-icon svg'));
   return {
     help: help,
     title: oneLine(title),
@@ -643,8 +687,10 @@ fn assert_studio_chart(cdp: &mut Cdp, session: Option<&str>, name: &str) {
     ruler: unitNames.length === 1 && unitNames[0] === 'ms' && numbers === '0,500,1000,1500,2000',
     ticks: ticks,
     zero: nums.indexOf('0') >= 0 && document.body.innerText.indexOf('0 ns') < 0,
+    instrumentsCols: instrumentsCols,
     scope: (document.querySelector('[data-testid=heaviest-scope]') || {}).textContent || '',
-    first: (document.querySelector('#heaviest li') || {}).textContent || '',
+    first: (document.querySelector('#heaviest li .heavy-fn') || {}).textContent || '',
+    heavyWeight: (document.querySelector('#heaviest li .heavy-weight') || {}).textContent || '',
     gap: gap
   };
 })()"#;
@@ -680,8 +726,13 @@ fn assert_studio_chart(cdp: &mut Cdp, session: Option<&str>, name: &str) {
         "{name}: a zero weight was not plain 0: {value}"
     );
     assert!(
+        value["instrumentsCols"].as_bool() == Some(true),
+        "{name}: Instruments left-gutter columns (Weight | Self Weight | Symbol Names) were not rendered: {value}"
+    );
+    assert!(
         value["scope"].as_str() == Some("Through the selected function")
-            && value["first"].as_str() == Some("main"),
+            && value["first"].as_str() == Some("main")
+            && !value["heavyWeight"].as_str().unwrap_or_default().is_empty(),
         "{name}: heaviest path was not the selected function: {value}"
     );
     assert!(
@@ -752,6 +803,46 @@ fn drag_timeline(cdp: &mut Cdp, session: Option<&str>) {
         "Runtime.evaluate",
         json!({
             "expression": "(function(){ const canvas = document.querySelector('#timeline'); const rect = canvas.getBoundingClientRect(); const gutter = 128; const plot = Math.max(1, rect.width - gutter); return {y: rect.top + Math.min(8, rect.height / 2), x0: rect.left + gutter + plot * 0.80, x1: rect.left + gutter + plot * 0.97}; })()",
+            "returnByValue": true,
+        }),
+    );
+    let value = point
+        .pointer("/result/value")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let x0 = value["x0"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("timeline rect: {point}"));
+    let x1 = value["x1"].as_f64().unwrap();
+    let y = value["y"].as_f64().unwrap();
+    for (kind, x) in [
+        ("mousePressed", x0),
+        ("mouseMoved", x1),
+        ("mouseReleased", x1),
+    ] {
+        cdp.call(
+            session,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": kind,
+                "x": x,
+                "y": y,
+                "button": "left",
+                "buttons": if kind == "mouseReleased" { 0 } else { 1 },
+                "clickCount": 1,
+            }),
+        );
+    }
+}
+
+/// Grab the interior of the active `[0.80, 0.97]` brush selection (`0.885`) and
+/// slide it left into the early `[0.06, 0.23]` interval.
+fn slide_timeline_brush(cdp: &mut Cdp, session: Option<&str>) {
+    let point = cdp.call(
+        session,
+        "Runtime.evaluate",
+        json!({
+            "expression": "(function(){ const canvas = document.querySelector('#timeline'); const rect = canvas.getBoundingClientRect(); const gutter = 128; const plot = Math.max(1, rect.width - gutter); return {y: rect.top + Math.min(8, rect.height / 2), x0: rect.left + gutter + plot * 0.885, x1: rect.left + gutter + plot * 0.145}; })()",
             "returnByValue": true,
         }),
     );

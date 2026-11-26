@@ -42,6 +42,7 @@
           <button type="button" id="invert" data-testid="invert" aria-pressed="false">Invert</button>
           <button type="button" id="hide-system" data-testid="hide-system" aria-pressed="false" disabled>Hide system</button>
         </div>
+        <div id="time-filter" class="time-filter" data-testid="time-filter-badge" hidden></div>
         <div id="tracks" class="tracks" data-testid="tracks"></div>
       </div>
       <div id="pane" class="pane" data-testid="pane" tabindex="0" aria-label="Profile table. Arrow keys move, left and right collapse and expand, Enter opens source, slash searches, i inverts, escape clears or resets zoom."></div>
@@ -49,7 +50,10 @@
     <div id="split-inspector" class="splitter splitter-x" role="separator" aria-orientation="vertical" aria-label="Resize detail" tabindex="0"></div>
     <aside class="inspector" data-testid="inspector">
       <div class="inspector-section inspector-heavy">
-        <h2 id="heaviest-label" data-testid="heaviest-label">Heaviest path</h2>
+        <div class="heavy-head">
+          <h2 id="heaviest-label" data-testid="heaviest-label">Heaviest Stack Trace</h2>
+          <span id="heaviest-by" class="heavy-by">by Weight</span>
+        </div>
         <p id="heaviest-scope" class="scope" data-testid="heaviest-scope"></p>
         <ol id="heaviest" data-testid="heaviest"></ol>
       </div>
