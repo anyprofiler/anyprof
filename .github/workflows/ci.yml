@@ -211,6 +211,20 @@ jobs:
           ANYPROF_PYTHON_312: ${{ steps.py312.outputs.python-path }}
           ANYPROF_PYTHON_313: ${{ steps.py313.outputs.python-path }}
           ANYPROF_PYTHON_314: ${{ steps.py314.outputs.python-path }}
+      - name: Verify non-root macOS sampling via anyprof setup (no sudo)
+        if: startsWith(matrix.os, 'macos-')
+        env:
+          PY314: ${{ steps.py314.outputs.python-path }}
+        run: |
+          set -eu
+          sudo /usr/sbin/DevToolsSecurity -enable
+          sudo security authorizationdb write system.privilege.taskport.debug allow
+          sudo security authorizationdb write system.privilege.taskport allow
+          cargo build -p anyprof-cli --locked
+          ./target/debug/anyprof setup --yes --binary ./target/debug/anyprof
+          printf 'def nonroot_spin():\n    x = 0\n    while True:\n        x += 1\nnonroot_spin()\n' > /tmp/nonroot_spin.py
+          ./target/debug/anyprof rec -d 1s -f collapsed -o /tmp/nonroot-py.collapsed -- "$PY314" /tmp/nonroot_spin.py
+          grep -q "\[python\] nonroot_spin" /tmp/nonroot-py.collapsed
       - name: Upload viewer screenshots
         if: always()
         uses: actions/upload-artifact@v4

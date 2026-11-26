@@ -7,6 +7,8 @@ members = ["cargo:."]
 cargo-dist-version = "0.33.1"
 # CI backends to support
 ci = "github"
+# Allow custom macOS code-signing (com.apple.security.cs.debugger) & notarization step in release.yml
+allow-dirty = ["ci"]
 # The installers to generate for each app.
 # TODO(installers): Homebrew and npm are intentionally off until a tap and an npm scope exist.
 # installers = ["shell", "powershell", "homebrew", "npm"]

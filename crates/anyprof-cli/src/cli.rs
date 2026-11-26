@@ -44,6 +44,14 @@ pub enum Command {
     /// optionally writes a `.json`, `.md`, or `.txt` report via `-o`, and serves
     /// an interactive Differential Flame Graph on `127.0.0.1` with `-w` / `--web`.
     Diff(DiffArgs),
+    /// Sign anyprof with macOS debugger entitlements (`com.apple.security.cs.debugger`) so sampling needs no sudo.
+    ///
+    /// On macOS, applies `codesign --force --options runtime --entitlements` to
+    /// the `anyprof` binary (using ad-hoc local signing `-` by default, or an
+    /// Apple Developer ID / Keychain certificate via `--identity`) and checks
+    /// `DevToolsSecurity -status`. Re-run after `anyprof update` or `cargo install`
+    /// unless using an already-signed release archive.
+    Setup(SetupArgs),
     /// Upgrade this install to the latest GitHub release.
     ///
     /// Works for copies installed by the shell or PowerShell release installer.
@@ -309,6 +317,29 @@ pub struct ConvertArgs {
     pub to: ProfileFormat,
 }
 
+#[derive(Debug, Args)]
+#[command(after_help = "\
+Examples:
+  anyprof setup --yes
+  anyprof setup --identity \"Developer ID Application: Example Corp (TEAMID1234)\" --timestamp")]
+pub struct SetupArgs {
+    /// Skip the interactive confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+
+    /// macOS Keychain code-signing identity (defaults to `-` for local ad-hoc signing).
+    #[arg(long, value_name = "IDENTITY")]
+    pub identity: Option<String>,
+
+    /// Path to the `anyprof` binary to sign (defaults to the running executable).
+    #[arg(long, value_name = "PATH")]
+    pub binary: Option<PathBuf>,
+
+    /// Request a secure Apple timestamp when signing with a non-ad-hoc certificate.
+    #[arg(long)]
+    pub timestamp: bool,
+}
+
 /// One sample per microsecond. V8 takes whole-microsecond intervals, so a
 /// faster `-F` could not be honored.
 pub const MAX_FREQUENCY_HZ: u32 = 1_000_000;
@@ -330,6 +361,7 @@ fn parse_frequency(raw: &str) -> Result<u32, String> {
 pub enum BackendName {
     Node,
     Browser,
+    Xctrace,
     Rust,
     Go,
     Python,
@@ -343,6 +375,7 @@ impl BackendName {
         match self {
             Self::Node => "node",
             Self::Browser => "browser",
+            Self::Xctrace => "xctrace",
             Self::Rust => "rust",
             Self::Go => "go",
             Self::Python => "python",

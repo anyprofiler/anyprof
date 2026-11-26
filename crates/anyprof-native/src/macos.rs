@@ -64,6 +64,7 @@ unsafe extern "C" {
         thread_info_out_cnt: *mut mach_msg_type_number_t,
     ) -> kern_return_t;
     fn mach_port_deallocate(task: mach_port_t, name: mach_port_t) -> kern_return_t;
+    fn geteuid() -> u32;
 }
 
 pub fn record(
@@ -86,7 +87,33 @@ pub fn record(
         return Err(Error::backend("native", message));
     }
 
-    let mut task = Task::attach(target.pid)?;
+    let mut task = match Task::attach(target.pid) {
+        Ok(task) => task,
+        Err(attach_err) => {
+            if unsafe { geteuid() } != 0
+                && matches!(
+                    opts.language_unwind,
+                    anyprof_core::LanguageUnwind::None
+                        | anyprof_core::LanguageUnwind::Go
+                        | anyprof_core::LanguageUnwind::Auto
+                )
+                && crate::xctrace::is_available()
+            {
+                tracing::info!(
+                    pid = target.pid,
+                    "task_for_pid denied without root; falling back to Apple Instruments (xcrun xctrace)"
+                );
+                return crate::xctrace::record_fallback(
+                    target,
+                    opts,
+                    session_stop,
+                    ready_tx,
+                    attach_err,
+                );
+            }
+            return Err(attach_err);
+        }
+    };
     let mut unwinder = MachUnwinder::new();
     let mut unwind_cache = MachUnwindCache::new_in();
     let mut go_images = Vec::new();

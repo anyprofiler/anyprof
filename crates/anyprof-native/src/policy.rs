@@ -239,9 +239,10 @@ pub(crate) fn strip_pointer(
 pub(crate) fn task_for_pid_denied(pid: u32, kr: i32) -> String {
     format!(
         "cannot sample pid {pid}: task_for_pid failed (kern return {kr}). \
-         sudo anyprof rec -p {pid} can sample an ordinary process. \
-         It does not grant access to a process protected by System Integrity Protection \
-         or a hardened runtime. anyprof will not change those protections."
+         Run 'anyprof setup' once to sign anyprof with debugger entitlements, \
+         or use 'sudo anyprof rec -p {pid}' to sample an ordinary process. \
+         Neither grants access to a process protected by System Integrity Protection \
+         or a hardened runtime without debuggable entitlements. anyprof will not change those protections."
     )
 }
 
