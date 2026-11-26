@@ -21,10 +21,8 @@
 #include <internal/pycore_frame.h>
 #include <internal/pycore_interp.h>
 #include <internal/pycore_runtime.h>
-#if PY_VERSION_HEX >= 0x030D0000
-#include <internal/pycore_debug_offsets.h>
-#endif
 #if PY_VERSION_HEX >= 0x030E0000
+#include <internal/pycore_debug_offsets.h>
 #include <internal/pycore_stackref.h>
 #endif
 

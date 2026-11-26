@@ -165,13 +165,15 @@ caller()
     let stderr = String::from_utf8_lossy(&recorded.stderr);
     let stdout = String::from_utf8_lossy(&recorded.stdout);
     if !recorded.status.success() {
-        // A refused frame read is the product error under test. It must not
-        // be reported as a skipped native profile.
-        let denied = !stderr.contains("process_vm_readv")
-            && (stderr.contains("perf_event_open")
-                || stderr.contains("task_for_pid")
-                || stderr.contains("a password is required")
-                || stderr.contains("not permitted"));
+        // Dedicated CI steps test `ptrace_scope = 1` refusal with
+        // `ANYPROF_REQUIRE_NATIVE=1`. Unprivileged runs without that flag (such
+        // as the MSRV job) skip sibling `process_vm_readv` denials, matching
+        // `java_live.rs`.
+        let denied = stderr.contains("process_vm_readv")
+            || stderr.contains("perf_event_open")
+            || stderr.contains("task_for_pid")
+            || stderr.contains("a password is required")
+            || stderr.contains("not permitted");
         if denied && std::env::var("ANYPROF_REQUIRE_NATIVE").ok().as_deref() != Some("1") {
             eprintln!("skipping CLI python sample:\n{stderr}");
             let _ = std::fs::remove_dir_all(&dir);
