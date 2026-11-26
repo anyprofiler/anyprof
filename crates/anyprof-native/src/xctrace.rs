@@ -107,6 +107,34 @@ pub(crate) fn is_available() -> bool {
     resolve_xctrace_bin().is_some()
 }
 
+/// True when automatic fallback from Mach `task_for_pid` to `xctrace` can collect samples.
+///
+/// Apple's `Virtualization.framework` on Apple Silicon (`kern.hv_vmm_present=1` on
+/// `aarch64`) does not virtualize ARM PMU counters, causing `Time Profiler` to record
+/// 0 samples in arm64 guest VMs while bare-metal Apple Silicon Macs and Intel hosts/VMs
+/// sample normally.
+#[cfg(target_os = "macos")]
+pub(crate) fn fallback_available() -> bool {
+    is_available() && !arm64_guest_vm_lacks_pmu()
+}
+
+#[cfg(target_os = "macos")]
+fn arm64_guest_vm_lacks_pmu() -> bool {
+    if !cfg!(target_arch = "aarch64") {
+        return false;
+    }
+    std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.hv_vmm_present"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .is_some_and(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
+        })
+}
+
 #[cfg(target_os = "macos")]
 fn resolve_xctrace_bin() -> Option<PathBuf> {
     let output = std::process::Command::new("xcrun")

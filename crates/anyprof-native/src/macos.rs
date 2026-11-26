@@ -97,7 +97,7 @@ pub fn record(
                         | anyprof_core::LanguageUnwind::Go
                         | anyprof_core::LanguageUnwind::Auto
                 )
-                && crate::xctrace::is_available()
+                && crate::xctrace::fallback_available()
             {
                 tracing::info!(
                     pid = target.pid,

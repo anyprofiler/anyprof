@@ -238,11 +238,18 @@ jobs:
           trap 'kill "$BURN_PID" 2>/dev/null || true' EXIT
           sleep 0.2
 
-          # 1. Zero-config / zero-sudo / zero-DevToolsSecurity sampling via Instruments xctrace
-          ./target/debug/anyprof rec -b xctrace -p "$BURN_PID" -d 1s -f collapsed -o /tmp/nonroot-xc.collapsed
-          grep -q "burn_xctrace" /tmp/nonroot-xc.collapsed
-          ./target/debug/anyprof rec -p "$BURN_PID" -d 1s -f collapsed -o /tmp/nonroot-fallback.collapsed
-          grep -q "burn_xctrace" /tmp/nonroot-fallback.collapsed
+          # 1. Zero-config / zero-sudo / zero-DevToolsSecurity sampling via Instruments xctrace.
+          # Apple Virtualization.framework arm64 VMs (kern.hv_vmm_present=1 on arm64) omit
+          # hardware PMU counters needed by Time Profiler; Intel runners and bare-metal Macs have them.
+          VMM_PRESENT=$(/usr/sbin/sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)
+          if [ "$(uname -m)" != "arm64" ] || [ "$VMM_PRESENT" != "1" ]; then
+            ./target/debug/anyprof rec -b xctrace -p "$BURN_PID" -d 1s -f collapsed -o /tmp/nonroot-xc.collapsed
+            grep -q "burn_xctrace" /tmp/nonroot-xc.collapsed
+            ./target/debug/anyprof rec -p "$BURN_PID" -d 1s -f collapsed -o /tmp/nonroot-fallback.collapsed
+            grep -q "burn_xctrace" /tmp/nonroot-fallback.collapsed
+          else
+            echo "Skipping xctrace Time Profiler PMU check on arm64 guest VM (kern.hv_vmm_present=1)"
+          fi
 
           # 2. Mach task_for_pid sampling without sudo after 'anyprof setup --yes'
           sudo /usr/sbin/DevToolsSecurity -enable

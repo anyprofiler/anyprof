@@ -164,19 +164,7 @@ fn run_macos(args: SetupArgs) -> anyhow::Result<()> {
         return Err(err).with_context(|| format!("replacing {}", exe.display()));
     }
 
-    let dev_mode_enabled = Command::new("/usr/sbin/DevToolsSecurity")
-        .arg("-status")
-        .output()
-        .ok()
-        .is_some_and(|out| {
-            let text = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            )
-            .to_ascii_lowercase();
-            text.contains("enabled")
-        });
+    let dev_mode_enabled = devtools_taskport_authorized();
 
     if dev_mode_enabled {
         eprintln!(
@@ -192,4 +180,32 @@ fn run_macos(args: SetupArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn devtools_taskport_authorized() -> bool {
+    let dev_tools = Command::new("/usr/sbin/DevToolsSecurity")
+        .arg("-status")
+        .output()
+        .ok()
+        .is_some_and(|out| {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .to_ascii_lowercase();
+            text.contains("enabled")
+        });
+    if dev_tools {
+        return true;
+    }
+    Command::new("security")
+        .args(["authorizationdb", "read", "system.privilege.taskport.debug"])
+        .output()
+        .ok()
+        .is_some_and(|out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.contains("<string>allow</string>") || text.contains("authenticate-developer")
+        })
 }
