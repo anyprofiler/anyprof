@@ -25,6 +25,10 @@
   --source-target-border: #0a5fd4;
   --badge-bg: #e8e8ed;
   --badge-text: #3a3a40;
+  --diff-reg: #c62828;
+  --diff-imp: #1565c0;
+  --diff-reg-bar: rgba(220, 38, 38, 0.16);
+  --diff-imp-bar: rgba(37, 99, 235, 0.16);
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
@@ -57,6 +61,10 @@
     --source-target-border: #3b9eff;
     --badge-bg: #36363c;
     --badge-text: #d8d8df;
+    --diff-reg: #ff7b7b;
+    --diff-imp: #6cb6ff;
+    --diff-reg-bar: rgba(239, 68, 68, 0.26);
+    --diff-imp-bar: rgba(59, 130, 246, 0.26);
   }
 }
 
@@ -87,6 +95,10 @@
   --source-target-border: #3b9eff;
   --badge-bg: #36363c;
   --badge-text: #d8d8df;
+  --diff-reg: #ff7b7b;
+  --diff-imp: #6cb6ff;
+  --diff-reg-bar: rgba(239, 68, 68, 0.26);
+  --diff-imp-bar: rgba(59, 130, 246, 0.26);
 }
 
 * { box-sizing: border-box; }
@@ -1236,3 +1248,120 @@ mark {
 }
 
 .error { color: var(--danger); }
+
+/* Differential Flame Graph & Instruments Diff Table */
+.diff-overview {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-height: 36px;
+  padding: 6px 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.diff-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  background: var(--bar);
+  border: 1px solid var(--line);
+}
+
+.diff-pill-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.diff-arrow {
+  color: var(--muted);
+}
+
+.diff-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.diff-scale {
+  width: 72px;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #2563eb 0%, #94a3b8 50%, #dc2626 100%);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+}
+
+.cols.diff-cols,
+.row.diff-row,
+.fn-row.diff-row {
+  grid-template-columns: 92px 92px 108px 112px minmax(180px, 1fr);
+}
+
+@media (max-width: 960px) {
+  .cols.diff-cols,
+  .row.diff-row,
+  .fn-row.diff-row {
+    grid-template-columns: 80px 80px 96px 100px minmax(140px, 1fr);
+  }
+}
+
+.diff-num-cell {
+  position: relative;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0 8px 0 4px;
+  overflow: hidden;
+}
+
+.diff-self-cell {
+  position: relative;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 0 7px 0 4px;
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.diff-num-cell .num,
+.diff-self-cell .num {
+  position: relative;
+  z-index: 1;
+}
+
+.cell-bar-reg { background: var(--diff-reg-bar); }
+.cell-bar-imp { background: var(--diff-imp-bar); }
+
+.delta-pos { color: var(--diff-reg); font-weight: 600; }
+.delta-neg { color: var(--diff-imp); font-weight: 600; }
+
+.row[aria-selected="true"] .delta-pos,
+.row[aria-selected="true"] .delta-neg {
+  color: #ffffff;
+}
+
+.source-cols.diff-source-cols,
+.source-row.diff-source-row {
+  grid-template-columns: 54px 82px 82px 88px minmax(0, 1fr);
+}
+
+.source-row.source-reg { background: var(--diff-reg-bar); }
+.source-row.source-imp { background: var(--diff-imp-bar); }
