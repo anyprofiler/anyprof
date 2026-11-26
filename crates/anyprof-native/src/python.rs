@@ -6,13 +6,14 @@
 //! Python frame, then `previous`. The frame is [`Runtime::Python`], with
 //! `co_qualname`, `co_filename`, and a line from `co_linetable`.
 //!
-//! The leaf program counter has to fall inside the interpreter image (the
-//! executable or `libpython` that exports `_PyRuntime`). C helpers in that
+//! The leaf program counter is checked against the interpreter image (the
+//! executable or `libpython` that exports `_PyRuntime`). C helpers inside that
 //! image, such as allocation the eval loop calls, stay attributed to the
-//! Python function. A leaf in another image (libc, a ctypes extension)
-//! keeps the native walk. A leaf inside the image does too when this read
-//! returns no chain: the thread id is missing, a pointer is not plausible,
-//! or a read is short. Those frames stay native and are not labeled Python.
+//! Python function. When a Python thread's leaf lands in another image (a
+//! C/C++/Rust extension, PyO3/Cython/ctypes module, `libffi`, or `libc`),
+//! native unwinding recovers the external frames above `libpython` and
+//! stitches them onto the thread's `_PyInterpreterFrame` chain. Pure native
+//! threads without a `PyThreadState` keep their native walk unchanged.
 //! A denied `process_vm_readv` does not reach that path. `prepare_python`
 //! fails `start` before a profile exists. A thread blocked in `time.sleep`
 //! is off CPU and is not recorded. Only the thread that holds the GIL runs
@@ -45,22 +46,25 @@ const MAX_PY_FRAMES: usize = 64;
 const MAX_STRING: usize = 4096;
 const MAX_LINETABLE: usize = 1024 * 1024;
 
-/// One counted stack: native addresses, or a language frame chain.
+/// One counted stack: native addresses, or a language frame chain (optionally
+/// preceded by kernel PCs and external native extension / JNI PCs).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum CountedStack {
     /// Leaf-first addresses. `kernel_len` leading entries are kernel PCs.
     Addresses { frames: Vec<u64>, kernel_len: u16 },
-    /// Python frames, optionally after kernel PCs from the same sample.
+    /// Python frames, optionally after kernel PCs and external native PCs.
     Python {
         kernel: Vec<u64>,
+        native: Vec<u64>,
         frames: Vec<PyName>,
     },
-    /// Java methods, optionally after kernel PCs from the same sample.
+    /// Java methods, optionally after kernel PCs and external native JNI/FFM PCs.
     ///
     /// Frames carry `Class.method` plus optional source file and line, leaf
-    /// first. Kernel frames stay addresses until the profile is finished.
+    /// first. Kernel and native frames stay addresses until finished.
     Java {
         kernel: Vec<u64>,
+        native: Vec<u64>,
         frames: Vec<crate::java::JavaFrame>,
     },
 }
@@ -69,8 +73,16 @@ impl CountedStack {
     pub(crate) fn recordable(&self) -> bool {
         match self {
             Self::Addresses { frames, .. } => !frames.is_empty(),
-            Self::Python { kernel, frames } => !kernel.is_empty() || !frames.is_empty(),
-            Self::Java { kernel, frames } => !kernel.is_empty() || !frames.is_empty(),
+            Self::Python {
+                kernel,
+                native,
+                frames,
+            } => !kernel.is_empty() || !native.is_empty() || !frames.is_empty(),
+            Self::Java {
+                kernel,
+                native,
+                frames,
+            } => !kernel.is_empty() || !native.is_empty() || !frames.is_empty(),
         }
     }
 }
@@ -130,9 +142,7 @@ impl PythonVm {
     ///
     /// `read` copies remote bytes. `None` means the leaf is outside the
     /// image, or it is inside and the chain cannot be read (missing thread
-    /// id, a pointer that is not plausible, or a short read). The caller
-    /// keeps the native stack either way. This does not panic and does not
-    /// invent a Python name.
+    /// id, a pointer that is not plausible, or a short read).
     pub(crate) fn frames(
         &self,
         tid: u64,
@@ -140,6 +150,19 @@ impl PythonVm {
         read: &mut impl FnMut(u64, &mut [u8]) -> bool,
     ) -> Option<Vec<PyName>> {
         if tid == 0 || !self.in_image(pc) {
+            return None;
+        }
+        self.thread_frames_any_pc(tid, read)
+    }
+
+    /// Python frames for `tid` regardless of where `pc` points, used when a
+    /// Python thread is executing inside an external C/C++/Rust extension.
+    pub(crate) fn thread_frames_any_pc(
+        &self,
+        tid: u64,
+        read: &mut impl FnMut(u64, &mut [u8]) -> bool,
+    ) -> Option<Vec<PyName>> {
+        if tid == 0 {
             return None;
         }
         let mut interp = read_ptr(
@@ -162,8 +185,20 @@ impl PythonVm {
         None
     }
 
-    fn in_image(&self, pc: u64) -> bool {
+    /// True when `pc` falls inside the CPython binary or `libpython` image.
+    pub(crate) fn in_image(&self, pc: u64) -> bool {
         pc >= self.image_start && pc < self.image_end
+    }
+
+    /// Keeps external native frames (C/C++/Rust extensions, `libffi`, `libc`)
+    /// above the first CPython interpreter frame, stripping `libpython` eval
+    /// loop and OS thread-entry frames below it.
+    pub(crate) fn slice_external_native(&self, walked: &[u64]) -> Vec<u64> {
+        let cut = walked
+            .iter()
+            .position(|&addr| self.in_image(addr))
+            .unwrap_or(walked.len());
+        walked[..cut].to_vec()
     }
 
     fn thread_frames(
@@ -1614,6 +1649,16 @@ mod tests {
                     line: 10,
                 },
             ]
+        );
+        // External extension leaf (`0x9000` outside `0x2000..0x4000`) returns None on
+        // the fast path, resolves Python frames via `thread_frames_any_pc`, ignores
+        // pure native threads (`tid = 88`), and slices native frames above `libpython`.
+        assert!(vm.frames(77, 0x9000, &mut reader).is_none());
+        assert_eq!(vm.thread_frames_any_pc(77, &mut reader), Some(walked));
+        assert!(vm.thread_frames_any_pc(88, &mut reader).is_none());
+        assert_eq!(
+            vm.slice_external_native(&[0x9020, 0x8010, 0x2600, 0x1050]),
+            vec![0x9020, 0x8010]
         );
     }
 

@@ -18,8 +18,8 @@ Capture CPU profiles from any running process — no code changes, agents, or re
 | **C / C++** | `native` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Mach `task_for_pid` (macOS), `StackWalk64` (Windows), `perf_event_open` (Linux) |
 | **Rust** | `rust` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Native sampler + `rustc-demangle` (`[rust]` frames) |
 | **Go** | `go` | 99 Hz · `pprof` (`.pb.gz`) | Supported (`sudo`) | Supported | Supported | Go 1.18–1.26+ `pclntab` (`pcsp`) unwind; works on stripped (`-s -w`) binaries |
-| **Python** | `python` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | CPython 3.11–3.14 (GIL); walks `_PyRuntime` frame chains (`[python]` + file:line) |
-| **Java** | `java` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | HotSpot JDK 17, 21, 25; walks CodeCache `nmethod` & interpreter frames (`[java]`) |
+| **Python** | `python` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | CPython 3.11–3.14 (GIL); stitches C/C++/Rust extensions onto `[python]` frame chains |
+| **Java** | `java` | 99 Hz · `speedscope` | Supported (`sudo`) | Supported | Supported | HotSpot JDK 17, 21, 25; stitches JNI/FFM native frames onto CodeCache & interpreter `[java]` stacks |
 
 When `--backend` is omitted, auto-detection checks `node` → `rust` → `go` → `python` → `java` → `native` (`browser` requires `-B` / `--browser` or `-b browser`). Non-native frames are prefixed with `[runtime]` (`[node]`, `[rust]`, `[go]`, `[python]`, `[java]`, `[kernel]`) so mixed stacks preserve frame origin. Other CPU architectures compile cleanly and return not-implemented on `start`.
 

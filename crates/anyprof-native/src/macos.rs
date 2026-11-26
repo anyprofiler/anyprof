@@ -269,8 +269,22 @@ fn finish_profile(
             .enumerate()
             .map(|(index, addr)| frame_for(addr, symbols, index == 0))
             .collect(),
-        CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
-        CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
+        CountedStack::Python { native, frames, .. } => {
+            let mut out = Vec::with_capacity(native.len() + frames.len());
+            for (index, addr) in native.into_iter().enumerate() {
+                out.push(frame_for(addr, symbols, index == 0));
+            }
+            out.extend(python::python_profile_frames(&frames));
+            out
+        }
+        CountedStack::Java { native, frames, .. } => {
+            let mut out = Vec::with_capacity(native.len() + frames.len());
+            for (index, addr) in native.into_iter().enumerate() {
+                out.push(frame_for(addr, symbols, index == 0));
+            }
+            out.extend(java::java_profile_frames(&frames));
+            out
+        }
     });
     Profile {
         pid,
@@ -640,6 +654,7 @@ fn unwind_thread(
         {
             Some(PendingStack::Language(CountedStack::Java {
                 kernel: Vec::new(),
+                native: Vec::new(),
                 frames: java_frames,
             }))
         } else if let Some(vm) = python
@@ -647,6 +662,7 @@ fn unwind_thread(
         {
             Some(PendingStack::Language(CountedStack::Python {
                 kernel: Vec::new(),
+                native: Vec::new(),
                 frames: py_frames,
             }))
         } else if !go_images.is_empty()
@@ -659,7 +675,29 @@ fn unwind_thread(
         } else {
             let n =
                 walk_native_frames(task, unwinder, unwind_cache, pc, sp, fp, lr, &mut raw_addrs);
-            (n > 0).then_some(PendingStack::Native(n))
+            let mut read = |addr: u64, buf: &mut [u8]| read_task(task, addr, buf);
+            if let Some(vm) = java
+                && let Some(java_frames) = vm.anchor_frames(tid, sp, &mut read)
+            {
+                let native = vm.slice_external_native(&raw_addrs[..n], &mut read);
+                Some(PendingStack::Language(CountedStack::Java {
+                    kernel: Vec::new(),
+                    native,
+                    frames: java_frames,
+                }))
+            } else if let Some(vm) = python
+                && !vm.in_image(pc)
+                && let Some(py_frames) = vm.thread_frames_any_pc(tid, &mut read)
+            {
+                let native = vm.slice_external_native(&raw_addrs[..n]);
+                Some(PendingStack::Language(CountedStack::Python {
+                    kernel: Vec::new(),
+                    native,
+                    frames: py_frames,
+                }))
+            } else {
+                (n > 0).then_some(PendingStack::Native(n))
+            }
         }
     } else {
         None
@@ -1125,8 +1163,11 @@ impl SymbolTable {
     fn activate_shared_cache_for_hits(&mut self, unwinder: &mut MachUnwinder, hits: &[ThreadHit]) {
         let mut hit_indices = Vec::new();
         for hit in hits {
-            let CountedStack::Addresses { frames, .. } = &hit.stack else {
-                continue;
+            let frames = match &hit.stack {
+                CountedStack::Addresses { frames, .. } => frames.as_slice(),
+                CountedStack::Python { native, .. } | CountedStack::Java { native, .. } => {
+                    native.as_slice()
+                }
             };
             for (frame_idx, &addr) in frames.iter().enumerate() {
                 let probe = policy::symbol_lookup_address(addr, frame_idx == 0);

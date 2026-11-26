@@ -103,6 +103,19 @@ public class AnyprofSpin {
     }
     return clobber(depth - 1, fill + 1L) ^ p0 ^ p1 ^ p2 ^ p3;
   }
+  public static native long nativeSpin(int iters);
+  public static void jniCaller() {
+    while (true) {
+      sink = nativeSpin(200000);
+    }
+  }
+  public static void jniOuter(String libPath) {
+    System.load(libPath);
+    for (int warmup = 0; warmup < 20000; warmup++) {
+      sink = nativeSpin(4);
+    }
+    jniCaller();
+  }
   public static void main(String[] args) throws Exception {
     String mode = args.length > 0 ? args[0] : "busy";
     if (mode.equals("sleep")) {
@@ -121,6 +134,10 @@ public class AnyprofSpin {
     }
     if (mode.equals("alternating")) {
       alternating();
+      return;
+    }
+    if (mode.equals("jni")) {
+      jniOuter(args[1]);
       return;
     }
     caller();
@@ -171,6 +188,15 @@ public class AnyprofSpin {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn samples_mixed_java_and_jni_native_stacks() {
+        with_root(
+            "supported::samples_mixed_java_and_jni_native_stacks",
+            sample_jni_mixed,
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn samples_a_busy_java_program() {
@@ -204,6 +230,13 @@ public class AnyprofSpin {
     fn returning_call_chains_are_not_torn_across_callers() {
         let _lock = LiveLock::acquire();
         sample_alternating();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn samples_mixed_java_and_jni_native_stacks() {
+        let _lock = LiveLock::acquire();
+        sample_jni_mixed();
     }
 
     /// A double-forked JVM is not a descendant of this test.
@@ -563,6 +596,187 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
         );
         assert_alternating_stacks(&profile);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_jni_mixed() {
+        let jdks = jdks();
+        if jdks.is_empty() {
+            return;
+        }
+        let lib_dir = fixture_dir("jni-cdylib");
+        let Some(cdylib) = compile_jni_cdylib(&lib_dir) else {
+            let _ = std::fs::remove_dir_all(&lib_dir);
+            return;
+        };
+        if jdks.len() == 1 {
+            sample_jni_one(&jdks[0], &cdylib, false);
+            sample_jni_one(&jdks[0], &cdylib, true);
+        } else {
+            for (idx, jdk) in jdks.iter().enumerate() {
+                sample_jni_one(jdk, &cdylib, idx == 1);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    fn sample_jni_one(jdk: &Jdk, cdylib: &Path, interpret: bool) {
+        let java = &jdk.java;
+        let tag = if interpret { "jni-xint" } else { "jni-jit" };
+        let Some(dir) = compile_fixture(&format!("{tag}-{}", jdk.label), java) else {
+            return;
+        };
+        let mut command = Command::new(java);
+        for method in ["jniOuter", "jniCaller"] {
+            command.arg(format!(
+                "-XX:CompileCommand=dontinline,AnyprofSpin.{method}"
+            ));
+        }
+        if interpret {
+            command.arg("-Xint");
+        }
+        command
+            .arg("-cp")
+            .arg(&dir)
+            .arg("AnyprofSpin")
+            .arg("jni")
+            .arg(cdylib)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawn {}: {err}", java.display()));
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(800));
+        if child.try_wait().ok().flatten().is_some() {
+            let _ = std::fs::remove_dir_all(&dir);
+            if required() {
+                panic!(
+                    "the JNI Java fixture exited before sampling ({tag}, {})",
+                    jdk.label
+                );
+            }
+            eprintln!("skipping JNI java sample: the fixture exited");
+            return;
+        }
+        let started = JavaBackend.start(
+            &anyprof_core::Target { pid },
+            &record(Duration::from_millis(900)),
+        );
+        let Some(session) = accept_or_skip(started) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        std::thread::sleep(Duration::from_millis(900));
+        let alive = child.try_wait().ok().flatten().is_none();
+        let profile = session.stop().expect("stop");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            alive,
+            "the JNI Java process exited during the profile ({tag}, {})",
+            jdk.label
+        );
+        let stitched = profile.stacks.iter().any(|stack| {
+            let native_idx = stack.frames.iter().position(|frame| {
+                matches!(frame.runtime, Runtime::Rust | Runtime::Native)
+                    && (frame.name.contains("rust_jni_spin")
+                        || frame.name.contains("Java_AnyprofSpin_nativeSpin"))
+            });
+            let caller_idx = stack.frames.iter().position(|frame| {
+                frame.runtime == Runtime::Java && frame.name == "AnyprofSpin.jniCaller"
+            });
+            let outer_idx = stack.frames.iter().position(|frame| {
+                frame.runtime == Runtime::Java && frame.name == "AnyprofSpin.jniOuter"
+            });
+            match (native_idx, caller_idx, outer_idx) {
+                (Some(n), Some(c), Some(o)) => n < c && c < o,
+                _ => false,
+            }
+        });
+        assert!(
+            stitched,
+            "expected unified mixed stack with native/Rust JNI leaf above AnyprofSpin.jniCaller -> AnyprofSpin.jniOuter ({tag}, {})\n{}",
+            jdk.label,
+            explain(&profile)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn compile_jni_cdylib(dir: &Path) -> Option<PathBuf> {
+        let src = dir.join("anyprof_jniext.rs");
+        std::fs::write(
+            &src,
+            r#"
+#[inline(never)]
+pub fn rust_jni_spin(iters: i32) -> i64 {
+    let mut acc = 1i64;
+    let mut i = 0i32;
+    while i < iters {
+        acc = std::hint::black_box(acc.wrapping_mul(31).wrapping_add(i as i64));
+        i += 1;
+    }
+    acc
+}
+
+#[no_mangle]
+#[inline(never)]
+pub extern "system" fn Java_AnyprofSpin_nativeSpin(
+    _env: *mut (),
+    _cls: *mut (),
+    iters: i32,
+) -> i64 {
+    std::hint::black_box(rust_jni_spin(std::hint::black_box(iters)))
+}
+"#,
+        )
+        .unwrap();
+        let rustc = std::env::var_os("RUSTC")
+            .filter(|val| !val.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "rustc.exe" } else { "rustc" }));
+        let output = Command::new(&rustc)
+            .args([
+                "--edition",
+                "2021",
+                "--crate-type",
+                "cdylib",
+                "--crate-name",
+                "anyprof_jniext",
+                "-C",
+                "opt-level=0",
+                "-C",
+                "force-frame-pointers=yes",
+                "-C",
+                "debuginfo=2",
+            ])
+            .arg(&src)
+            .arg("--out-dir")
+            .arg(dir)
+            .output();
+        let Ok(output) = output else {
+            if required() {
+                panic!("failed to invoke {} to build JNI fixture", rustc.display());
+            }
+            eprintln!("skipping mixed java sample: rustc was not found");
+            return None;
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("rustc JNI cdylib build failed:\n{stderr}");
+        }
+        let filename = if cfg!(target_os = "macos") {
+            "libanyprof_jniext.dylib"
+        } else if cfg!(windows) {
+            "anyprof_jniext.dll"
+        } else {
+            "libanyprof_jniext.so"
+        };
+        let path = dir.join(filename);
+        assert!(path.is_file(), "expected JNI cdylib at {}", path.display());
+        Some(path)
     }
 
     fn assert_alternating_stacks(profile: &anyprof_core::Profile) {
@@ -933,11 +1147,22 @@ os.execv(java, [java, "-XX:CompileCommand=dontinline,AnyprofSpin.spin", "-cp", c
             "ANYPROF_JAVA",
             "JAVA_HOME",
             "PATH",
+            "RUSTC",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
         ] {
             if let Ok(value) = std::env::var(key)
                 && !value.is_empty()
             {
                 command.arg(format!("{key}={value}"));
+            }
+        }
+        if std::env::var_os("RUSTUP_HOME").is_none()
+            && let Ok(home) = std::env::var("HOME")
+        {
+            let rustup = Path::new(&home).join(".rustup");
+            if rustup.is_dir() {
+                command.arg(format!("RUSTUP_HOME={}", rustup.display()));
             }
         }
         if required() {

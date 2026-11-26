@@ -562,6 +562,7 @@ fn walk_suspended(
     {
         return Some(CountedStack::Java {
             kernel: Vec::new(),
+            native: Vec::new(),
             frames,
         });
     }
@@ -572,6 +573,7 @@ fn walk_suspended(
     {
         return Some(CountedStack::Python {
             kernel: Vec::new(),
+            native: Vec::new(),
             frames,
         });
     }
@@ -581,12 +583,14 @@ fn walk_suspended(
             kernel_len: 0,
         });
     }
+    let leaf_ip = aligned.context.Rip;
+    let leaf_sp = aligned.context.Rsp;
     let mut frame: STACKFRAME64 = unsafe { std::mem::zeroed() };
-    frame.AddrPC = flat(aligned.context.Rip);
+    frame.AddrPC = flat(leaf_ip);
     // x64 unwind uses `Rsp` as both the frame and stack addresses. Microsoft's
     // `StackWalk64` sample does this; `Rbp` is not the frame pointer there.
-    frame.AddrFrame = flat(aligned.context.Rsp);
-    frame.AddrStack = flat(aligned.context.Rsp);
+    frame.AddrFrame = flat(leaf_sp);
+    frame.AddrStack = flat(leaf_sp);
     let mut frames = Vec::new();
     let mut previous = 0u64;
     while frames.len() < MAX_FRAMES {
@@ -617,6 +621,32 @@ fn walk_suspended(
         previous = pc;
     }
     let frames = crate::walk::user_instruction_pointers(frames);
+    if let Some(vm) = java
+        && let Some(java_frames) = vm.anchor_frames(u64::from(tid), leaf_sp, &mut |addr, buf| {
+            read_process(process, addr, buf)
+        })
+    {
+        let native =
+            vm.slice_external_native(&frames, &mut |addr, buf| read_process(process, addr, buf));
+        return Some(CountedStack::Java {
+            kernel: Vec::new(),
+            native,
+            frames: java_frames,
+        });
+    }
+    if let Some(vm) = python
+        && !vm.in_image(leaf_ip)
+        && let Some(py_frames) = vm.thread_frames_any_pc(u64::from(tid), &mut |addr, buf| {
+            read_process(process, addr, buf)
+        })
+    {
+        let native = vm.slice_external_native(&frames);
+        return Some(CountedStack::Python {
+            kernel: Vec::new(),
+            native,
+            frames: py_frames,
+        });
+    }
     if frames.is_empty() {
         None
     } else {
@@ -654,8 +684,36 @@ fn finish_profile(
                 frame_for(process, *addr, index == 0, go, &mut rust_files, &mut pdbs)
             })
             .collect(),
-        CountedStack::Python { frames, .. } => python::python_profile_frames(&frames),
-        CountedStack::Java { frames, .. } => java::java_profile_frames(&frames),
+        CountedStack::Python { native, frames, .. } => {
+            let mut out = Vec::with_capacity(native.len() + frames.len());
+            for (index, addr) in native.into_iter().enumerate() {
+                out.push(frame_for(
+                    process,
+                    addr,
+                    index == 0,
+                    go,
+                    &mut rust_files,
+                    &mut pdbs,
+                ));
+            }
+            out.extend(python::python_profile_frames(&frames));
+            out
+        }
+        CountedStack::Java { native, frames, .. } => {
+            let mut out = Vec::with_capacity(native.len() + frames.len());
+            for (index, addr) in native.into_iter().enumerate() {
+                out.push(frame_for(
+                    process,
+                    addr,
+                    index == 0,
+                    go,
+                    &mut rust_files,
+                    &mut pdbs,
+                ));
+            }
+            out.extend(java::java_profile_frames(&frames));
+            out
+        }
     });
     Profile {
         pid,

@@ -114,6 +114,27 @@ struct LineMeta {
     bcp_words: i32,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TidField {
+    U32(u64),
+    U64(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AnchorLayout {
+    threads_list_addr: u64,
+    list_length: u64,
+    list_threads: u64,
+    osthread: u64,
+    tid: TidField,
+    stack_base: u64,
+    stack_size: u64,
+    anchor: u64,
+    last_java_sp: u64,
+    last_java_pc: u64,
+    last_java_fp: u64,
+}
+
 /// Byte offsets and the interpreter slot this process's HotSpot actually uses.
 #[derive(Debug)]
 struct Layout {
@@ -128,6 +149,7 @@ struct Layout {
     name_index: u64,
     source_file_index: Option<u64>,
     line_meta: Option<LineMeta>,
+    anchor: Option<AnchorLayout>,
     pool_holder: u64,
     klass_name: u64,
     sym_length: u64,
@@ -149,6 +171,8 @@ struct Layout {
     method_words: i32,
 }
 
+const MAX_JAVA_THREADS: usize = 4096;
+
 /// One HotSpot process whose serviceability table matched the walked layout.
 #[derive(Debug)]
 pub(crate) struct JavaVm {
@@ -157,19 +181,150 @@ pub(crate) struct JavaVm {
     heaps: u64,
     low_bound: u64,
     high_bound: u64,
+    jvm_start: u64,
+    jvm_end: u64,
 }
 
 impl JavaVm {
     /// Java methods for a sample whose leaf is `pc`.
     ///
     /// `None` means the leaf is not a Java method (outside the code cache, a
-    /// stub, or a method pointer that does not resolve). The caller keeps the
-    /// native walk. This does not invent a name.
+    /// stub, or a method pointer that does not resolve).
     pub(crate) fn frames<R>(
         &self,
         pc: u64,
         sp: u64,
         fp: u64,
+        read: &mut R,
+    ) -> Option<Vec<JavaFrame>>
+    where
+        R: FnMut(u64, &mut [u8]) -> bool,
+    {
+        self.frames_inner(pc, sp, fp, false, read)
+    }
+
+    /// Java caller methods recorded in `JavaThread::_anchor` when thread `tid`
+    /// has transitioned out of Java into JNI / Project Panama FFM native code.
+    pub(crate) fn anchor_frames<R>(
+        &self,
+        tid: u64,
+        leaf_sp: u64,
+        read: &mut R,
+    ) -> Option<Vec<JavaFrame>>
+    where
+        R: FnMut(u64, &mut [u8]) -> bool,
+    {
+        let anchor = self.layout.anchor.as_ref()?;
+        if tid == 0 {
+            return None;
+        }
+        let jthread = self.find_java_thread(anchor, tid, read)?;
+        let stack_base = read_u64(read, jthread.checked_add(anchor.stack_base)?)?;
+        let stack_size = read_u64(read, jthread.checked_add(anchor.stack_size)?)?;
+        if stack_base == 0 || stack_size == 0 || stack_size > 64 * 1024 * 1024 {
+            return None;
+        }
+        let stack_low = stack_base.checked_sub(stack_size)?;
+        let jfa = jthread.checked_add(anchor.anchor)?;
+        let last_sp = canonical_user(read_u64(read, jfa.checked_add(anchor.last_java_sp)?)?)?;
+        if last_sp < stack_low || last_sp >= stack_base || !last_sp.is_multiple_of(WORD) {
+            return None;
+        }
+        if leaf_sp != 0 && (leaf_sp < stack_low || leaf_sp > last_sp) {
+            return None;
+        }
+        let raw_pc = read_u64(read, jfa.checked_add(anchor.last_java_pc)?).unwrap_or(0);
+        // `JavaFrameAnchor::make_walkable()` on x86_64: JNI transition stubs
+        // leave `_last_Java_pc == 0` with the return PC stored at `_last_Java_sp[-1]`.
+        let last_pc = match canonical_user(raw_pc) {
+            Some(pc) => pc,
+            None => canonical_user(read_u64(read, last_sp.checked_sub(WORD)?)?)?,
+        };
+        let last_fp =
+            canonical_user(read_u64(read, jfa.checked_add(anchor.last_java_fp)?).unwrap_or(0))
+                .unwrap_or(0);
+        self.frames_inner(last_pc, last_sp, last_fp, true, read)
+    }
+
+    /// Slices a native user stack at the Java boundary (`CodeCache` or `libjvm`
+    /// entry frames) so only native JNI/FFM/C/Rust frames above Java remain.
+    pub(crate) fn slice_external_native<R>(&self, walked: &[u64], read: &mut R) -> Vec<u64>
+    where
+        R: FnMut(u64, &mut [u8]) -> bool,
+    {
+        if walked.is_empty() {
+            return Vec::new();
+        }
+        let code_low = read_u64(read, self.low_bound).unwrap_or(0);
+        let code_high = read_u64(read, self.high_bound).unwrap_or(0);
+        let in_code_cache =
+            |addr: u64| code_low < code_high && addr >= code_low && addr < code_high;
+        let in_libjvm = |addr: u64| {
+            self.jvm_start < self.jvm_end && addr >= self.jvm_start && addr < self.jvm_end
+        };
+        if let Some(cut) = walked.iter().position(|&addr| in_code_cache(addr)) {
+            return walked[..cut].to_vec();
+        }
+        if !in_libjvm(walked[0]) {
+            if let Some(cut) = walked.iter().position(|&addr| in_libjvm(addr)) {
+                return walked[..cut].to_vec();
+            }
+            return walked.to_vec();
+        }
+        let cut = walked
+            .iter()
+            .position(|&addr| !in_libjvm(addr))
+            .unwrap_or(walked.len());
+        walked[..cut].to_vec()
+    }
+
+    fn find_java_thread<R>(&self, anchor: &AnchorLayout, tid: u64, read: &mut R) -> Option<u64>
+    where
+        R: FnMut(u64, &mut [u8]) -> bool,
+    {
+        let list = read_u64(read, anchor.threads_list_addr)?;
+        if !plausible_user(list) {
+            return None;
+        }
+        let len = read_i32(read, list.checked_add(anchor.list_length)?)?;
+        if len <= 0 || usize::try_from(len).ok()? > MAX_JAVA_THREADS {
+            return None;
+        }
+        let threads_ptr = read_u64(read, list.checked_add(anchor.list_threads)?)?;
+        if !plausible_user(threads_ptr) {
+            return None;
+        }
+        for idx in 0..(len as usize) {
+            let slot = threads_ptr.checked_add((idx as u64).checked_mul(WORD)?)?;
+            let Some(jt) = read_u64(read, slot) else {
+                continue;
+            };
+            if !plausible_user(jt) {
+                continue;
+            }
+            let Some(osthread) = read_u64(read, jt.checked_add(anchor.osthread)?) else {
+                continue;
+            };
+            if !plausible_user(osthread) {
+                continue;
+            }
+            let jt_tid = match anchor.tid {
+                TidField::U64(off) => read_u64(read, osthread.checked_add(off)?)?,
+                TidField::U32(off) => u64::from(read_i32(read, osthread.checked_add(off)?)? as u32),
+            };
+            if jt_tid == tid {
+                return Some(jt);
+            }
+        }
+        None
+    }
+
+    fn frames_inner<R>(
+        &self,
+        pc: u64,
+        sp: u64,
+        fp: u64,
+        allow_stub_entry: bool,
         read: &mut R,
     ) -> Option<Vec<JavaFrame>>
     where
@@ -208,10 +363,11 @@ impl JavaVm {
                 continue;
             }
             if blob.frame_words > 0 {
-                let Some(frame) = self.method_frame(blob.method, None, read) else {
+                if let Some(frame) = self.method_frame(blob.method, None, read) {
+                    out.push(frame);
+                } else if !allow_stub_entry && out.is_empty() {
                     break;
-                };
-                out.push(frame);
+                }
                 let Some(next) = compiled_sender(sp, blob.frame_words, read) else {
                     break;
                 };
@@ -625,10 +781,13 @@ fn open_linux(pid: u32) -> Result<JavaVm, String> {
         .get("gHotSpotVMStructs")
         .ok_or_else(|| "libjvm does not export gHotSpotVMStructs".to_string())?;
     probe_linux(pid, probe)?;
+    let jvm_start = spans.iter().map(|s| s.start).min().unwrap_or(0);
+    let jvm_end = spans.iter().map(|s| s.end).max().unwrap_or(0);
     load_layout(
         &runtime,
         &mut |addr, buf| linux_read(pid, addr, buf).is_ok(),
         arch,
+        (jvm_start, jvm_end),
     )
 }
 
@@ -637,13 +796,13 @@ fn open_mach<R>(images: &[(String, u64, u64)], read: &mut R) -> Result<JavaVm, S
 where
     R: FnMut(u64, &mut [u8]) -> bool,
 {
-    let (path, load, _) = images
+    let (path, load, end) = images
         .iter()
         .find(|(path, _, _)| is_libjvm(path))
         .ok_or_else(|| "libjvm was not in the process image list".to_string())?;
     let arch = mapped_mach_arch(*load, read)?;
     let symbols = macho_hotspot(Path::new(path), *load, arch)?;
-    load_layout(&symbols, read, arch)
+    load_layout(&symbols, read, arch, (*load, *end))
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -654,15 +813,16 @@ fn open_windows<R>(
 where
     R: FnMut(u64, &mut [u8]) -> bool,
 {
-    let (path, base) = windows_libjvm(process)?;
+    let (path, base, end) = windows_libjvm(process)?;
     let (symbols, arch) = pe_hotspot(&path, base)?;
-    load_layout(&symbols, read, arch)
+    load_layout(&symbols, read, arch, (base, end))
 }
 
 fn load_layout<R>(
     symbols: &HashMap<String, u64>,
     read: &mut R,
     arch: JvmArch,
+    jvm_bounds: (u64, u64),
 ) -> Result<JavaVm, String>
 where
     R: FnMut(u64, &mut [u8]) -> bool,
@@ -756,6 +916,10 @@ where
             ));
         }
         Ok(*address)
+    };
+    let opt_static_addr = |ty: &str, name: &str| -> Option<u64> {
+        let (is_static, _, address) = fields.get(&(ty.to_string(), name.to_string()))?;
+        (*is_static && *address >= 0x1_0000).then_some(*address)
     };
     let types = read_type_sizes(read, &resolved)?;
     let major = hotspot_major(
@@ -860,6 +1024,52 @@ where
         }
         _ => None,
     };
+    let tid_field = opt_instance("OSThread", "_unique_thread_id")
+        .map(TidField::U64)
+        .or_else(|| opt_instance("OSThread", "_thread_id").map(TidField::U32));
+    // JDK 25 moved `_osthread` from `JavaThread` to `Thread`.
+    let osthread_off =
+        opt_instance("JavaThread", "_osthread").or_else(|| opt_instance("Thread", "_osthread"));
+    let anchor = match (
+        opt_static_addr("ThreadsSMRSupport", "_java_thread_list"),
+        opt_instance("ThreadsList", "_length"),
+        opt_instance("ThreadsList", "_threads"),
+        osthread_off,
+        tid_field,
+        opt_instance("JavaThread", "_stack_base"),
+        opt_instance("JavaThread", "_stack_size"),
+        opt_instance("JavaThread", "_anchor"),
+        opt_instance("JavaFrameAnchor", "_last_Java_sp"),
+        opt_instance("JavaFrameAnchor", "_last_Java_pc"),
+        opt_instance("JavaFrameAnchor", "_last_Java_fp"),
+    ) {
+        (
+            Some(threads_list_addr),
+            Some(list_length),
+            Some(list_threads),
+            Some(osthread),
+            Some(tid),
+            Some(stack_base),
+            Some(stack_size),
+            Some(anchor),
+            Some(last_java_sp),
+            Some(last_java_pc),
+            Some(last_java_fp),
+        ) => Some(AnchorLayout {
+            threads_list_addr,
+            list_length,
+            list_threads,
+            osthread,
+            tid,
+            stack_base,
+            stack_size,
+            anchor,
+            last_java_sp,
+            last_java_pc,
+            last_java_fp,
+        }),
+        _ => None,
+    };
     let method_type = compiled_method_type(major)?;
     Ok(JavaVm {
         layout: Layout {
@@ -874,6 +1084,7 @@ where
             name_index: instance("ConstMethod", "_name_index")?,
             source_file_index: opt_instance("ConstantPool", "_source_file_name_index"),
             line_meta,
+            anchor,
             pool_holder: instance("ConstantPool", "_pool_holder")?,
             klass_name: instance("Klass", "_name")?,
             sym_length: instance("Symbol", "_length")?,
@@ -894,6 +1105,8 @@ where
         heaps: static_addr("CodeCache", "_heaps")?,
         low_bound: static_addr("CodeCache", "_low_bound")?,
         high_bound: static_addr("CodeCache", "_high_bound")?,
+        jvm_start: jvm_bounds.0,
+        jvm_end: jvm_bounds.1,
     })
 }
 
@@ -1797,7 +2010,7 @@ fn windows_has_libjvm(pid: u32) -> bool {
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn windows_libjvm(
     process: windows_sys::Win32::Foundation::HANDLE,
-) -> Result<(PathBuf, u64), String> {
+) -> Result<(PathBuf, u64, u64), String> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::ProcessStatus::{
         EnumProcessModules, GetModuleFileNameExW, GetModuleInformation, MODULEINFO,
@@ -1847,7 +2060,9 @@ fn windows_libjvm(
         if ok == 0 || info.lpBaseOfDll.is_null() {
             continue;
         }
-        return Ok((path, info.lpBaseOfDll as u64));
+        let base = info.lpBaseOfDll as u64;
+        let end = base.saturating_add(u64::from(info.SizeOfImage));
+        return Ok((path, base, end));
     }
     Err("jvm.dll was not loaded".to_string())
 }
@@ -2277,6 +2492,7 @@ pub(crate) mod tests {
                         has_linenumber_mask: 1,
                         bcp_words: -7,
                     }),
+                    anchor: None,
                     pool_holder: 0,
                     klass_name: 0,
                     sym_length: 0,
@@ -2297,6 +2513,8 @@ pub(crate) mod tests {
                 heaps: heaps_ptr_addr,
                 low_bound: low_bound_addr,
                 high_bound: high_bound_addr,
+                jvm_start: 0x1000_0000,
+                jvm_end: 0x1100_0000,
             };
             Self {
                 vm: Some(vm),
@@ -2329,5 +2547,112 @@ pub(crate) mod tests {
             }
             true
         }
+    }
+
+    #[test]
+    fn synthetic_anchor_unwinds_jni_callers_and_slices_native_frames() {
+        let mut fixture = SyntheticJavaFixture::two_compiled_frames();
+        let anchor_sp = 0x7fff_0000_1000u64;
+        let native_sp = anchor_sp - 0x40;
+        let stack = fixture.build_copied_stack(anchor_sp);
+
+        // Populate ThreadsSMRSupport -> ThreadsList -> JavaThread -> OSThread + JavaFrameAnchor
+        let threads_list_global = 0x2002_0000u64;
+        let threads_list = 0x2002_0100u64;
+        let threads_arr = 0x2002_0200u64;
+        let jthread = 0x2002_1000u64;
+        let osthread = 0x2002_2000u64;
+        let put = |mem: &mut std::collections::HashMap<u64, u8>, addr: u64, bytes: &[u8]| {
+            for (i, &b) in bytes.iter().enumerate() {
+                mem.insert(addr + i as u64, b);
+            }
+        };
+        put(
+            &mut fixture.mem,
+            threads_list_global,
+            &threads_list.to_le_bytes(),
+        );
+        put(&mut fixture.mem, threads_list, &1i32.to_le_bytes());
+        put(
+            &mut fixture.mem,
+            threads_list + 8,
+            &threads_arr.to_le_bytes(),
+        );
+        put(&mut fixture.mem, threads_arr, &jthread.to_le_bytes());
+        put(&mut fixture.mem, jthread + 0x10, &osthread.to_le_bytes());
+        put(&mut fixture.mem, osthread + 0x20, &7777i32.to_le_bytes());
+        put(
+            &mut fixture.mem,
+            jthread + 0x30,
+            &(anchor_sp + 0x2000).to_le_bytes(),
+        ); // _stack_base
+        put(
+            &mut fixture.mem,
+            jthread + 0x38,
+            &0x10_0000u64.to_le_bytes(),
+        ); // _stack_size
+        // _last_Java_sp = anchor_sp, _last_Java_pc = 0 (forces _last_Java_sp[-1] lookup!)
+        put(&mut fixture.mem, jthread + 0x80, &anchor_sp.to_le_bytes());
+        put(&mut fixture.mem, jthread + 0x88, &0u64.to_le_bytes());
+        put(
+            &mut fixture.mem,
+            jthread + 0x90,
+            &(anchor_sp + 16).to_le_bytes(),
+        );
+        put(
+            &mut fixture.mem,
+            anchor_sp - 8,
+            &fixture.leaf_pc.to_le_bytes(),
+        );
+
+        {
+            let vm = fixture.vm.as_mut().unwrap();
+            vm.layout.anchor = Some(super::AnchorLayout {
+                threads_list_addr: threads_list_global,
+                list_length: 0,
+                list_threads: 8,
+                osthread: 0x10,
+                tid: super::TidField::U32(0x20),
+                stack_base: 0x30,
+                stack_size: 0x38,
+                anchor: 0x80,
+                last_java_sp: 0,
+                last_java_pc: 8,
+                last_java_fp: 16,
+            });
+        }
+        let vm = fixture.vm.as_ref().unwrap();
+
+        let mut read = |addr: u64, buf: &mut [u8]| {
+            if let Some(off) = addr.checked_sub(anchor_sp)
+                && let Ok(off) = usize::try_from(off)
+                && let Some(end) = off.checked_add(buf.len())
+                && end <= stack.len()
+            {
+                buf.copy_from_slice(&stack[off..end]);
+                return true;
+            }
+            fixture.read_metadata(addr, buf)
+        };
+
+        let frames = vm
+            .anchor_frames(7777, native_sp, &mut read)
+            .expect("anchor frames");
+        assert_eq!(
+            frames,
+            vec![
+                super::JavaFrame::named("Leaf.work"),
+                super::JavaFrame::named("Caller.entry"),
+            ]
+        );
+        // Unrelated native thread returns None.
+        assert!(vm.anchor_frames(8888, native_sp, &mut read).is_none());
+
+        // Native stack slicing stops right before CodeCache (or libjvm fallback).
+        let walked = vec![0x4000_0050, 0x4000_0010, fixture.leaf_pc, 0x1000_5000];
+        assert_eq!(
+            vm.slice_external_native(&walked, &mut read),
+            vec![0x4000_0050, 0x4000_0010]
+        );
     }
 }
