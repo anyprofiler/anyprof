@@ -830,18 +830,24 @@ where
             // Stack return addresses and interpreter slots within the copied
             // `PERF_SAMPLE_STACK_USER` window come from the kernel's interrupt
             // snapshot, while CodeCache and Metaspace reads fall back to
-            // `process_vm_readv`. `None` keeps the native walk below.
-            return Some(CountedStack::Java { kernel, frames });
+            // `process_vm_readv`.
+            return Some(CountedStack::Java {
+                kernel,
+                native: Vec::new(),
+                frames,
+            });
         }
     }
     if let Some(vm) = ctx.python
         && let Some(frames) = vm.frames(u64::from(sample.tid), pc, live_read)
     {
         // `poll_events` wakes as soon as a sample is published to minimize lag
-        // before reading the thread's `_PyInterpreterFrame` chain. `None`
-        // covers a leaf outside the interpreter image and a leaf inside it
-        // whose chain cannot be read; both keep the native walk below.
-        return Some(CountedStack::Python { kernel, frames });
+        // before reading the thread's `_PyInterpreterFrame` chain.
+        return Some(CountedStack::Python {
+            kernel,
+            native: Vec::new(),
+            frames,
+        });
     }
     // Go's pcsp walk uses the copied user stack. A leaf that is not a Go
     // function keeps the DWARF / frame-pointer walk below.
@@ -854,20 +860,27 @@ where
         |addr, buf| read_copied_stack(stack, sp, addr, buf),
         walk::strip_pac_code,
     );
-    let mut user = if let Some(frames) = go_walk {
-        frames
-    } else {
-        unwind_user_stack(
-            ctx.unwinder,
-            ctx.unwind_cache,
-            pc,
-            sp,
-            fp,
-            lr,
-            stack,
-            user_chain,
-        )
-    };
+    if let Some(mut user) = go_walk {
+        user.truncate(walk::MAX_FRAMES);
+        if kernel.is_empty() && user.is_empty() {
+            return None;
+        }
+        let kernel_len = u16::try_from(kernel.len()).unwrap_or(u16::MAX);
+        let mut frames = kernel;
+        frames.extend(user);
+        return Some(CountedStack::Addresses { frames, kernel_len });
+    }
+
+    let mut user = unwind_user_stack(
+        ctx.unwinder,
+        ctx.unwind_cache,
+        pc,
+        sp,
+        fp,
+        lr,
+        stack,
+        user_chain,
+    );
     if user.is_empty() {
         let raw_ip = walk::strip_pac_code(sample.ip);
         if walk::plausible_user_address(raw_ip) {
@@ -875,6 +888,36 @@ where
         }
     }
     user.truncate(walk::MAX_FRAMES);
+
+    if let Some(vm) = ctx.java {
+        let mut read_java = |addr: u64, buf: &mut [u8]| {
+            if read_copied_stack(stack, sp, addr, buf) {
+                true
+            } else {
+                live_read(addr, buf)
+            }
+        };
+        if let Some(java_frames) = vm.anchor_frames(u64::from(sample.tid), sp, &mut read_java) {
+            let native = vm.slice_external_native(&user, &mut read_java);
+            return Some(CountedStack::Java {
+                kernel,
+                native,
+                frames: java_frames,
+            });
+        }
+    }
+    if let Some(vm) = ctx.python
+        && !vm.in_image(pc)
+        && let Some(py_frames) = vm.thread_frames_any_pc(u64::from(sample.tid), live_read)
+    {
+        let native = vm.slice_external_native(&user);
+        return Some(CountedStack::Python {
+            kernel,
+            native,
+            frames: py_frames,
+        });
+    }
+
     if kernel.is_empty() && user.is_empty() {
         return None;
     }
@@ -1005,18 +1048,32 @@ fn finish_profile(
                 })
                 .collect()
         }
-        CountedStack::Python { kernel, frames } => {
-            let mut out = Vec::with_capacity(kernel.len() + frames.len());
+        CountedStack::Python {
+            kernel,
+            native,
+            frames,
+        } => {
+            let mut out = Vec::with_capacity(kernel.len() + native.len() + frames.len());
             for (index, addr) in kernel.into_iter().enumerate() {
                 out.push(kernel_frame(kernel_symbols, addr, index == 0));
+            }
+            for (index, addr) in native.into_iter().enumerate() {
+                out.push(user_frame(images, addr, index == 0));
             }
             out.extend(python::python_profile_frames(&frames));
             out
         }
-        CountedStack::Java { kernel, frames } => {
-            let mut out = Vec::with_capacity(kernel.len() + frames.len());
+        CountedStack::Java {
+            kernel,
+            native,
+            frames,
+        } => {
+            let mut out = Vec::with_capacity(kernel.len() + native.len() + frames.len());
             for (index, addr) in kernel.into_iter().enumerate() {
                 out.push(kernel_frame(kernel_symbols, addr, index == 0));
+            }
+            for (index, addr) in native.into_iter().enumerate() {
+                out.push(user_frame(images, addr, index == 0));
             }
             out.extend(crate::java::java_profile_frames(&frames));
             out
@@ -1470,6 +1527,7 @@ mod tests {
             got,
             CountedStack::Java {
                 kernel: Vec::new(),
+                native: Vec::new(),
                 frames: vec![
                     crate::java::JavaFrame::named("Leaf.work"),
                     crate::java::JavaFrame::named("Caller.entry"),
@@ -1487,6 +1545,7 @@ mod tests {
             truncated,
             CountedStack::Java {
                 kernel: Vec::new(),
+                native: Vec::new(),
                 frames: vec![crate::java::JavaFrame::named("Leaf.work")],
             }
         );

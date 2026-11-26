@@ -99,6 +99,15 @@ threading.Event().wait()
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn samples_mixed_python_and_native_extension_stacks() {
+        with_root(
+            "supported::samples_mixed_python_and_native_extension_stacks",
+            sample_mixed_extension,
+        );
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn samples_a_busy_python_program() {
@@ -118,6 +127,13 @@ threading.Event().wait()
     fn both_spinning_threads_are_sampled() {
         let _lock = LiveLock::acquire();
         sample_threads();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn samples_mixed_python_and_native_extension_stacks() {
+        let _lock = LiveLock::acquire();
+        sample_mixed_extension();
     }
 
     /// A double-forked interpreter is not a descendant of this test.
@@ -486,6 +502,182 @@ os.execv(sys.executable, [sys.executable, script, counter])
         }
     }
 
+    fn sample_mixed_extension() {
+        let pythons = interpreters();
+        if pythons.is_empty() {
+            return;
+        }
+        let lib_dir = fixture_dir("pyext-cdylib");
+        let Some(cdylib) = compile_ext_cdylib(&lib_dir) else {
+            let _ = std::fs::remove_dir_all(&lib_dir);
+            return;
+        };
+        let ext_script_src = r#"
+import ctypes, sys
+counter_path, lib_path = sys.argv[1], sys.argv[2]
+lib = ctypes.CDLL(lib_path)
+lib.anyprof_ext_spin.argtypes = [ctypes.c_uint64]
+lib.anyprof_ext_spin.restype = ctypes.c_uint64
+
+def ext_caller():
+    with open(counter_path, "wb") as handle:
+        handle.write((1).to_bytes(8, "little"))
+    while True:
+        lib.anyprof_ext_spin(200000)
+
+def outer_entry():
+    ext_caller()
+
+outer_entry()
+"#;
+        for python in pythons {
+            let dir = fixture_dir("mixed-ext");
+            let script = dir.join("ext_spin.py");
+            std::fs::write(&script, ext_script_src).unwrap();
+            let counter = dir.join("counter");
+            std::fs::write(&counter, [0u8; 8]).unwrap();
+            let mut child = Command::new(&python)
+                .arg(&script)
+                .arg(&counter)
+                .arg(&cdylib)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap_or_else(|err| panic!("spawn {}: {err}", python.display()));
+            let pid = child.id();
+            if !wait_for_counter(&counter) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+            let started = PythonBackend.start(
+                &anyprof_core::Target { pid },
+                &anyprof_core::RecordOptions {
+                    duration: Some(Duration::from_millis(800)),
+                    sampling_interval: Some(Duration::from_millis(10)),
+                    ..anyprof_core::RecordOptions::default()
+                },
+            );
+            let Some(session) = accept_or_skip(started) else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&lib_dir);
+                return;
+            };
+            std::thread::sleep(Duration::from_millis(800));
+            let alive = child.try_wait().ok().flatten().is_none();
+            let profile = session.stop().expect("stop");
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                alive,
+                "{} exited during mixed-extension profile",
+                python.display()
+            );
+            let stitched = profile.stacks.iter().any(|stack| {
+                let native_idx = stack.frames.iter().position(|frame| {
+                    matches!(frame.runtime, Runtime::Rust | Runtime::Native)
+                        && (frame.name.contains("rust_ext_spin")
+                            || frame.name.contains("anyprof_ext_spin"))
+                });
+                let caller_idx = stack.frames.iter().position(|frame| {
+                    frame.runtime == Runtime::Python && frame.name == "ext_caller"
+                });
+                let outer_idx = stack.frames.iter().position(|frame| {
+                    frame.runtime == Runtime::Python && frame.name == "outer_entry"
+                });
+                match (native_idx, caller_idx, outer_idx) {
+                    (Some(n), Some(c), Some(o)) => n < c && c < o,
+                    _ => false,
+                }
+            });
+            assert!(
+                stitched,
+                "expected unified mixed stack with native/Rust extension leaf above Python ext_caller -> outer_entry ({})\n{}",
+                python.display(),
+                explain(&profile)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    fn compile_ext_cdylib(dir: &Path) -> Option<PathBuf> {
+        let src = dir.join("anyprof_pyext.rs");
+        std::fs::write(
+            &src,
+            r#"
+#[inline(never)]
+pub fn rust_ext_spin(iters: u64) -> u64 {
+    let mut acc = 1u64;
+    let mut i = 0u64;
+    while i < iters {
+        acc = std::hint::black_box(acc.wrapping_mul(31).wrapping_add(i));
+        i += 1;
+    }
+    acc
+}
+
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn anyprof_ext_spin(iters: u64) -> u64 {
+    std::hint::black_box(rust_ext_spin(std::hint::black_box(iters)))
+}
+"#,
+        )
+        .unwrap();
+        let rustc = std::env::var_os("RUSTC")
+            .filter(|val| !val.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "rustc.exe" } else { "rustc" }));
+        let output = Command::new(&rustc)
+            .args([
+                "--edition",
+                "2021",
+                "--crate-type",
+                "cdylib",
+                "--crate-name",
+                "anyprof_pyext",
+                "-C",
+                "opt-level=0",
+                "-C",
+                "force-frame-pointers=yes",
+                "-C",
+                "debuginfo=2",
+            ])
+            .arg(&src)
+            .arg("--out-dir")
+            .arg(dir)
+            .output();
+        let Ok(output) = output else {
+            if required() {
+                panic!(
+                    "failed to invoke {} to build python extension fixture",
+                    rustc.display()
+                );
+            }
+            eprintln!("skipping mixed python sample: rustc was not found");
+            return None;
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("rustc cdylib build failed:\n{stderr}");
+        }
+        let filename = if cfg!(target_os = "macos") {
+            "libanyprof_pyext.dylib"
+        } else if cfg!(windows) {
+            "anyprof_pyext.dll"
+        } else {
+            "libanyprof_pyext.so"
+        };
+        let path = dir.join(filename);
+        assert!(path.is_file(), "expected cdylib at {}", path.display());
+        Some(path)
+    }
+
     fn assert_spin_profile(
         profile: &anyprof_core::Profile,
         pid: u32,
@@ -824,11 +1016,23 @@ os.execv(sys.executable, [sys.executable, script, counter])
             "ANYPROF_PYTHON_313",
             "ANYPROF_PYTHON_314",
             "ANYPROF_PYTHON",
+            "PATH",
+            "RUSTC",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
         ] {
             if let Ok(value) = std::env::var(key)
                 && !value.is_empty()
             {
                 command.arg(format!("{key}={value}"));
+            }
+        }
+        if std::env::var_os("RUSTUP_HOME").is_none()
+            && let Ok(home) = std::env::var("HOME")
+        {
+            let rustup = Path::new(&home).join(".rustup");
+            if rustup.is_dir() {
+                command.arg(format!("RUSTUP_HOME={}", rustup.display()));
             }
         }
         if required() {
